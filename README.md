@@ -1,5 +1,8 @@
 # memgres
 
+[![CI](https://github.com/mozgsml/memgres/actions/workflows/ci.yml/badge.svg)](https://github.com/mozgsml/memgres/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Versioned document memory for AI agents — one Postgres, lexical *or* semantic recall, diff-based history, GDPR-erasable.**
 
 > Status: early. Core library, search, HTTP API and MCP server are implemented and tested against a live pgvector Postgres.
@@ -114,13 +117,30 @@ old   = s.reconstruct(None, m.id, 1)                          # body as of versi
 s.forget(None, m.id)                                          # hard-erase + history
 ```
 
+### Install
+
+> Not on PyPI yet — install from git (or clone and `pip install -e .`):
+
+```bash
+pip install "git+https://github.com/mozgsml/memgres"            # core library
+pip install "memgres[server] @ git+https://github.com/mozgsml/memgres"   # + HTTP API
+pip install "memgres[mcp]   @ git+https://github.com/mozgsml/memgres"    # + MCP server
+# extras: local (sentence-transformers), qdrant (Qdrant backend)
+```
+
+Or pull the container image:
+
+```bash
+docker pull ghcr.io/mozgsml/memgres:latest
+```
+
 ### Three ways to run it
 
 1. **`docker compose up`** — `pgvector` + service, nothing to configure. For a dedicated vector service instead, `docker compose --profile qdrant up` and set `MEMGRES_VECTOR_BACKEND=qdrant` (Qdrant ranks vectors; Postgres still holds bodies and does tag/subtree/TTL filtering).
-2. **Your own Postgres** — `pip install "memgres[server]"`, point `MEMGRES_DATABASE_URL` at it, run `memgres-server` (migrates on startup).
-3. **Embedded library** — `pip install memgres`, use `Store` directly, no HTTP at all.
+2. **Your own Postgres** — install the `[server]` extra (above), point `MEMGRES_DATABASE_URL` at it, run `memgres-server` (migrates on startup).
+3. **Embedded library** — install the core package, use `Store` directly, no HTTP at all.
 
-Semantic recall is optional: the default `MEMGRES_EMBED_PROVIDER=none` gives you lexical FTS with zero models. Turn on `local` (sentence-transformers) or a cloud API (`jina`/`openai`) when you want meaning-based search — the model id + dimension get stamped into the schema and a later mismatch hard-fails instead of silently returning garbage.
+Semantic recall is optional: the default `MEMGRES_EMBED_PROVIDER=none` gives you lexical FTS with zero models. Turn on `local` (sentence-transformers), a cloud API (`openai`/`jina`), or any OpenAI-compatible server (LM Studio, Ollama, …) when you want meaning-based search — see [docs/BACKENDS.md](docs/BACKENDS.md) for copy-paste setups. The model id + dimension get stamped into the schema and a later mismatch hard-fails instead of silently returning garbage.
 
 ## Configuration
 
@@ -164,7 +184,7 @@ Namespace token (when `MEMGRES_NAMESPACES=true`) goes in `Authorization: Bearer 
 The same store is exposed to MCP clients (Claude Desktop, etc.) over stdio:
 
 ```bash
-pip install "memgres[mcp]"
+pip install "memgres[mcp] @ git+https://github.com/mozgsml/memgres"
 memgres-mcp                    # needs MEMGRES_DATABASE_URL; migrates on startup
 ```
 
