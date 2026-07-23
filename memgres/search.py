@@ -56,9 +56,11 @@ def _lexical(conn, cfg, ns, query, k, tags, path_prefix) -> List[Hit]:
                 for r in cur.fetchall()]
 
 
-def _semantic(conn, cfg, embedder, ns, query, k, tags, path_prefix) -> List[Hit]:
+def _semantic(conn, cfg, embedder, ns, query, k, tags, path_prefix, qdrant=None) -> List[Hit]:
     if not embedder:
         raise RuntimeError("semantic recall needs an embedder (MEMGRES_EMBED_PROVIDER)")
+    if qdrant is not None:
+        return _semantic_qdrant(conn, cfg, embedder, ns, query, k, tags, path_prefix, qdrant)
     qv = "[" + ",".join(repr(float(x)) for x in embedder.embed_query(query)) + "]"
     where, params = _filters(ns, tags, path_prefix)
     sql = (
@@ -72,6 +74,26 @@ def _semantic(conn, cfg, embedder, ns, query, k, tags, path_prefix) -> List[Hit]
         cur.execute(sql, args)
         return [Hit(str(r[0]), r[1], list(r[2]), r[3], float(r[4]))
                 for r in cur.fetchall()]
+
+
+def _semantic_qdrant(conn, cfg, embedder, ns, query, k, tags, path_prefix, qdrant) -> List[Hit]:
+    """Rank in Qdrant (namespace-scoped), then fetch + filter bodies in Postgres.
+    Over-fetch when tag/subtree filters apply, since those are enforced in PG."""
+    qv = embedder.embed_query(query)
+    overfetch = k if not (tags or path_prefix) else min(max(k * 10, k), 500)
+    pairs = qdrant.query(qv, overfetch, ns)          # [(id, score)] cosine similarity
+    if not pairs:
+        return []
+    score = {pid: s for pid, s in pairs}
+    where, params = _filters(ns, tags, path_prefix)  # namespace, expiry, tags, subtree
+    sql = (f"SELECT id, body, tags, path::text FROM memory "
+           f"WHERE {where} AND id = ANY(%s)")
+    with conn.cursor() as cur:
+        cur.execute(sql, params + [list(score.keys())])
+        hits = [Hit(str(r[0]), r[1], list(r[2]), r[3], score[str(r[0])])
+                for r in cur.fetchall()]
+    hits.sort(key=lambda h: h.score, reverse=True)   # Qdrant order, minus PG-filtered
+    return hits[:k]
 
 
 def _rrf(lists: Sequence[List[Hit]], k: int) -> List[Hit]:
@@ -89,15 +111,15 @@ def _rrf(lists: Sequence[List[Hit]], k: int) -> List[Hit]:
 
 def recall(conn, cfg, embedder, ns: str, query: str, *, k: int = 10,
            tags: Optional[Sequence[str]] = None, path_prefix: Optional[str] = None,
-           mode: str = "auto") -> List[Hit]:
+           mode: str = "auto", qdrant=None) -> List[Hit]:
     if mode == "auto":
         mode = "semantic" if embedder else "lexical"
     if mode == "lexical":
         return _lexical(conn, cfg, ns, query, k, tags, path_prefix)
     if mode == "semantic":
-        return _semantic(conn, cfg, embedder, ns, query, k, tags, path_prefix)
+        return _semantic(conn, cfg, embedder, ns, query, k, tags, path_prefix, qdrant)
     if mode == "hybrid":
         lex = _lexical(conn, cfg, ns, query, k, tags, path_prefix)
-        sem = _semantic(conn, cfg, embedder, ns, query, k, tags, path_prefix)
+        sem = _semantic(conn, cfg, embedder, ns, query, k, tags, path_prefix, qdrant)
         return _rrf([sem, lex], k)
     raise ValueError(f"unknown recall mode: {mode!r} (lexical|semantic|hybrid|auto)")

@@ -57,6 +57,21 @@ def test_openai_base_and_no_task(monkeypatch):
     assert emb._passage_task is None                  # OpenAI has no task hint
 
 
+def test_openai_compatible_needs_base_not_key(monkeypatch):
+    # LM Studio / Ollama style: base required, key optional
+    cfg = _cfg(monkeypatch, EMBED_PROVIDER="openai-compatible", EMBED_MODEL="nomic-embed-text",
+               EMBED_DIM="768", EMBED_API_BASE="http://localhost:1234/v1")
+    emb = get_embedder(cfg)
+    assert isinstance(emb, _HttpEmbedder) and emb._base == "http://localhost:1234/v1"
+    assert emb._key == ""                                # no key needed
+
+
+def test_openai_compatible_requires_base(monkeypatch):
+    cfg = _cfg(monkeypatch, EMBED_PROVIDER="openai-compatible", EMBED_MODEL="m", EMBED_DIM="8")
+    with pytest.raises(ValueError, match="API_BASE"):
+        get_embedder(cfg)
+
+
 def test_custom_api_base(monkeypatch):
     cfg = _cfg(monkeypatch, EMBED_PROVIDER="openai", EMBED_MODEL="m", EMBED_DIM="8",
                EMBED_API_KEY="k", EMBED_API_BASE="http://localhost:9999/v1/")

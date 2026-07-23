@@ -28,6 +28,8 @@ services:
     build: .
     environment:
       MEMGRES_DATABASE_URL: postgresql://memgres:memgres@db:5432/memgres
+      # only used when MEMGRES_VECTOR_BACKEND=qdrant (start with --profile qdrant)
+      QDRANT_URL: http://qdrant:6333
     env_file:
       - path: .env          # optional: your MEMGRES_* overrides
         required: false

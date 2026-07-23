@@ -67,13 +67,16 @@ class _LocalEmbedder(Embedder):
 # ─── cloud: Jina and OpenAI share an OpenAI-shaped /embeddings endpoint ───────
 class _HttpEmbedder(Embedder):
     def __init__(self, model: str, dim: int, api_key: str, api_base: str,
-                 query_task: Optional[str] = None, passage_task: Optional[str] = None):
+                 query_task: Optional[str] = None, passage_task: Optional[str] = None,
+                 require_key: bool = True):
         if not model:
-            raise ValueError("MEMGRES_EMBED_MODEL is required for cloud providers")
-        if not api_key:
-            raise ValueError("MEMGRES_EMBED_API_KEY is required for cloud providers")
+            raise ValueError("MEMGRES_EMBED_MODEL is required for HTTP providers")
+        if not api_base:
+            raise ValueError("MEMGRES_EMBED_API_BASE (server URL) is required")
+        if require_key and not api_key:
+            raise ValueError("MEMGRES_EMBED_API_KEY is required for this provider")
         if dim <= 0:
-            raise ValueError("MEMGRES_EMBED_DIM must be set for cloud providers")
+            raise ValueError("MEMGRES_EMBED_DIM must be set for HTTP providers")
         self.dim = dim
         self._model = model
         self._key = api_key
@@ -85,11 +88,13 @@ class _HttpEmbedder(Embedder):
         payload = {"model": self._model, "input": list(inputs)}
         if task:  # Jina uses task to distinguish passage vs query; OpenAI ignores it
             payload["task"] = task
+        headers = {"Content-Type": "application/json"}
+        if self._key:  # local servers (LM Studio/Ollama) often need no key
+            headers["Authorization"] = f"Bearer {self._key}"
         req = urllib.request.Request(
             f"{self._base}/embeddings",
             data=json.dumps(payload).encode(),
-            headers={"Authorization": f"Bearer {self._key}",
-                     "Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -128,5 +133,12 @@ def get_embedder(cfg: Config) -> Optional[Embedder]:
         return _HttpEmbedder(
             cfg.embed_model, cfg.embed_dim, cfg.embed_api_key,
             cfg.embed_api_base or "https://api.openai.com/v1",
+        )
+    if p in ("openai-compatible", "compatible", "custom"):
+        # any OpenAI-shaped /embeddings server: LM Studio, Ollama, vLLM, TEI,
+        # LocalAI, … base URL required, key optional.
+        return _HttpEmbedder(
+            cfg.embed_model, cfg.embed_dim, cfg.embed_api_key, cfg.embed_api_base,
+            require_key=False,
         )
     raise ValueError(f"unknown embed provider: {p}")  # config.validate guards this

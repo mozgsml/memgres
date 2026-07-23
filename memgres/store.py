@@ -78,6 +78,12 @@ class Store:
         self.embedder = embedder if embedder is not None else get_embedder(cfg)
         self._own_conn = conn is None
         self._conn = conn or psycopg.connect(cfg.database_url or "")
+        # Qdrant holds vectors out-of-band; pgvector keeps them in-row (default).
+        self._use_qdrant = (cfg.vector_backend == "qdrant" and self.embedder is not None)
+        self._qdrant = None
+        if self._use_qdrant:
+            from .qdrant_backend import QdrantIndex
+            self._qdrant = QdrantIndex(self.embedder.dim)
 
     def close(self):
         if self._own_conn:
@@ -109,8 +115,15 @@ class Store:
             raise NoParent(f"parent of '{path}' does not exist "
                            f"(MEMGRES_REQUIRE_PARENT is on)")
 
-    def _embed(self, body: str) -> Optional[str]:
+    def _raw_vec(self, body: str) -> "Optional[list]":
         if not self.embedder:
+            return None
+        return self.embedder.embed_documents([body])[0]
+
+    def _embed(self, body: str) -> Optional[str]:
+        """pgvector literal for the in-row embedding column. Returns None when
+        embeddings are off OR vectors live in Qdrant (out-of-band)."""
+        if not self.embedder or self._use_qdrant:
             return None
         return _vec_literal(self.embedder.embed_documents([body])[0])
 
@@ -164,6 +177,8 @@ class Store:
             params,
         )
         mid, created, updated, expires = cur.fetchone()
+        if self._use_qdrant:
+            self._qdrant.upsert(str(mid), self._raw_vec(body), ns)
         # store create as a diff-from-empty so the whole history is a self-contained
         # chain (empty → current), replayable forward for reconstruct/annotate.
         self._append_history(str(mid), 1, "create", make_diff("", body), None, chash,
@@ -250,6 +265,8 @@ class Store:
                 RETURNING seq, created_at, updated_at, expires_at""",
             params)
         new_seq, created, updated, expires = cur.fetchone()
+        if self._use_qdrant and body_changed:
+            self._qdrant.upsert(str(id), self._raw_vec(new_body), ns)
         # store the canonical diff (recomputed) even for a whole-body replace, so
         # every body change is line-attributable and the chain stays replayable.
         stored_diff = make_diff(cur_body, new_body) if body_changed else None
@@ -287,7 +304,8 @@ class Store:
                path_prefix: Optional[str] = None, mode: str = "auto"):
         from .search import recall as _recall
         return _recall(self._conn, self.cfg, self.embedder, self._ns(token),
-                       query, k=k, tags=tags, path_prefix=path_prefix, mode=mode)
+                       query, k=k, tags=tags, path_prefix=path_prefix, mode=mode,
+                       qdrant=self._qdrant)
 
     # ─── convenience: move ──────────────────────────────────────────────────
     def move(self, token: Optional[str], id: str, new_path: str,
@@ -371,7 +389,10 @@ class Store:
         with self._conn.transaction():
             cur = self._conn.cursor()
             cur.execute("DELETE FROM memory WHERE id=%s AND namespace=%s", (id, ns))
-            return cur.rowcount > 0
+            deleted = cur.rowcount > 0
+        if deleted and self._use_qdrant:
+            self._qdrant.delete(id)      # drop the out-of-band vector too
+        return deleted
 
     def purge_expired(self) -> int:
         with self._conn.transaction():

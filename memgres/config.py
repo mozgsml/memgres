@@ -60,7 +60,7 @@ class Config:
     fts_language: str            # Postgres FTS dict: simple | english | russian | …
     vector_backend: str          # pgvector (default) | qdrant
     # embeddings
-    embed_provider: str          # none | local | jina | openai
+    embed_provider: str          # none | local | jina | openai | openai-compatible
     embed_model: str
     embed_dim: int               # 0 = infer from provider
     embed_api_key: str
@@ -73,7 +73,9 @@ class Config:
             raise ValueError(
                 "MEMGRES_MAX_WRITE_BYTES must be <= MEMGRES_MAX_BODY_BYTES"
             )
-        if self.embed_provider not in ("none", "local", "jina", "openai"):
+        if self.embed_provider not in (
+                "none", "local", "jina", "openai",
+                "openai-compatible", "compatible", "custom"):
             raise ValueError(f"unknown MEMGRES_EMBED_PROVIDER: {self.embed_provider}")
         if self.vector_backend not in ("pgvector", "qdrant"):
             raise ValueError(f"unknown MEMGRES_VECTOR_BACKEND: {self.vector_backend}")

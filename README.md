@@ -50,7 +50,7 @@ memgres (core library, no HTTP dependency)
   ├─ diffing      unified diff make/apply + content hash (optimistic locking)
   ├─ blame        line-attributed document + reconstruct any past version
   ├─ organize     tags (text[] + GIN) · tree (ltree path + GiST, fast subtree select)
-  ├─ search       lexical (Postgres FTS)  +  semantic (pgvector; Qdrant planned)  +  hybrid
+  ├─ search       lexical (Postgres FTS)  +  semantic (pgvector or Qdrant)  +  hybrid
   ├─ embeddings   provider via env: none | local (sentence-transformers) | cloud (Jina/OpenAI)
   └─ config       every limit via env (body/write size, TTL, namespaces, …)
 
@@ -116,7 +116,7 @@ s.forget(None, m.id)                                          # hard-erase + his
 
 ### Three ways to run it
 
-1. **`docker compose up`** — `pgvector` + service, nothing to configure. (A `qdrant` compose profile and `MEMGRES_VECTOR_BACKEND=qdrant` flag are scaffolded but the Qdrant backend isn't wired yet — pgvector is the working path.)
+1. **`docker compose up`** — `pgvector` + service, nothing to configure. For a dedicated vector service instead, `docker compose --profile qdrant up` and set `MEMGRES_VECTOR_BACKEND=qdrant` (Qdrant ranks vectors; Postgres still holds bodies and does tag/subtree/TTL filtering).
 2. **Your own Postgres** — `pip install "memgres[server]"`, point `MEMGRES_DATABASE_URL` at it, run `memgres-server` (migrates on startup).
 3. **Embedded library** — `pip install memgres`, use `Store` directly, no HTTP at all.
 
@@ -138,9 +138,9 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_REQUIRE_PARENT` | `false` | `true` = a node's parent path must already exist |
 | `MEMGRES_HISTORY` | `true` | keep the hash-chained diff history (deleted with the record) |
 | `MEMGRES_FTS_LANGUAGE` | `simple` | Postgres FTS dictionary (`simple`/`english`/…) |
-| `MEMGRES_VECTOR_BACKEND` | `pgvector` | `pgvector` (same DB); `qdrant` scaffolded, not yet wired |
-| `MEMGRES_EMBED_PROVIDER` | `none` | `none` / `local` / `jina` / `openai` |
-| `MEMGRES_EMBED_MODEL` / `_DIM` / `_API_KEY` / `_API_BASE` | — | embedding model settings |
+| `MEMGRES_VECTOR_BACKEND` | `pgvector` | `pgvector` (same DB) or `qdrant` (set `QDRANT_URL`, `QDRANT_API_KEY`, `MEMGRES_QDRANT_COLLECTION`) |
+| `MEMGRES_EMBED_PROVIDER` | `none` | `none` / `local` / `openai` / `jina` / `openai-compatible` (LM Studio, Ollama, vLLM, TEI…) |
+| `MEMGRES_EMBED_MODEL` / `_DIM` / `_API_KEY` / `_API_BASE` | — | model id · dimension (HTTP providers require it, `local` infers) · token · server URL |
 
 ## HTTP API
 
