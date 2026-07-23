@@ -3,12 +3,27 @@ name = "memgres"
 version = "0.1.0"
 description = "Drop-in memory for AI agents: one Postgres, lexical + semantic recall, diff-versioned history, GDPR-erasable."
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
-keywords = ["agent", "memory", "postgres", "pgvector", "embeddings", "semantic-search", "llm"]
+keywords = ["agent", "memory", "postgres", "pgvector", "qdrant", "embeddings", "semantic-search", "llm", "mcp", "rag"]
+authors = [{ name = "mozgsml" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries",
+]
 dependencies = [
     "psycopg[binary]>=3.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/mozgsml/memgres"
+Repository = "https://github.com/mozgsml/memgres"
+Issues = "https://github.com/mozgsml/memgres/issues"
 
 [project.optional-dependencies]
 # Semantic recall backends — install only what you use. Cloud embeddings
