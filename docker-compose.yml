@@ -3,6 +3,8 @@
 #   docker compose up            → pgvector + memgres on http://localhost:8080
 #   docker compose --profile qdrant up   → also start Qdrant (optional vector backend)
 #
+# By default this pulls the published image (no build). Pin a version with
+# MEMGRES_VERSION=0.1.0, or build from source by uncommenting `build: .` below.
 # Override any limit by putting MEMGRES_* into a local .env (all optional; see
 # .env.example). MEMGRES_DATABASE_URL is set here to point at the db service.
 name: memgres
@@ -25,7 +27,9 @@ services:
     # ports: ["5432:5432"]
 
   memgres:
-    build: .
+    image: ghcr.io/mozgsml/memgres:${MEMGRES_VERSION:-latest}
+    # build from source instead of pulling the published image:
+    # build: .
     environment:
       MEMGRES_DATABASE_URL: postgresql://memgres:memgres@db:5432/memgres
       # only used when MEMGRES_VECTOR_BACKEND=qdrant (start with --profile qdrant)

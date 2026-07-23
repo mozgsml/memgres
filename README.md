@@ -5,7 +5,7 @@
 
 **Versioned document memory for AI agents — one Postgres, lexical *or* semantic recall, diff-based history, GDPR-erasable.**
 
-> Status: early. Core library, search, HTTP API and MCP server are implemented and tested against a live pgvector Postgres.
+> Status: v0.1.0 — on [PyPI](https://pypi.org/project/memgres/) (`pip install memgres`) and [GHCR](https://ghcr.io/mozgsml/memgres). Core library, search (pgvector/Qdrant), HTTP API and MCP server, all tested in CI against live Postgres + Qdrant.
 
 memgres is a lightweight, drop-in memory layer — a Python library plus an optional HTTP/MCP service — backed by a single PostgreSQL database. You store **documents** (bodies of text an agent owns and edits), not facts an LLM guessed at. Every change is an authored diff with provenance, kept in a tamper-evident history that you can still delete when the law says you must.
 
@@ -119,16 +119,14 @@ s.forget(None, m.id)                                          # hard-erase + his
 
 ### Install
 
-> Not on PyPI yet — install from git (or clone and `pip install -e .`):
-
 ```bash
-pip install "git+https://github.com/mozgsml/memgres"            # core library
-pip install "memgres[server] @ git+https://github.com/mozgsml/memgres"   # + HTTP API
-pip install "memgres[mcp]   @ git+https://github.com/mozgsml/memgres"    # + MCP server
+pip install memgres              # core library
+pip install "memgres[server]"    # + HTTP API
+pip install "memgres[mcp]"       # + MCP server
 # extras: local (sentence-transformers), qdrant (Qdrant backend)
 ```
 
-Or pull the container image:
+Or pull the container image (public, no login):
 
 ```bash
 docker pull ghcr.io/mozgsml/memgres:latest
@@ -184,7 +182,7 @@ Namespace token (when `MEMGRES_NAMESPACES=true`) goes in `Authorization: Bearer 
 The same store is exposed to MCP clients (Claude Desktop, etc.) over stdio:
 
 ```bash
-pip install "memgres[mcp] @ git+https://github.com/mozgsml/memgres"
+pip install "memgres[mcp]"
 memgres-mcp                    # needs MEMGRES_DATABASE_URL; migrates on startup
 ```
 
