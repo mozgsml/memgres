@@ -1,0 +1,60 @@
+# memgres — one command to a working memory service.
+#
+#   docker compose up            → pgvector + memgres on http://localhost:8080
+#   docker compose --profile qdrant up   → also start Qdrant (optional vector backend)
+#
+# Override any limit by putting MEMGRES_* into a local .env (all optional; see
+# .env.example). MEMGRES_DATABASE_URL is set here to point at the db service.
+name: memgres
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: memgres
+      POSTGRES_PASSWORD: memgres
+      POSTGRES_DB: memgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memgres -d memgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    # Uncomment to reach Postgres from the host directly:
+    # ports: ["5432:5432"]
+
+  memgres:
+    build: .
+    environment:
+      MEMGRES_DATABASE_URL: postgresql://memgres:memgres@db:5432/memgres
+    env_file:
+      - path: .env          # optional: your MEMGRES_* overrides
+        required: false
+    ports:
+      # host port (override with MEMGRES_HOST_PORT) : container always 8080
+      - "${MEMGRES_HOST_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # slim image has no curl; hit /healthz with stdlib urllib
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz',timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 4s
+      retries: 5
+      start_period: 20s     # migrate runs on startup before serving
+    restart: unless-stopped
+
+  # Optional separate vector backend. Only used if MEMGRES_VECTOR_BACKEND=qdrant.
+  qdrant:
+    image: qdrant/qdrant:latest
+    profiles: ["qdrant"]
+    volumes:
+      - qdrantdata:/qdrant/storage
+    # ports: ["6333:6333"]
+
+volumes:
+  pgdata:
+  qdrantdata:
