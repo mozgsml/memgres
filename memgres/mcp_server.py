@@ -48,10 +48,23 @@ def build_server(cfg: Optional[Config] = None):
     mcp = _mcp("memgres")
 
     def _uid(token: Optional[str]) -> str:
-        """Resolve a token to its user id (for identity-management tools)."""
+        """Resolve a token to its user id (for read-level identity tools)."""
         p = identity.resolve(conn, cfg, token)
         if p.user_id is None:
             raise identity.AuthError("this token has no owning user")
+        return p.user_id
+
+    def _admin_uid(token: Optional[str]) -> str:
+        """Like _uid but for token management (issue/revoke/list). These are
+        account-level admin actions, so they require an UNSCOPED admin-ceiling
+        token — a read-only or namespace-scoped token must not mint/kill tokens
+        or escalate its own scope/permission."""
+        p = identity.resolve(conn, cfg, token)
+        if p.user_id is None:
+            raise identity.AuthError("this token has no owning user")
+        if p.permission != "admin" or p.scope_namespace_id is not None:
+            raise identity.AuthError(
+                "token management requires an unscoped admin-ceiling token")
         return p.user_id
 
     @mcp.tool()
@@ -150,9 +163,15 @@ def build_server(cfg: Optional[Config] = None):
         if expires_days:
             exp = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=expires_days)
         with conn.transaction():
-            uid = _uid(token)
+            uid = _admin_uid(token)
             nsid = space_id
-            if nsid is None and space is not None:
+            if nsid is not None:
+                # can only scope a new token to a namespace the caller can reach
+                with conn.cursor() as cur:
+                    if identity._reach(cur, uid, nsid) is None:
+                        raise identity.AuthError(
+                            "cannot scope a token to an unreachable namespace")
+            elif space is not None:
                 nsid = identity.create_namespace(conn, uid, space)
             secret, tid = identity.issue_token(
                 conn, uid, namespace_id=nsid, permission=permission,
@@ -164,7 +183,7 @@ def build_server(cfg: Optional[Config] = None):
     def memory_list_tokens(token: Optional[str] = None) -> List[dict]:
         """List your tokens (metadata only — never the secret)."""
         with conn.transaction():
-            out = identity.list_tokens(conn, _uid(token))
+            out = identity.list_tokens(conn, _admin_uid(token))
         for d in out:                                  # make timestamps JSON-safe
             for key in ("expires_at", "revoked_at", "last_used_at", "created_at"):
                 d[key] = str(d[key]) if d[key] else None
@@ -174,7 +193,7 @@ def build_server(cfg: Optional[Config] = None):
     def memory_revoke_token(token_id: str, token: Optional[str] = None) -> dict:
         """Revoke one of your tokens by id (kills it immediately)."""
         with conn.transaction():
-            uid = _uid(token)
+            uid = _admin_uid(token)
             owned = {t["id"] for t in identity.list_tokens(conn, uid)}
             if token_id not in owned:
                 raise identity.AuthError("not your token")

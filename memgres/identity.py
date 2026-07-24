@@ -228,7 +228,12 @@ def resolve_space(conn, principal: Principal, *, space_id: Optional[str] = None,
 
         # 3) default resolution
         if scope is not None:
-            perm = _reach(cur, uid, scope) or "read"
+            # a scoped token resolves to its namespace — but only if the user can
+            # actually reach it. Never default an unreachable scope to "read"
+            # (that would leak a namespace the token was wrongly scoped to).
+            perm = _reach(cur, uid, scope)
+            if perm is None:
+                raise SpaceNotFound(f"token scope {scope} not reachable")
             return scope, perm_min(perm, ceiling)
         cur.execute("SELECT default_namespace_id FROM app_user WHERE id=%s", (uid,))
         row = cur.fetchone()

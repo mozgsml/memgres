@@ -240,6 +240,9 @@ def test_admin_provisioning_and_request_access(monkeypatch):
         assert client.patch(f"/memories/{mid}",
                             json={"body": "hacked\n", "space_id": ns},
                             headers=hj).status_code == 401
+        # a malformed (non-uuid) space_id is a 400, not a 500 / aborted tx
+        assert client.get("/recall", params={"q": "x", "space_id": "not-a-uuid"},
+                          headers=ho).status_code == 400
 
 
 if __name__ == "__main__":

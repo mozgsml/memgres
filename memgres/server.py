@@ -23,6 +23,8 @@ psycopg_pool).
 
 from typing import List, Optional
 
+import psycopg
+
 from .config import Config, load
 from .diffing import DiffConflict
 from .embeddings import get_embedder
@@ -136,6 +138,11 @@ def create_app(cfg: Optional[Config] = None):
             raise HTTPException(401, str(e))
         except ValueError as e:
             raise HTTPException(422, str(e))
+        except psycopg.Error:
+            # malformed id (non-uuid space_id), FK violation on a non-existent
+            # namespace/request, etc. — a client input error, not a 500. Don't
+            # echo the DB message (avoids leaking schema / existence detail).
+            raise HTTPException(400, "bad request")
 
     # ─── routes ─────────────────────────────────────────────────────────────
     @app.get("/healthz")

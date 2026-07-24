@@ -220,6 +220,30 @@ def test_random_and_malformed_tokens_rejected(env):
             s.recall(bad, "x")
 
 
+def test_token_scoped_to_unreachable_namespace_cannot_read(env):
+    """Regression for the composed cross-tenant read: a token wrongly scoped to a
+    namespace its user can't reach must NOT resolve that namespace on the default
+    path (it once defaulted to 'read' and leaked bodies via recall)."""
+    setup, make_store = env
+    s = make_store("managed")
+    _, victim_tok, _ = _user_with_token(setup, "victim", namespace="vault")
+    vmem = s.write(victim_tok, body="top secret payload\n", space="vault")
+    vns = _ns_of(setup, "victim", "vault")
+
+    # attacker's user; forge a token scoped to the victim's namespace id
+    a_uid = ident.create_user(setup, name="attacker")
+    bad, _ = ident.issue_token(setup, a_uid, namespace_id=vns, permission="read")
+
+    with pytest.raises(DENIED):                 # default path — the old leak
+        s.recall(bad, "secret payload")
+    with pytest.raises(DENIED):                 # by-id path
+        s.recall(bad, "secret payload", space_id=vns)
+    with pytest.raises(DENIED):                 # get by known uuid + default
+        s.get(bad, vmem.id)
+    with pytest.raises(DENIED):
+        s.get(bad, vmem.id, space_id=vns)
+
+
 def test_open_mode_random_token_reads_nothing(env):
     """A well-formed but never-written token (open mode) creates nothing and
     cannot read another tenant's data."""
