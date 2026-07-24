@@ -233,12 +233,34 @@ def create_app(cfg: Optional[Config] = None):
                      "path": h.path, "score": h.score} for h in hits]
 
     # ─── spaces: what this token can reach ──────────────────────────────────
+    from . import identity
+
+    def _me(conn, tok) -> str:
+        """The caller's user id, or 401 if the token has no owning user."""
+        p = identity.resolve(conn, cfg, tok)
+        if p.user_id is None:
+            raise HTTPException(401, "this token has no owning user")
+        return p.user_id
+
+    def _require_admin_on(conn, tok, space_id: str) -> str:
+        """Caller must hold effective admin (membership min token ceiling) on the
+        namespace. Returns the caller's user id."""
+        p = identity.resolve(conn, cfg, tok)
+        if p.user_id is None:
+            raise HTTPException(401, "this token has no owning user")
+        with conn.cursor() as cur:
+            membership = identity._reach(cur, p.user_id, space_id)
+        if membership is None:
+            raise HTTPException(404, "no such namespace")
+        if identity.perm_min(membership, p.permission) != "admin":
+            raise HTTPException(403, "admin on this namespace required")
+        return p.user_id
+
     @app.get("/spaces")
     def spaces(tok: Optional[str] = Depends(token)):
         """List the namespaces this token can reach (identity modes only)."""
         if cfg.key_mode == "single":
             return []
-        from . import identity
         with pool.connection() as conn:
             def _list():
                 p = identity.resolve(conn, cfg, tok)
@@ -246,6 +268,128 @@ def create_app(cfg: Optional[Config] = None):
                     return []
                 return identity.list_spaces(conn, p.user_id)
             return _guard(_list)
+
+    # ─── request-access: ask to join a namespace, owner approves ────────────
+    class RequestBody(BaseModel):
+        permission: str = "read"
+
+    @app.post("/spaces/{space_id}/access-requests", status_code=201)
+    def request_access(space_id: str, req: RequestBody,
+                       tok: Optional[str] = Depends(token)):
+        with pool.connection() as conn:
+            def _do():
+                uid = _me(conn, tok)
+                return {"id": identity.request_access(conn, uid, space_id,
+                                                      req.permission)}
+            return _guard(_do)
+
+    @app.get("/spaces/{space_id}/access-requests")
+    def list_access_requests(space_id: str, tok: Optional[str] = Depends(token)):
+        with pool.connection() as conn:
+            def _do():
+                _require_admin_on(conn, tok, space_id)
+                return identity.list_requests(conn, space_id)
+            return _guard(_do)
+
+    def _decide_access(conn, tok, req_id: str, approve: bool):
+        with conn.cursor() as cur:
+            cur.execute("SELECT namespace_id FROM access_request WHERE id=%s",
+                        (req_id,))
+            row = cur.fetchone()
+        if row is None:
+            raise HTTPException(404, "no such request")
+        _require_admin_on(conn, tok, str(row[0]))
+        if approve:
+            identity.approve_request(conn, req_id)
+        else:
+            identity.deny_request(conn, req_id)
+
+    @app.post("/access-requests/{req_id}/approve")
+    def approve_access(req_id: str, tok: Optional[str] = Depends(token)):
+        with pool.connection() as conn:
+            _guard(lambda: _decide_access(conn, tok, req_id, True))
+            return {"approved": req_id}
+
+    @app.post("/access-requests/{req_id}/deny")
+    def deny_access(req_id: str, tok: Optional[str] = Depends(token)):
+        with pool.connection() as conn:
+            _guard(lambda: _decide_access(conn, tok, req_id, False))
+            return {"denied": req_id}
+
+    # ─── admin provisioning (MEMGRES_ADMIN_TOKEN) ───────────────────────────
+    def admin(authorization: Optional[str] = Header(None),
+              x_memgres_token: Optional[str] = Header(None)):
+        tok = x_memgres_token
+        if not tok and authorization and authorization.lower().startswith("bearer "):
+            tok = authorization[7:]
+        if not cfg.admin_token or tok != cfg.admin_token:
+            raise HTTPException(403, "admin token required")
+
+    class NewUser(BaseModel):
+        name: str = ""
+        description: str = ""
+
+    class NewNamespace(BaseModel):
+        owner_user_id: str
+        name: str
+        description: str = ""
+        instruction: str = ""
+
+    class NewToken(BaseModel):
+        user_id: str
+        namespace_id: Optional[str] = None
+        permission: str = "write"
+        label: str = ""
+        expires_days: Optional[int] = None
+
+    class NewMember(BaseModel):
+        user_id: str
+        permission: str = "read"
+
+    @app.post("/admin/users", status_code=201, dependencies=[Depends(admin)])
+    def admin_create_user(req: NewUser):
+        with pool.connection() as conn:
+            return {"id": _guard(lambda: identity.create_user(
+                conn, req.name, req.description))}
+
+    @app.post("/admin/namespaces", status_code=201, dependencies=[Depends(admin)])
+    def admin_create_namespace(req: NewNamespace):
+        with pool.connection() as conn:
+            return {"id": _guard(lambda: identity.create_namespace(
+                conn, req.owner_user_id, req.name, description=req.description,
+                instruction=req.instruction))}
+
+    @app.post("/admin/tokens", status_code=201, dependencies=[Depends(admin)])
+    def admin_issue_token(req: NewToken):
+        import datetime as dt
+        exp = None
+        if req.expires_days:
+            exp = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=req.expires_days)
+        with pool.connection() as conn:
+            secret, tid = _guard(lambda: identity.issue_token(
+                conn, req.user_id, namespace_id=req.namespace_id,
+                permission=req.permission, label=req.label, expires_at=exp))
+            return {"token": secret, "id": tid,
+                    "note": "store this now — it is not recoverable"}
+
+    @app.post("/admin/tokens/{token_id}/revoke", dependencies=[Depends(admin)])
+    def admin_revoke_token(token_id: str):
+        with pool.connection() as conn:
+            return {"revoked": _guard(lambda: identity.revoke_token(conn, token_id))}
+
+    @app.get("/admin/users/{user_id}/tokens", dependencies=[Depends(admin)])
+    def admin_list_tokens(user_id: str):
+        with pool.connection() as conn:
+            return _guard(lambda: identity.list_tokens(conn, user_id))
+
+    @app.post("/admin/namespaces/{space_id}/members", status_code=201,
+              dependencies=[Depends(admin)])
+    def admin_add_member(space_id: str, req: NewMember):
+        with pool.connection() as conn:
+            _guard(lambda: identity.add_member(
+                conn, space_id, req.user_id, req.permission))
+            return {"namespace_id": space_id, "user_id": req.user_id,
+                    "permission": req.permission}
 
     return app
 

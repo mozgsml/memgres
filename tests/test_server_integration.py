@@ -184,5 +184,63 @@ def test_identity_open_mode_over_http(monkeypatch):
         assert client.get("/recall", params={"q": "secret"}, headers=hb).json() == []
 
 
+def test_admin_provisioning_and_request_access(monkeypatch):
+    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    for k in list(os.environ):
+        if k.startswith("MEMGRES_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
+    monkeypatch.setenv("MEMGRES_KEY_MODE", "managed")
+    monkeypatch.setenv("MEMGRES_ADMIN_TOKEN", "root-admin")
+    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
+    monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
+    app = create_app(load())
+    A = {"Authorization": "Bearer root-admin"}
+    with TestClient(app) as client:
+        # non-admin can't provision
+        assert client.post("/admin/users", json={"name": "x"}).status_code == 403
+        # admin creates two users, a namespace, and an admin token for the owner
+        owner = client.post("/admin/users", json={"name": "owner"}, headers=A).json()["id"]
+        joiner = client.post("/admin/users", json={"name": "joiner"}, headers=A).json()["id"]
+        ns = client.post("/admin/namespaces",
+                         json={"owner_user_id": owner, "name": "team"},
+                         headers=A).json()["id"]
+        owner_tok = client.post("/admin/tokens",
+                                json={"user_id": owner, "permission": "admin"},
+                                headers=A).json()["token"]
+        joiner_tok = client.post("/admin/tokens",
+                                 json={"user_id": joiner, "permission": "write"},
+                                 headers=A).json()["token"]
+        ho = {"Authorization": f"Bearer {owner_tok}"}
+        hj = {"Authorization": f"Bearer {joiner_tok}"}
+
+        # owner writes into the team namespace
+        r = client.post("/memories", json={"body": "team memo\n", "space": "team"},
+                        headers=ho)
+        assert r.status_code == 201
+        mid = r.json()["id"]
+        # joiner can't reach it yet
+        assert client.get(f"/memories/{mid}", params={"space_id": ns},
+                          headers=hj).status_code == 404
+        # joiner requests read access; owner approves
+        rid = client.post(f"/spaces/{ns}/access-requests", json={"permission": "read"},
+                          headers=hj).json()["id"]
+        assert len(client.get(f"/spaces/{ns}/access-requests", headers=ho).json()) == 1
+        # joiner (only a requester, no membership) can't approve their own request
+        # (404 — the namespace isn't even visible to them, existence not leaked)
+        assert client.post(f"/access-requests/{rid}/approve",
+                           headers=hj).status_code in (403, 404)
+        assert client.post(f"/access-requests/{rid}/approve",
+                           headers=ho).status_code == 200
+        # now joiner reads it (by id — it's a shared space)
+        assert client.get(f"/memories/{mid}", params={"space_id": ns},
+                          headers=hj).json()["body"] == "team memo\n"
+        # but joiner's read is capped at read: can't edit
+        assert client.patch(f"/memories/{mid}",
+                            json={"body": "hacked\n", "space_id": ns},
+                            headers=hj).status_code == 401
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
