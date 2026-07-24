@@ -77,8 +77,8 @@ class Store:
                  conn: Optional["psycopg.Connection"] = None):
         self.cfg = cfg
         self.embedder = embedder if embedder is not None else get_embedder(cfg)
-        # v0.2 identity is on for open/managed; single mode keeps the legacy
-        # namespace = '' (or hash(token) when MEMGRES_NAMESPACES) behavior.
+        # identity is on for open/managed; single mode is one shared space,
+        # namespace = '' , no auth.
         self._identity_on = cfg.key_mode != "single"
         self._own_conn = conn is None
         self._conn = conn or psycopg.connect(cfg.database_url or "")
@@ -94,26 +94,15 @@ class Store:
             self._conn.close()
 
     # ─── namespace resolution / authorization ───────────────────────────────
-    def _ns_legacy(self, token: Optional[str]) -> str:
-        """single-mode namespace: '' by default, or hash(token) under the legacy
-        MEMGRES_NAMESPACES flag. No users/permissions — the v0.1 behavior."""
-        if not self.cfg.namespaces_enabled:
-            return ""
-        token = token or self.cfg.token      # env/MCP default for single-tenant setups
-        if not token:
-            raise PermissionError("MEMGRES_NAMESPACES is on: a token is required "
-                                  "(pass one, or set MEMGRES_TOKEN)")
-        return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
     def _authorize(self, token: Optional[str], *, space: Optional[str] = None,
                    space_id: Optional[str] = None, need: str = "read",
                    for_write: bool = False) -> str:
         """Resolve (token, space) to the namespace id-string to operate in, and
-        enforce ``need`` (read|write|admin). In single mode this is the legacy
-        namespace and no auth happens. In open/managed mode a token is required;
-        the returned string is a namespace uuid (or '' never)."""
+        enforce ``need`` (read|write|admin). In single mode there is one shared
+        space ('') and no auth. In open/managed mode a token is required; the
+        returned string is a namespace uuid."""
         if not self._identity_on:
-            return self._ns_legacy(token)
+            return ""
         token = token or self.cfg.token or None
         with self._conn.transaction():
             principal = identity.resolve(self._conn, self.cfg, token)

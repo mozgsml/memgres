@@ -120,31 +120,6 @@ def test_blame_lines_query(client):
         f"/memories/{mid}/blame", params={"text": "false"}).json()[0]
 
 
-def test_namespace_token_required(monkeypatch):
-    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
-        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
-    for k in list(os.environ):
-        if k.startswith("MEMGRES_"):
-            monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
-    monkeypatch.setenv("MEMGRES_NAMESPACES", "true")
-    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
-    monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
-    app = create_app(load())
-    with TestClient(app) as client:
-        # no token -> 401
-        assert client.post("/memories", json={"body": "x\n"}).status_code == 401
-        # with token -> ok, and another token can't read it
-        r = client.post("/memories", json={"body": "alice\n"},
-                        headers={"Authorization": "Bearer alice-tok"})
-        assert r.status_code == 201
-        mid = r.json()["id"]
-        assert client.get(f"/memories/{mid}",
-                          headers={"X-Memgres-Token": "bob-tok"}).status_code == 404
-        assert client.get(f"/memories/{mid}",
-                          headers={"X-Memgres-Token": "alice-tok"}).status_code == 200
-
-
 def test_identity_open_mode_over_http(monkeypatch):
     from memgres import identity
     with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:

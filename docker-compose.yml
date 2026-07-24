@@ -65,9 +65,9 @@ services:
       MEMGRES_MCP_HOST: 0.0.0.0
       MEMGRES_MCP_PORT: "8765"
       QDRANT_URL: http://qdrant:6333
-      # single-tenant token (optional): uncomment to isolate this endpoint
-      # MEMGRES_NAMESPACES: "true"
-      # MEMGRES_TOKEN: change-me
+      # multi-tenant (optional): uncomment to require tokens on this endpoint
+      # MEMGRES_KEY_MODE: open
+      # MEMGRES_TOKEN: change-me      # or a default token for a one-tenant endpoint
     env_file:
       - path: .env
         required: false

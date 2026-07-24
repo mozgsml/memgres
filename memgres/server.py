@@ -12,9 +12,9 @@ billing layer can wrap these routes without touching store logic:
     GET    /recall                  lexical / semantic / hybrid recall
     GET    /healthz                 liveness
 
-The namespace token (when MEMGRES_NAMESPACES is on) comes in as a bearer token or
-`X-Memgres-Token` header; recall/read are the cheap ops, writes the expensive ones
-— the natural place for per-route pricing/metering later.
+In identity modes (MEMGRES_KEY_MODE=open|managed) the token comes in as a bearer
+token or `X-Memgres-Token` header; recall/read are the cheap ops, writes the
+expensive ones — the natural place for per-route pricing/metering later.
 
 Concurrency: a psycopg_pool hands each request its own connection; the embedder
 is built once and shared. Requires the `[server]` extra (fastapi, uvicorn,
@@ -109,8 +109,7 @@ def create_app(cfg: Optional[Config] = None):
         if not tok and authorization and authorization.lower().startswith("bearer "):
             tok = authorization[7:]
         tok = tok or cfg.token          # env default (single-tenant deployments)
-        auth_required = cfg.namespaces_enabled or cfg.key_mode != "single"
-        if auth_required and not tok:
+        if cfg.key_mode != "single" and not tok:
             raise HTTPException(401, "token required")
         return tok
 

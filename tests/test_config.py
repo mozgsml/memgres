@@ -19,7 +19,7 @@ def test_defaults(monkeypatch):
     c = load()
     assert c.max_body_bytes == 262_144
     assert c.max_write_bytes == 16_384
-    assert c.namespaces_enabled is False
+    assert c.key_mode == "single"
     assert c.embed_provider == "none"
 
 

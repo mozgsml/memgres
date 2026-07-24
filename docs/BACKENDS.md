@@ -126,7 +126,7 @@ MEMGRES_VECTOR_BACKEND=pgvector
 **Multi-tenant service, cloud embeddings, dedicated Qdrant:**
 ```bash
 MEMGRES_DATABASE_URL=postgresql://…
-MEMGRES_NAMESPACES=true
+MEMGRES_KEY_MODE=managed
 MEMGRES_EMBED_PROVIDER=openai
 MEMGRES_EMBED_MODEL=text-embedding-3-small
 MEMGRES_EMBED_DIM=1536

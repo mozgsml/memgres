@@ -5,7 +5,7 @@
 
 **Versioned document memory for AI agents — one Postgres, lexical *or* semantic recall, diff-based history, GDPR-erasable.**
 
-> Status: v0.1.0 — on [PyPI](https://pypi.org/project/memgres/) (`pip install memgres`) and [GHCR](https://ghcr.io/mozgsml/memgres). Core library, search (pgvector/Qdrant), HTTP API and MCP server, all tested in CI against live Postgres + Qdrant.
+> Status: v0.2.0 — on [PyPI](https://pypi.org/project/memgres/) (`pip install memgres`) and [GHCR](https://ghcr.io/mozgsml/memgres). Core library, search (pgvector/Qdrant), multi-tenant identity (users / namespaces / scoped tokens), HTTP API and MCP server, all tested in CI against live Postgres + Qdrant.
 
 memgres is a lightweight, drop-in memory layer — a Python library plus an optional HTTP/MCP service — backed by a single PostgreSQL database. You store **documents** (bodies of text an agent owns and edits), not facts an LLM guessed at. Every change is an authored diff with provenance, kept in a tamper-evident history that you can still delete when the law says you must.
 
@@ -37,7 +37,7 @@ Reach for memgres when you want **auditable, authored, versioned text memory**.
 | **Lexical *and* semantic (hybrid)** | Exact identifiers/codes go to lexical (where [dense retrieval alone stumbles](https://tianpan.co/blog/2026-04-12-hybrid-search-production-bm25-dense-embeddings)); meaning-based queries go to vectors; hybrid fuses both with RRF. |
 | **Embedding-model safety by construction** | The model id + dimension are stamped into the schema; a mismatch **hard-fails** instead of silently returning garbage. |
 | **TTL renewed on read** | Active memory persists because it's used; abandoned memory expires itself. Storage self-cleans instead of growing forever. |
-| **Optional token namespaces** | Multi-tenant isolation when you need it (secret token → namespace); nothing to configure for single-user. |
+| **Optional multi-tenant identity** | Users, namespaces and rotatable scoped tokens when you need isolation; nothing to configure for single-user. |
 | **Fast subtree recall via `ltree`** | Memories form a real tree; `path <@ 'a.b'` pulls a whole subtree in one GiST index scan, no recursive walk that degrades with depth. |
 | **Git-blame + version reconstruct** | Every line carries who last changed it (grouped into author-blocks); any past version reconstructs from history — no replaying diffs yourself. |
 | **One Postgres, one backup** | The whole thing is `pg_dump`-able; the vector index rebuilds from the source of truth. No second datastore to run or back up. |
@@ -55,7 +55,7 @@ memgres (core library, no HTTP dependency)
   ├─ organize     tags (text[] + GIN) · tree (ltree path + GiST, fast subtree select)
   ├─ search       lexical (Postgres FTS)  +  semantic (pgvector or Qdrant)  +  hybrid
   ├─ embeddings   provider via env: none | local (sentence-transformers) | cloud (Jina/OpenAI)
-  └─ config       every limit via env (body/write size, TTL, namespaces, …)
+  └─ config       every limit via env (body/write size, TTL, key mode, …)
 
 optional layers on top of the same core:
   ├─ HTTP API (FastAPI)   REST + OpenAPI
@@ -64,7 +64,7 @@ optional layers on top of the same core:
 
 **Record model:** one memory = one mutable body (up to a configurable ceiling, default 256 KB) plus metadata — `tags` (cross-cutting labels, `text[]` + GIN), a `path` (its place in an `ltree` tree), timestamps, and per-diff provenance (`source`/`reason`, kept in history). A single write/diff is capped smaller (default 16 KB), so large bodies accrue over many authored diffs. **Organization is two orthogonal axes:** the tree is *where a memory lives* (one place, subtree-selectable); tags are *what it's about* (many, overlapping). Both filter either search — narrow a semantic query to a subtree, or list a tag across the tree.
 
-**Isolation:** optional token *namespaces* keep tenants from seeing each other's memories (namespace = hash of a secret token, so one wallet can back many clients). Encryption at rest is left to the deployment — Postgres/managed-PG/disk TDE stays transparent to queries, so search keeps working; memgres deliberately does **not** encrypt bodies application-side (that would make them unsearchable, which is why no comparable tool does it either). GDPR erasure is real: `forget()` hard-deletes the row, its vectors, and crypto-shreds the history chain. All limits are env-configurable, so the same code serves a single-user embed and a capped multi-tenant service.
+**Isolation:** optional multi-tenant identity keeps tenants from seeing each other's memories — users own *namespaces*, and rotatable, permission-scoped *tokens* authenticate as a user (turned on with `MEMGRES_KEY_MODE=open|managed`; see [docs/TENANCY.md](docs/TENANCY.md)). Encryption at rest is left to the deployment — Postgres/managed-PG/disk TDE stays transparent to queries, so search keeps working; memgres deliberately does **not** encrypt bodies application-side (that would make them unsearchable, which is why no comparable tool does it either). GDPR erasure is real: `forget()` hard-deletes the row, its vectors, and crypto-shreds the history chain. All limits are env-configurable, so the same code serves a single-user embed and a capped multi-tenant service.
 
 ---
 
@@ -170,7 +170,6 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_KEY_MODE` | `single` | `single` (no auth, one space) · `open` (bring-your-own token, self-registers) · `managed` (admin-provisioned). See [docs/TENANCY.md](docs/TENANCY.md) |
 | `MEMGRES_ADMIN_TOKEN` | — | global admin bearer for provisioning (managed mode) |
 | `MEMGRES_TOKEN` | — | default token used when a call passes none (single-tenant endpoints) |
-| `MEMGRES_NAMESPACES` | `false` | legacy single-mode flag: `true` = namespace is `hash(token)` (superseded by `MEMGRES_KEY_MODE`) |
 | `MEMGRES_TREE` | `true` | `ltree` path column + GiST index (fast subtree select) |
 | `MEMGRES_REQUIRE_PARENT` | `false` | `true` = a node's parent path must already exist |
 | `MEMGRES_HISTORY` | `true` | keep the hash-chained diff history (deleted with the record) |
@@ -244,10 +243,10 @@ Either way the model gets tools `memory_write`, `memory_recall`, `memory_get`,
 X"* / *"what do you know about Y?"* and it calls them. (For semantic recall add the
 embedding env vars — see [docs/BACKENDS.md](docs/BACKENDS.md).)
 
-**Isolation:** the compose HTTP endpoint is one tenant — set `MEMGRES_NAMESPACES=true`
-+ `MEMGRES_TOKEN=<secret>` on the `mcp` service to scope it. For per-user isolation,
-run one stdio server per user with each user's `MEMGRES_TOKEN` in their client's env;
-every memory then lives in `hash(MEMGRES_TOKEN)`.
+**Isolation:** by default the endpoint is single-tenant (one shared space). For
+multi-tenant, set `MEMGRES_KEY_MODE=open` (or `managed`) and give each client its
+own `mgk_` token — passed as the `token` tool argument, or as `MEMGRES_TOKEN` on a
+one-tenant `mcp` service. Full model in [docs/TENANCY.md](docs/TENANCY.md).
 
 **B. From your own agent code** — your loop calls the HTTP API or the `Store`
 library after the model produces text (see the examples above). Use this when you
@@ -266,7 +265,7 @@ There is **no token for single-user / local use** — leave everything default
   Tokens are rotatable, expirable, revocable, and restrictable (a permission
   ceiling + optional scope to one namespace); the secret is stored only as a hash.
   Rotating a token does **not** move you to a new empty space — many tokens can
-  back one user, and namespaces are addressed by name/id, not by `hash(token)`.
+  back one user, and namespaces are addressed by name or id.
 
   ```bash
   python -c "import secrets; print('mgk_'+secrets.token_urlsafe(32))"   # open mode: mint your own

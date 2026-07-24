@@ -49,10 +49,9 @@ class Config:
     retention_days: int          # 0 = forever; >0 = expire N days after last touch
     renew_on_read: bool          # a read pushes the expiry clock forward
     # multi-tenant isolation
-    namespaces_enabled: bool     # False = single space; True = secret-token namespaces
-    token: str                   # default namespace token when a call passes none
+    token: str                   # default token used when a call passes none
                                  # (set in MCP/env for a single-tenant deployment)
-    # identity / tenancy (v0.2 model; see docs/TENANCY.md)
+    # identity / tenancy (see docs/TENANCY.md)
     key_mode: str                # single | open | managed  (how tokens/users are minted)
     admin_token: str             # global-admin bearer: provision users/namespaces anywhere
     # organization
@@ -104,7 +103,6 @@ def load() -> Config:
         max_write_bytes=_int("MEMGRES_MAX_WRITE_BYTES", 16_384),      # 16 KB
         retention_days=_int("MEMGRES_RETENTION_DAYS", 0),
         renew_on_read=_bool("MEMGRES_RENEW_ON_READ", True),
-        namespaces_enabled=_bool("MEMGRES_NAMESPACES", False),
         token=_str("MEMGRES_TOKEN", ""),
         key_mode=_str("MEMGRES_KEY_MODE", "single"),
         admin_token=_str("MEMGRES_ADMIN_TOKEN", ""),

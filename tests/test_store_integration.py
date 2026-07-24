@@ -148,41 +148,19 @@ def test_require_parent_enforced(monkeypatch):
     conn.close()
 
 
-def test_namespace_isolation(monkeypatch):
-    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
-        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
-    for k in list(os.environ):
-        if k.startswith("MEMGRES_"):
-            monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
-    monkeypatch.setenv("MEMGRES_NAMESPACES", "true")
-    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
-    monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
-    cfg = load()
-    conn = psycopg.connect(DSN)
-    migrate(conn, cfg)
-    s = Store(cfg, conn=conn)
-    m = s.write("alice-token", body="alice's memory\n")
-    # bob can't read alice's memory by id
-    with pytest.raises(NotFound):
-        s.get("bob-token", m.id)
-    # alice can
-    assert s.get("alice-token", m.id).body == "alice's memory\n"
-    # no token at all -> refused when namespaces on
-    with pytest.raises(PermissionError):
-        s.write(None, body="x\n")
-    conn.close()
-
-
 def test_default_token_from_config(monkeypatch):
+    """MEMGRES_TOKEN is the default identity when a call passes no token
+    (single-tenant endpoints); a different token is a different user."""
+    from memgres.identity import new_token, SpaceNotFound
     with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
         cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
-    monkeypatch.setenv("MEMGRES_NAMESPACES", "true")
-    monkeypatch.setenv("MEMGRES_TOKEN", "single-tenant-secret")   # env default
+    monkeypatch.setenv("MEMGRES_KEY_MODE", "open")
+    default_tok = new_token()
+    monkeypatch.setenv("MEMGRES_TOKEN", default_tok)              # env default
     monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
     monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
     cfg = load(); conn = psycopg.connect(DSN); migrate(conn, cfg)
@@ -190,9 +168,9 @@ def test_default_token_from_config(monkeypatch):
     # no token passed -> falls back to MEMGRES_TOKEN, so writes/reads work
     m = s.write(None, body="via default token\n")
     assert s.get(None, m.id).body == "via default token\n"
-    # an explicit different token is a different namespace -> can't see it
-    with pytest.raises(NotFound):
-        s.get("other-secret", m.id)
+    # a different token is a different user -> can't see it
+    with pytest.raises((NotFound, SpaceNotFound)):
+        s.get(new_token(), m.id)
     conn.close()
 
 
