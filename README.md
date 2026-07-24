@@ -232,7 +232,11 @@ pip install "memgres[mcp]"
   "mcpServers": {
     "memgres": {
       "command": "memgres-mcp",
-      "env": { "MEMGRES_DATABASE_URL": "postgresql://memgres:memgres@localhost:5432/memgres" }
+      "env": {
+        "MEMGRES_DATABASE_URL": "postgresql://memgres:memgres@localhost:5432/memgres",
+        "MEMGRES_KEY_MODE": "open",
+        "MEMGRES_TOKEN": "mgk_…"
+      }
     }
   }
 }
@@ -243,10 +247,24 @@ Either way the model gets tools `memory_write`, `memory_recall`, `memory_get`,
 X"* / *"what do you know about Y?"* and it calls them. (For semantic recall add the
 embedding env vars — see [docs/BACKENDS.md](docs/BACKENDS.md).)
 
-**Isolation:** by default the endpoint is single-tenant (one shared space). For
-multi-tenant, set `MEMGRES_KEY_MODE=open` (or `managed`) and give each client its
-own `mgk_` token — passed as the `token` tool argument, or as `MEMGRES_TOKEN` on a
-one-tenant `mcp` service. Full model in [docs/TENANCY.md](docs/TENANCY.md).
+**Isolation — pin the identity in the client config; the agent never handles the
+token** (so the model spends nothing echoing a secret and can't switch user):
+
+- **stdio**: set `MEMGRES_KEY_MODE=open` + `MEMGRES_TOKEN=<mgk_…>` in the client's
+  `env` block (above).
+- **http**: send the token as a header — one shared endpoint then serves many
+  clients, each pinned to its own user:
+  ```json
+  { "mcpServers": { "memgres": {
+      "url": "http://localhost:8765/mcp",
+      "headers": { "Authorization": "Bearer mgk_…" } } } }
+  ```
+
+A *namespace-scoped* token also locks the agent to one space. Only a genuinely
+multi-tenant endpoint (open/managed, **no** pinned token) exposes a `token` tool
+argument for the model to supply — force it either way with
+`MEMGRES_MCP_TOKEN_ARG=on|off`. Single mode needs no token. Full model in
+[docs/TENANCY.md](docs/TENANCY.md).
 
 **B. From your own agent code** — your loop calls the HTTP API or the `Store`
 library after the model produces text (see the examples above). Use this when you
@@ -271,9 +289,11 @@ There is **no token for single-user / local use** — leave everything default
   python -c "import secrets; print('mgk_'+secrets.token_urlsafe(32))"   # open mode: mint your own
   ```
 
-  Sent as `Authorization: Bearer <token>` / `X-Memgres-Token` (HTTP), the `token`
-  argument (library/MCP), or `MEMGRES_TOKEN` in env for a single-tenant endpoint.
-  It's a bearer secret with **no recovery** — treat it like a password.
+  Sent as `Authorization: Bearer <token>` / `X-Memgres-Token` (HTTP + MCP over
+  http), the `token` argument (library), or `MEMGRES_TOKEN` in env for a
+  single-tenant endpoint. Over MCP the agent never passes it — you pin it in the
+  client config (env or headers). It's a bearer secret with **no recovery** —
+  treat it like a password.
 
 Full model — users, namespaces, permissions, request-access, admin
 provisioning — in **[docs/TENANCY.md](docs/TENANCY.md)**.

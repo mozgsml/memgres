@@ -1,4 +1,4 @@
-"""MCP server exposing memgres as agent tools (stdio).
+"""MCP server exposing memgres as agent tools (stdio or Streamable HTTP).
 
 Thin wrapper over the same `Store` the HTTP layer uses — an MCP client (Claude
 Desktop, etc.) gets write / recall / get / blame / history / move / forget as
@@ -8,11 +8,26 @@ tools. Run it:
 
 Requires MEMGRES_DATABASE_URL (or libpq PG* env) pointing at a Postgres the
 schema can migrate into; migration runs once on startup.
+
+**The caller's identity is pinned in the MCP client config, never handled by the
+LLM.** The tools take no `token` argument. The token is resolved server-side:
+
+  * http transport — the ``Authorization: Bearer <mgk_…>`` (or ``X-Memgres-Token``)
+    header the client sends, so one shared endpoint serves many clients, each
+    pinned to its own user via its own config ``headers``;
+  * else the ``MEMGRES_TOKEN`` env default (a stdio client sets it in its config
+    ``env`` block; a dedicated http endpoint sets it on the service).
+
+So the agent works as one fixed user, spends no tokens echoing a secret, and
+can't switch users. Pin a *namespace-scoped* token and it can't switch space
+either. (``single`` mode needs no token at all.)
 """
 
 from __future__ import annotations
 
 from typing import List, Optional
+
+from mcp.server.fastmcp import Context
 
 from . import identity
 from .config import Config, load
@@ -52,8 +67,53 @@ def build_server(cfg: Optional[Config] = None):
         migrate(conn, cfg)
     mcp = _mcp("memgres")
 
+    # Should the LLM-facing tools carry a `token` argument at all?
+    #   MEMGRES_MCP_TOKEN_ARG = on | off | auto (default).
+    # auto: expose it only on a genuinely multi-tenant endpoint with no pinned
+    # default token — i.e. when the LLM really must supply the identity. When the
+    # identity is pinned (MEMGRES_TOKEN, or a per-client Authorization header) or
+    # in single mode, the argument is pruned so the agent never sees or fills it.
+    import os as _os
+    _arg = _os.environ.get("MEMGRES_MCP_TOKEN_ARG", "auto").strip().lower()
+    if _arg in ("1", "true", "on", "yes"):
+        expose_token = True
+    elif _arg in ("0", "false", "off", "no"):
+        expose_token = False
+    else:
+        expose_token = cfg.key_mode != "single" and not cfg.token
+
     def _store(conn):
         return Store(cfg, embedder=embedder, conn=conn)
+
+    def _token(ctx, arg: Optional[str] = None) -> Optional[str]:
+        """The caller's token, resolved **authoritatively** so a pin can't be
+        overridden by the model:
+
+          1. a per-client ``Authorization: Bearer`` / ``X-Memgres-Token`` header
+             (http transport) — how a client pins its own identity;
+          2. else ``MEMGRES_TOKEN`` — a pinned default the arg cannot override;
+          3. else the explicit ``arg`` — only meaningful on an unpinned,
+             multi-tenant endpoint (where the arg is exposed).
+
+        Security does not depend on the schema-pruning below: even if the `token`
+        argument stays visible, a header/env pin still wins here."""
+        req = None
+        if ctx is not None:
+            try:
+                req = ctx.request_context.request
+            except Exception:
+                req = None
+        if req is not None:
+            try:
+                auth = req.headers.get("authorization") or ""
+                if auth[:7].lower() == "bearer ":
+                    return auth[7:].strip()
+                xt = req.headers.get("x-memgres-token")
+                if xt:
+                    return xt.strip()
+            except Exception:
+                pass
+        return cfg.token or arg or None
 
     def _uid(conn, token: Optional[str]) -> str:
         """Resolve a token to its user id (for read-level identity tools)."""
@@ -82,7 +142,7 @@ def build_server(cfg: Optional[Config] = None):
                      source: Optional[str] = None, reason: Optional[str] = None,
                      ttl_days: Optional[int] = None,
                      space: Optional[str] = None, space_id: Optional[str] = None,
-                     token: Optional[str] = None) -> dict:
+                     token: Optional[str] = None, ctx: Context = None) -> dict:
         """Create or edit a memory. Omit `id` to create (needs `body`). To edit,
         pass `id` plus either a whole new `body` or a unified `diff` with the
         `base_hash` it was cut from (stale base -> conflict). `path`/`tags` set
@@ -91,87 +151,93 @@ def build_server(cfg: Optional[Config] = None):
         one); omit both to use your default."""
         with pool.connection() as conn:
             return _mem(_store(conn).write(
-                token, id=id or None, body=body, diff=diff, base_hash=base_hash,
-                path=path, tags=tags, source=source, reason=reason,
-                ttl_days=ttl_days, space=space, space_id=space_id))
+                _token(ctx, token), id=id or None, body=body, diff=diff,
+                base_hash=base_hash, path=path, tags=tags, source=source,
+                reason=reason, ttl_days=ttl_days, space=space, space_id=space_id))
 
     @mcp.tool()
     def memory_get(id: str, space: Optional[str] = None,
                    space_id: Optional[str] = None,
-                   token: Optional[str] = None) -> dict:
+                   token: Optional[str] = None, ctx: Context = None) -> dict:
         """Fetch one memory by id (renews its TTL)."""
         with pool.connection() as conn:
-            return _mem(_store(conn).get(token, id, space=space, space_id=space_id))
+            return _mem(_store(conn).get(_token(ctx, token), id,
+                                         space=space, space_id=space_id))
 
     @mcp.tool()
     def memory_recall(query: str, k: int = 10, mode: str = "auto",
                       tags: Optional[List[str]] = None,
                       path_prefix: Optional[str] = None,
                       space: Optional[str] = None, space_id: Optional[str] = None,
-                      token: Optional[str] = None) -> List[dict]:
+                      token: Optional[str] = None, ctx: Context = None) -> List[dict]:
         """Search memories. `mode`: lexical | semantic | hybrid | auto. Optionally
         scope to a tag set (`tags`) or a subtree (`path_prefix`, e.g. 'ops.postgres').
         `space`/`space_id` pick which namespace to search (default: yours)."""
         with pool.connection() as conn:
             return [{"id": h.id, "body": h.body, "tags": h.tags, "path": h.path,
                      "score": h.score}
-                    for h in _store(conn).recall(token, query, k=k, tags=tags,
-                                                 path_prefix=path_prefix, mode=mode,
-                                                 space=space, space_id=space_id)]
+                    for h in _store(conn).recall(
+                        _token(ctx, token), query, k=k, tags=tags,
+                        path_prefix=path_prefix, mode=mode,
+                        space=space, space_id=space_id)]
 
     @mcp.tool()
     def memory_blame(id: str, grouped: bool = True,
                      space: Optional[str] = None, space_id: Optional[str] = None,
-                     token: Optional[str] = None) -> List[dict]:
+                     token: Optional[str] = None, ctx: Context = None) -> List[dict]:
         """Who last changed each line. Grouped into author-blocks by default;
         set grouped=false for per-line attribution."""
         with pool.connection() as conn:
             s = _store(conn)
+            tok = _token(ctx, token)
             if grouped:
-                return s.annotate_grouped(token, id, space=space, space_id=space_id)
-            return s.annotate(token, id, space=space, space_id=space_id)
+                return s.annotate_grouped(tok, id, space=space, space_id=space_id)
+            return s.annotate(tok, id, space=space, space_id=space_id)
 
     @mcp.tool()
     def memory_history(id: str, space: Optional[str] = None,
                        space_id: Optional[str] = None,
-                       token: Optional[str] = None) -> List[dict]:
+                       token: Optional[str] = None, ctx: Context = None) -> List[dict]:
         """The full change chain (diffs, provenance, hashes) for a memory."""
         with pool.connection() as conn:
-            return _store(conn).history(token, id, space=space, space_id=space_id)
+            return _store(conn).history(_token(ctx, token), id,
+                                        space=space, space_id=space_id)
 
     @mcp.tool()
     def memory_move(id: str, new_path: str, reason: Optional[str] = None,
                     space: Optional[str] = None, space_id: Optional[str] = None,
-                    token: Optional[str] = None) -> dict:
+                    token: Optional[str] = None, ctx: Context = None) -> dict:
         """Move a memory to a new tree path (cascades its subtree)."""
         with pool.connection() as conn:
-            return _mem(_store(conn).move(token, id, new_path, reason=reason,
-                                          space=space, space_id=space_id))
+            return _mem(_store(conn).move(_token(ctx, token), id, new_path,
+                                          reason=reason, space=space,
+                                          space_id=space_id))
 
     @mcp.tool()
     def memory_forget(id: str, space: Optional[str] = None,
                       space_id: Optional[str] = None,
-                      token: Optional[str] = None) -> dict:
+                      token: Optional[str] = None, ctx: Context = None) -> dict:
         """Permanently delete a memory and its history (GDPR erasure)."""
         with pool.connection() as conn:
             return {"forgotten": _store(conn).forget(
-                token, id, space=space, space_id=space_id)}
+                _token(ctx, token), id, space=space, space_id=space_id)}
 
     # ─── identity: spaces & tokens (open/managed modes) ─────────────────────
     @mcp.tool()
-    def memory_list_spaces(token: Optional[str] = None) -> List[dict]:
-        """List the namespaces this token can reach — your own plus any shared
-        with you — with each one's id, name, description, permission and whether
-        it's your default. Use a returned `id` as `space_id` to target a shared
-        space; use your own space's `name` as `space`."""
+    def memory_list_spaces(token: Optional[str] = None,
+                           ctx: Context = None) -> List[dict]:
+        """List the namespaces you can reach — your own plus any shared with you —
+        with each one's id, name, description, permission and whether it's your
+        default. Use a returned `id` as `space_id` to target a shared space; use
+        your own space's `name` as `space`."""
         with pool.connection() as conn, conn.transaction():
-            return identity.list_spaces(conn, _uid(conn, token))
+            return identity.list_spaces(conn, _uid(conn, _token(ctx, token)))
 
     @mcp.tool()
     def memory_issue_token(permission: str = "write", space: Optional[str] = None,
                            space_id: Optional[str] = None, label: str = "",
                            expires_days: Optional[int] = None,
-                           token: Optional[str] = None) -> dict:
+                           token: Optional[str] = None, ctx: Context = None) -> dict:
         """Mint a new token for your account (rotate / delegate / time-box).
         `permission` is its ceiling (read|write|admin); `space`/`space_id` scope
         it to one namespace (omit for all yours). The secret is returned ONCE."""
@@ -180,7 +246,7 @@ def build_server(cfg: Optional[Config] = None):
         if expires_days:
             exp = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=expires_days)
         with pool.connection() as conn, conn.transaction():
-            uid = _admin_uid(conn, token)
+            uid = _admin_uid(conn, _token(ctx, token))
             nsid = space_id
             if nsid is not None:
                 # can only scope a new token to a namespace the caller can reach
@@ -197,24 +263,41 @@ def build_server(cfg: Optional[Config] = None):
                 "namespace_id": nsid, "note": "store this now — it is not recoverable"}
 
     @mcp.tool()
-    def memory_list_tokens(token: Optional[str] = None) -> List[dict]:
+    def memory_list_tokens(token: Optional[str] = None,
+                           ctx: Context = None) -> List[dict]:
         """List your tokens (metadata only — never the secret)."""
         with pool.connection() as conn, conn.transaction():
-            out = identity.list_tokens(conn, _admin_uid(conn, token))
+            out = identity.list_tokens(conn, _admin_uid(conn, _token(ctx, token)))
         for d in out:                                  # make timestamps JSON-safe
             for key in ("expires_at", "revoked_at", "last_used_at", "created_at"):
                 d[key] = str(d[key]) if d[key] else None
         return out
 
     @mcp.tool()
-    def memory_revoke_token(token_id: str, token: Optional[str] = None) -> dict:
+    def memory_revoke_token(token_id: str, token: Optional[str] = None,
+                            ctx: Context = None) -> dict:
         """Revoke one of your tokens by id (kills it immediately)."""
         with pool.connection() as conn, conn.transaction():
-            uid = _admin_uid(conn, token)
+            uid = _admin_uid(conn, _token(ctx, token))
             owned = {t["id"] for t in identity.list_tokens(conn, uid)}
             if token_id not in owned:
                 raise identity.AuthError("not your token")
             return {"revoked": identity.revoke_token(conn, token_id)}
+
+    # Best-effort: on a pinned/single endpoint drop the (now unused) `token` arg
+    # from each tool's advertised schema so the model doesn't even see it. Purely
+    # cosmetic — _token above already resolves identity from the header/env and a
+    # pin wins regardless; if a future FastMCP changes these internals this simply
+    # no-ops and the optional field stays in place (still safe).
+    if not expose_token:
+        for _t in getattr(getattr(mcp, "_tool_manager", None), "_tools", {}).values():
+            _params = getattr(_t, "parameters", None)
+            if not isinstance(_params, dict):
+                continue
+            _params.get("properties", {}).pop("token", None)
+            _req = _params.get("required")
+            if isinstance(_req, list) and "token" in _req:
+                _req.remove("token")
 
     return mcp
 

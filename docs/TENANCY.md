@@ -97,8 +97,19 @@ curl -s "$BASE/recall?q=note&space_id=<uuid>" -H "Authorization: Bearer $TOK"
 
 ## Using it — MCP
 
-Point your MCP client at the server (stdio or the Streamable-HTTP endpoint) and
-pass `token` as a tool argument. Tools:
+**The identity is pinned in the client config, not handled by the model.** The
+tools take no `token` argument; the server resolves it from:
+
+- the `Authorization: Bearer <mgk_…>` / `X-Memgres-Token` **header** the client
+  sends (http transport) — so one shared endpoint serves many clients, each
+  pinned to its own user via its own config `headers`;
+- else `MEMGRES_TOKEN` — a stdio client sets it in its config `env` block; a
+  dedicated http endpoint sets it on the service.
+
+A header/env pin is authoritative (the model can't override it), and a
+namespace-scoped token also locks the agent to one space.
+
+Tools:
 
 - `memory_write` / `memory_get` / `memory_recall` / `memory_move` /
   `memory_history` / `memory_blame` / `memory_forget` — all take `space` /
@@ -107,8 +118,9 @@ pass `token` as a tool argument. Tools:
 - `memory_issue_token` — mint a token (rotate/delegate; secret returned once);
 - `memory_list_tokens` / `memory_revoke_token` — manage them.
 
-For a single-tenant MCP endpoint you can set `MEMGRES_TOKEN` once and omit the
-per-call `token`.
+Only a genuinely multi-tenant endpoint (`open`/`managed`, **no** pinned token)
+exposes a `token` argument for the model to supply; force it either way with
+`MEMGRES_MCP_TOKEN_ARG=on|off`. In `single` mode no token is needed at all.
 
 ## Sharing a namespace (request-access)
 
