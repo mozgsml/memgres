@@ -177,16 +177,61 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 
 Namespace token (when `MEMGRES_NAMESPACES=true`) goes in `Authorization: Bearer <token>` or `X-Memgres-Token`. OpenAPI/Swagger is served at `/docs`. Store errors map to status codes: `409` stale-hash conflict, `404` not found, `413` too large, `401` missing token.
 
-## MCP server
+## Use it with an LLM / agent
 
-The same store is exposed to MCP clients (Claude Desktop, etc.) over stdio:
+memgres itself **never calls an LLM** — it's the memory, not the model. Your LLM
+uses it one of two ways:
+
+**A. Via MCP** — the model calls memgres tools directly (Claude Desktop, Cursor,
+Cline, any MCP client). This is the zero-code path.
 
 ```bash
-pip install "memgres[mcp]"
-memgres-mcp                    # needs MEMGRES_DATABASE_URL; migrates on startup
+pip install "memgres[mcp]"     # installs the `memgres-mcp` command
 ```
 
-Tools: `memory_write` (create or edit by body/diff), `memory_get`, `memory_recall`, `memory_blame`, `memory_history`, `memory_move`, `memory_forget`. Point your MCP client's config at the `memgres-mcp` command.
+Add it to your MCP client config (e.g. Claude Desktop's `claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "memgres": {
+      "command": "memgres-mcp",
+      "env": {
+        "MEMGRES_DATABASE_URL": "postgresql://memgres:memgres@localhost:5432/memgres"
+      }
+    }
+  }
+}
+```
+
+Restart the client — the model now has tools `memory_write`, `memory_recall`,
+`memory_get`, `memory_blame`, `memory_history`, `memory_move`, `memory_forget`.
+Tell it *"remember X"* / *"what do you know about Y?"* and it will call them. (If
+`memgres-mcp` isn't on the client's PATH, use the absolute path to it, e.g.
+`/path/to/venv/bin/memgres-mcp`. For semantic recall add the embedding env vars —
+see [docs/BACKENDS.md](docs/BACKENDS.md).)
+
+**B. From your own agent code** — your loop calls the HTTP API or the `Store`
+library after the model produces text (see the examples above). Use this when you
+control the agent loop and decide when to write/recall.
+
+Either way you need a Postgres running (`docker compose up` gives you one, or point
+`MEMGRES_DATABASE_URL` at your own).
+
+## Tokens & auth
+
+There is **no token for single-user / local use** — leave everything default and it
+just works. Two *optional*, unrelated tokens exist:
+
+- **Embedding API key** (`MEMGRES_EMBED_API_KEY`) — only if you use a *cloud*
+  embedding provider (`openai`/`jina`) for semantic recall. Local models and
+  lexical-only need none. This is the key from your embedding provider.
+- **Namespace token** (only if `MEMGRES_NAMESPACES=true`, for multi-tenant) — each
+  caller sends a secret string; memgres stores `hash(token)` as the namespace, so
+  callers only ever see their own memories. You mint and hand out these strings
+  yourself (any high-entropy secret); there's no built-in issuer. Sent as
+  `Authorization: Bearer <token>` / `X-Memgres-Token` (HTTP) or the `token`
+  argument (library/MCP). One wallet/app can back many clients via distinct tokens.
 
 ---
 
