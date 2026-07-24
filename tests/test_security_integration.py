@@ -1,0 +1,239 @@
+"""Adversarial multi-tenant isolation tests.
+
+Every test here is an *attack*: a caller holding a valid token for their own
+user tries to reach another tenant's data or exceed their permission. All must
+fail closed. If any of these ever passes, isolation is broken.
+"""
+
+import dataclasses
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import pytest  # noqa: E402
+
+psycopg = pytest.importorskip("psycopg")
+
+from memgres.config import load  # noqa: E402
+from memgres.schema import migrate  # noqa: E402
+from memgres import identity as ident  # noqa: E402
+from memgres.identity import AuthError, SpaceNotFound, new_token  # noqa: E402
+from memgres.store import Store, NotFound  # noqa: E402
+
+DSN = os.environ.get("MEMGRES_TEST_DSN",
+                     "postgresql://memgres:memgres@localhost:55432/memgres")
+
+
+def _reachable() -> bool:
+    try:
+        psycopg.connect(DSN, connect_timeout=2).close()
+        return True
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(not _reachable(), reason="no test Postgres")
+
+# any denial is acceptable — the point is the op does NOT succeed
+DENIED = (AuthError, SpaceNotFound, NotFound, PermissionError)
+
+
+@pytest.fixture
+def env(monkeypatch):
+    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    for k in list(os.environ):
+        if k.startswith("MEMGRES_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
+    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
+    monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
+    base = load()
+    setup = psycopg.connect(DSN, autocommit=True)
+    migrate(setup, base)
+    stores = []
+
+    def make_store(key_mode="managed", admin_token=""):
+        cfg = dataclasses.replace(base, key_mode=key_mode, admin_token=admin_token)
+        s = Store(cfg, conn=psycopg.connect(DSN))
+        s._own_conn = True
+        stores.append(s)
+        return s
+
+    yield setup, make_store
+    for s in stores:
+        s.close()
+    setup.close()
+
+
+def _user_with_token(setup, name, permission="write", namespace=None):
+    uid = ident.create_user(setup, name=name)
+    nsid = ident.create_namespace(setup, uid, namespace) if namespace else None
+    secret, _ = ident.issue_token(setup, uid, namespace_id=nsid,
+                                  permission=permission)
+    return uid, secret, nsid
+
+
+# ─── the core attack: reach another tenant's memory ──────────────────────────
+def test_cannot_read_victim_memory_by_uuid(env):
+    setup, make_store = env
+    s = make_store("managed")
+    _, victim_tok, _ = _user_with_token(setup, "victim", namespace="secrets")
+    _, attacker_tok, _ = _user_with_token(setup, "attacker", namespace="secrets")
+
+    vmem = s.write(victim_tok, body="launch codes\n", space="secrets")
+
+    # attacker knows the exact UUID and tries every addressing trick
+    with pytest.raises(DENIED):                       # default space
+        s.get(attacker_tok, vmem.id)
+    with pytest.raises(DENIED):                       # their OWN 'secrets' by name
+        s.get(attacker_tok, vmem.id, space="secrets")
+    # victim's namespace id directly
+    _, _, victim_ns = _user_with_token(setup, "probe", namespace="x")  # noqa
+    with pytest.raises(DENIED):
+        # attacker guesses victim's namespace id — must be unreachable
+        s.get(attacker_tok, vmem.id, space_id=_ns_of(setup, "victim", "secrets"))
+
+
+def _ns_of(setup, user_name, ns_name):
+    with setup.cursor() as cur:
+        cur.execute("SELECT n.id FROM namespace n JOIN app_user u "
+                    "ON u.id=n.owner_user_id WHERE u.name=%s AND n.name=%s",
+                    (user_name, ns_name))
+        return str(cur.fetchone()[0])
+
+
+def test_cannot_recall_across_tenants(env):
+    setup, make_store = env
+    s = make_store("managed")
+    _, victim_tok, _ = _user_with_token(setup, "victim", namespace="n")
+    _, attacker_tok, _ = _user_with_token(setup, "attacker", namespace="n")
+    s.write(victim_tok, body="victim only secret data\n", space="n")
+    s.write(attacker_tok, body="attacker own note\n", space="n")
+    # attacker's recall never sees the victim's row
+    hits = s.recall(attacker_tok, "secret data", space="n")
+    assert all("victim" not in h.body for h in hits)
+    assert [h.body for h in hits] == [] or all("attacker" in h.body for h in hits)
+
+
+def test_cannot_forget_or_move_victim_memory(env):
+    setup, make_store = env
+    s = make_store("managed")
+    _, victim_tok, _ = _user_with_token(setup, "victim", namespace="n")
+    _, attacker_tok, _ = _user_with_token(setup, "attacker", namespace="n")
+    vmem = s.write(victim_tok, body="keep me\n", path="root.a", space="n")
+
+    # forget matches zero rows in the attacker's namespace → False (idempotent
+    # delete; returns False for both "not yours" and "doesn't exist" → no leak),
+    # and crucially does NOT delete the victim's row.
+    assert s.forget(attacker_tok, vmem.id, space="n") is False
+    with pytest.raises(DENIED):
+        s.move(attacker_tok, vmem.id, "root.b", space="n")
+    with pytest.raises(DENIED):
+        s.history(attacker_tok, vmem.id, space="n")
+    # victim's memory is untouched
+    assert s.get(victim_tok, vmem.id, space="n").body == "keep me\n"
+    assert s.get(victim_tok, vmem.id, space="n").path == "root.a"
+
+
+def test_name_collision_does_not_cross_tenants(env):
+    """Both own a namespace called 'notes'; a name must resolve to the caller's."""
+    setup, make_store = env
+    s = make_store("managed")
+    _, alice_tok, _ = _user_with_token(setup, "alice", namespace="notes")
+    _, bob_tok, _ = _user_with_token(setup, "bob", namespace="notes")
+    amem = s.write(alice_tok, body="alice notes\n", space="notes")
+    bmem = s.write(bob_tok, body="bob notes\n", space="notes")
+    # bob naming 'notes' hits HIS notes, never alice's
+    assert s.get(bob_tok, bmem.id, space="notes").body == "bob notes\n"
+    with pytest.raises(DENIED):
+        s.get(bob_tok, amem.id, space="notes")
+    # recall in bob's 'notes' never returns alice's row
+    assert all("alice" not in h.body for h in s.recall(bob_tok, "notes", space="notes"))
+
+
+# ─── permission ceilings ─────────────────────────────────────────────────────
+def test_read_token_cannot_mutate(env):
+    setup, make_store = env
+    s = make_store("managed")
+    uid = ident.create_user(setup, name="u")
+    ns = ident.create_namespace(setup, uid, "n")
+    ro, _ = ident.issue_token(setup, uid, permission="read")
+    rw, _ = ident.issue_token(setup, uid, permission="write")
+    mem = s.write(rw, body="seed\n", space="n")
+    # read is fine
+    assert s.get(ro, mem.id, space="n").body == "seed\n"
+    # every mutation denied for the read token
+    with pytest.raises(DENIED):
+        s.write(ro, body="x\n", space="n")
+    with pytest.raises(DENIED):
+        s.write(ro, id=mem.id, body="x\n", space="n")
+    with pytest.raises(DENIED):
+        s.move(ro, mem.id, "root.z", space="n")
+    with pytest.raises(DENIED):
+        s.forget(ro, mem.id, space="n")
+
+
+def test_scoped_token_confined_to_its_namespace(env):
+    setup, make_store = env
+    s = make_store("managed")
+    uid = ident.create_user(setup, name="u")
+    a = ident.create_namespace(setup, uid, "a")
+    b = ident.create_namespace(setup, uid, "b")
+    scoped, _ = ident.issue_token(setup, uid, namespace_id=a, permission="write")
+    # works in its own scope
+    s.write(scoped, body="in a\n", space_id=a)
+    # cannot touch the user's OTHER namespace, by id or name
+    with pytest.raises(DENIED):
+        s.write(scoped, body="in b\n", space_id=b)
+    with pytest.raises(DENIED):
+        s.recall(scoped, "x", space_id=b)
+    # cannot create a brand new namespace
+    with pytest.raises(DENIED):
+        s.write(scoped, body="in c\n", space="c")
+
+
+# ─── token lifecycle ─────────────────────────────────────────────────────────
+def test_revoked_token_cannot_act(env):
+    setup, make_store = env
+    s = make_store("managed")
+    uid = ident.create_user(setup, name="u")
+    ns = ident.create_namespace(setup, uid, "n")
+    secret, tid = ident.issue_token(setup, uid, permission="write")
+    s.write(secret, body="before\n", space="n")
+    ident.revoke_token(setup, tid)
+    with pytest.raises(DENIED):
+        s.get(secret, "whatever", space="n")
+    with pytest.raises(DENIED):
+        s.write(secret, body="after\n", space="n")
+
+
+def test_random_and_malformed_tokens_rejected(env):
+    setup, make_store = env
+    s = make_store("managed")
+    for bad in [new_token(), "garbage", "", "mgk_short"]:
+        with pytest.raises(DENIED):
+            s.write(bad, body="x\n")
+        with pytest.raises(DENIED):
+            s.recall(bad, "x")
+
+
+def test_open_mode_random_token_reads_nothing(env):
+    """A well-formed but never-written token (open mode) creates nothing and
+    cannot read another tenant's data."""
+    setup, make_store = env
+    s = make_store("open")
+    _, victim_tok, _ = _user_with_token(setup, "victim", namespace="n")
+    vmem = s.write(victim_tok, body="victim\n", space="n")   # victim pre-exists
+
+    ghost = new_token()                     # valid format, no user yet
+    with pytest.raises(DENIED):             # can't read victim's memory
+        s.get(ghost, vmem.id, space_id=_ns_of(setup, "victim", "n"))
+    with pytest.raises(DENIED):             # its own read makes/sees nothing
+        s.recall(ghost, "victim")
+    # and it created no user row by merely reading
+    with setup.cursor() as cur:
+        cur.execute("SELECT count(*) FROM app_user")
+        assert cur.fetchone()[0] == 1       # only the victim

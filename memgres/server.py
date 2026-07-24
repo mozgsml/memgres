@@ -317,12 +317,16 @@ def create_app(cfg: Optional[Config] = None):
             return {"denied": req_id}
 
     # ─── admin provisioning (MEMGRES_ADMIN_TOKEN) ───────────────────────────
+    import hmac as _hmac
+
     def admin(authorization: Optional[str] = Header(None),
               x_memgres_token: Optional[str] = Header(None)):
         tok = x_memgres_token
         if not tok and authorization and authorization.lower().startswith("bearer "):
             tok = authorization[7:]
-        if not cfg.admin_token or tok != cfg.admin_token:
+        # constant-time compare; empty admin_token disables admin entirely
+        if not cfg.admin_token or not tok or \
+                not _hmac.compare_digest(tok, cfg.admin_token):
             raise HTTPException(403, "admin token required")
 
     class NewUser(BaseModel):
