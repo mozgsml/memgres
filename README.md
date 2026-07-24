@@ -70,11 +70,28 @@ optional layers on top of the same core:
 
 ## Quickstart
 
-**The whole thing, one command** — brings up `pgvector` + the memgres service on `http://localhost:8080`, schema auto-migrated on startup:
+**Run everything with Docker** — `pgvector`, the memgres service (HTTP on `:8080`) and an MCP server (Streamable HTTP on `:8765`), schema auto-migrated on startup. Just grab the compose file (it pulls the published image, so there's nothing to build):
 
 ```bash
-docker compose up            # → http://localhost:8080  (GET /healthz → {"ok":true})
+curl -O https://raw.githubusercontent.com/mozgsml/memgres/main/docker-compose.yml
+docker compose up
 ```
+
+Defaults suit a single-user setup with no auth. To change limits, the embedding provider, tokens, … drop a `.env` beside it — every `MEMGRES_*` is optional (see [Configuration](#configuration) or [.env.example](.env.example)).
+
+**Give it to an LLM / agent — no code (MCP).** Point any URL-capable MCP client (Cursor, Cline, Claude Desktop, …) at the running server; the model gets `memory_write`, `memory_recall`, `memory_get`, `memory_blame`, `memory_history`, `memory_move`, `memory_forget` as tools:
+
+```json
+{
+  "mcpServers": {
+    "memgres": { "url": "http://localhost:8765/mcp" }
+  }
+}
+```
+
+Then just tell the model *"remember X"* / *"what do you know about Y?"* and it calls the tools — nothing else to run. (For stdio-only clients, semantic recall, and multi-tenant tokens, see [Use it with an LLM / agent (MCP)](#use-it-with-an-llm--agent-mcp) and [docs/TENANCY.md](docs/TENANCY.md).)
+
+**Also a plain HTTP API** — the same service on `:8080` (`GET /healthz → {"ok":true}`), for when you drive the agent loop yourself:
 
 ```bash
 # create a memory
@@ -97,6 +114,13 @@ curl -s localhost:8080/memories/$ID/blame
 
 ### As a Python library (no HTTP)
 
+```bash
+pip install memgres              # core library
+pip install "memgres[server]"    # + HTTP API
+pip install "memgres[mcp]"       # + MCP server
+# extras: local (sentence-transformers), qdrant (Qdrant backend)
+```
+
 ```python
 from memgres import Store, load_config, migrate
 import psycopg
@@ -115,15 +139,6 @@ hits  = s.recall(None, "what did I remember?", k=5)          # lexical / semanti
 blame = s.annotate_grouped(None, m.id)                        # [{start,end,source,reason,…}]
 old   = s.reconstruct(None, m.id, 1)                          # body as of version 1
 s.forget(None, m.id)                                          # hard-erase + history
-```
-
-### Install
-
-```bash
-pip install memgres              # core library
-pip install "memgres[server]"    # + HTTP API
-pip install "memgres[mcp]"       # + MCP server
-# extras: local (sentence-transformers), qdrant (Qdrant backend)
 ```
 
 Or pull the container image (public, no login):
