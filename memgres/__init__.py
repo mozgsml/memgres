@@ -22,6 +22,13 @@ from .schema import migrate, SchemaMismatch, SCHEMA_VERSION
 from .search import Hit, recall
 from .blame import annotate, annotate_grouped, reconstruct, replay
 from .store import Store, Memory, Conflict, NotFound, TooLarge, NoParent
+from .identity import (
+    Principal, AuthError, SpaceNotFound,
+    resolve, resolve_space, new_token, valid_format,
+    create_user, create_namespace, list_spaces,
+    issue_token, register_token, revoke_token, list_tokens,
+    request_access, approve_request, deny_request, list_requests,
+)
 
 __all__ = [
     "Config", "load_config",
@@ -31,4 +38,9 @@ __all__ = [
     "migrate", "SchemaMismatch", "SCHEMA_VERSION",
     "Hit", "recall",
     "annotate", "annotate_grouped", "reconstruct", "replay",
+    "Principal", "AuthError", "SpaceNotFound",
+    "resolve", "resolve_space", "new_token", "valid_format",
+    "create_user", "create_namespace", "list_spaces",
+    "issue_token", "register_token", "revoke_token", "list_tokens",
+    "request_access", "approve_request", "deny_request", "list_requests",
 ]

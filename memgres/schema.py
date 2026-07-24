@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .config import Config
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are
 # shipped inside the package (see pyproject) and this still resolves.
@@ -34,8 +34,8 @@ class SchemaMismatch(RuntimeError):
     """The DB was built with settings incompatible with the current config."""
 
 
-def _core_sql() -> str:
-    return (MIGRATIONS_DIR / "0001_core.sql").read_text(encoding="utf-8")
+def _sql(name: str) -> str:
+    return (MIGRATIONS_DIR / name).read_text(encoding="utf-8")
 
 
 def migrate(conn, cfg: Config) -> None:
@@ -46,7 +46,9 @@ def migrate(conn, cfg: Config) -> None:
     """
     with conn.transaction():
         with conn.cursor() as cur:
-            cur.execute(_core_sql())
+            cur.execute(_sql("0001_core.sql"))
+            # identity tables (always applied, idempotent; empty in single mode)
+            cur.execute(_sql("0002_identity.sql"))
             _apply_tree(cur, cfg)
             _apply_vector(cur, cfg)
             _stamp(cur, cfg)

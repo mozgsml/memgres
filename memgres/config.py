@@ -52,6 +52,9 @@ class Config:
     namespaces_enabled: bool     # False = single space; True = secret-token namespaces
     token: str                   # default namespace token when a call passes none
                                  # (set in MCP/env for a single-tenant deployment)
+    # identity / tenancy (v0.2 model; see docs/TENANCY.md)
+    key_mode: str                # single | open | managed  (how tokens/users are minted)
+    admin_token: str             # global-admin bearer: provision users/namespaces anywhere
     # organization
     tree_enabled: bool           # ltree path column + GiST index for fast subtree selection
     require_parent: bool         # False = sparse paths (create food.apple with no food row);
@@ -81,6 +84,8 @@ class Config:
             raise ValueError(f"unknown MEMGRES_EMBED_PROVIDER: {self.embed_provider}")
         if self.vector_backend not in ("pgvector", "qdrant"):
             raise ValueError(f"unknown MEMGRES_VECTOR_BACKEND: {self.vector_backend}")
+        if self.key_mode not in ("single", "open", "managed"):
+            raise ValueError(f"unknown MEMGRES_KEY_MODE: {self.key_mode}")
         if self.embed_provider != "none" and self.vector_backend == "pgvector" \
                 and self.embed_dim <= 0:
             raise ValueError(
@@ -98,6 +103,8 @@ def load() -> Config:
         renew_on_read=_bool("MEMGRES_RENEW_ON_READ", True),
         namespaces_enabled=_bool("MEMGRES_NAMESPACES", False),
         token=_str("MEMGRES_TOKEN", ""),
+        key_mode=_str("MEMGRES_KEY_MODE", "single"),
+        admin_token=_str("MEMGRES_ADMIN_TOKEN", ""),
         tree_enabled=_bool("MEMGRES_TREE", True),
         require_parent=_bool("MEMGRES_REQUIRE_PARENT", False),
         history_enabled=_bool("MEMGRES_HISTORY", True),
