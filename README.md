@@ -147,6 +147,7 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | Variable | Default | Meaning |
 |---|---|---|
 | `MEMGRES_DATABASE_URL` | libpq env | Postgres connection string |
+| `MEMGRES_POOL_SIZE` | `4` | max pooled DB connections (HTTP + http-MCP servers); raise for many concurrent clients, `1` to serialize |
 | `MEMGRES_MAX_BODY_BYTES` | `262144` | ceiling for a whole record body (256 KB) |
 | `MEMGRES_MAX_WRITE_BYTES` | `16384` | ceiling for one write/diff payload (≤ body) |
 | `MEMGRES_RETENTION_DAYS` | `0` | `0` = keep forever; `>0` = expire N days after last touch |

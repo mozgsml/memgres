@@ -59,7 +59,8 @@ def create_app(cfg: Optional[Config] = None):
 
     cfg = cfg or load()
     embedder = get_embedder(cfg)
-    pool = ConnectionPool(cfg.database_url or "", min_size=1, open=False)
+    pool = ConnectionPool(cfg.database_url or "", min_size=1,
+                          max_size=cfg.pool_size, open=False)
 
     @asynccontextmanager
     async def lifespan(app):

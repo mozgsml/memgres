@@ -31,7 +31,7 @@ Issues = "https://github.com/mozgsml/memgres/issues"
 local = ["sentence-transformers>=3.0"]                    # local embeddings on CPU/GPU
 qdrant = ["qdrant-client>=1.7"]                            # optional vector backend
 server = ["fastapi>=0.110", "uvicorn>=0.29", "psycopg-pool>=3.2"]  # optional HTTP layer
-mcp = ["mcp>=1.2"]                                         # optional MCP (stdio) server
+mcp = ["mcp>=1.2", "psycopg-pool>=3.2"]                    # optional MCP server (stdio/http)
 dev = ["pytest>=8.0"]
 
 [project.scripts]

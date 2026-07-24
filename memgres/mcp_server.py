@@ -14,8 +14,6 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-import psycopg
-
 from . import identity
 from .config import Config, load
 from .embeddings import get_embedder
@@ -42,19 +40,29 @@ def _mem(m) -> dict:
 
 def build_server(cfg: Optional[Config] = None):
     cfg = cfg or load()
-    conn = psycopg.connect(cfg.database_url or "")
-    migrate(conn, cfg)
-    store = Store(cfg, embedder=get_embedder(cfg), conn=conn)
+    embedder = get_embedder(cfg)
+    # A connection pool (not one shared connection) so the Streamable-HTTP
+    # transport can serve concurrent clients without interleaving transactions
+    # on one libpq handle. min_size=1 keeps it light; MEMGRES_POOL_SIZE caps it.
+    # For stdio (one client, sequential calls) the pool simply stays at size 1.
+    from psycopg_pool import ConnectionPool
+    pool = ConnectionPool(cfg.database_url or "", min_size=1,
+                          max_size=cfg.pool_size, open=True)
+    with pool.connection() as conn:
+        migrate(conn, cfg)
     mcp = _mcp("memgres")
 
-    def _uid(token: Optional[str]) -> str:
+    def _store(conn):
+        return Store(cfg, embedder=embedder, conn=conn)
+
+    def _uid(conn, token: Optional[str]) -> str:
         """Resolve a token to its user id (for read-level identity tools)."""
         p = identity.resolve(conn, cfg, token)
         if p.user_id is None:
             raise identity.AuthError("this token has no owning user")
         return p.user_id
 
-    def _admin_uid(token: Optional[str]) -> str:
+    def _admin_uid(conn, token: Optional[str]) -> str:
         """Like _uid but for token management (issue/revoke/list). These are
         account-level admin actions, so they require an UNSCOPED admin-ceiling
         token — a read-only or namespace-scoped token must not mint/kill tokens
@@ -81,17 +89,19 @@ def build_server(cfg: Optional[Config] = None):
         the tree position and labels; `source`/`reason` record provenance.
         `space` picks one of your namespaces by name (`space_id` for a shared
         one); omit both to use your default."""
-        return _mem(store.write(token, id=id or None, body=body, diff=diff,
-                                base_hash=base_hash, path=path, tags=tags,
-                                source=source, reason=reason, ttl_days=ttl_days,
-                                space=space, space_id=space_id))
+        with pool.connection() as conn:
+            return _mem(_store(conn).write(
+                token, id=id or None, body=body, diff=diff, base_hash=base_hash,
+                path=path, tags=tags, source=source, reason=reason,
+                ttl_days=ttl_days, space=space, space_id=space_id))
 
     @mcp.tool()
     def memory_get(id: str, space: Optional[str] = None,
                    space_id: Optional[str] = None,
                    token: Optional[str] = None) -> dict:
         """Fetch one memory by id (renews its TTL)."""
-        return _mem(store.get(token, id, space=space, space_id=space_id))
+        with pool.connection() as conn:
+            return _mem(_store(conn).get(token, id, space=space, space_id=space_id))
 
     @mcp.tool()
     def memory_recall(query: str, k: int = 10, mode: str = "auto",
@@ -102,11 +112,12 @@ def build_server(cfg: Optional[Config] = None):
         """Search memories. `mode`: lexical | semantic | hybrid | auto. Optionally
         scope to a tag set (`tags`) or a subtree (`path_prefix`, e.g. 'ops.postgres').
         `space`/`space_id` pick which namespace to search (default: yours)."""
-        return [{"id": h.id, "body": h.body, "tags": h.tags, "path": h.path,
-                 "score": h.score}
-                for h in store.recall(token, query, k=k, tags=tags,
-                                      path_prefix=path_prefix, mode=mode,
-                                      space=space, space_id=space_id)]
+        with pool.connection() as conn:
+            return [{"id": h.id, "body": h.body, "tags": h.tags, "path": h.path,
+                     "score": h.score}
+                    for h in _store(conn).recall(token, query, k=k, tags=tags,
+                                                 path_prefix=path_prefix, mode=mode,
+                                                 space=space, space_id=space_id)]
 
     @mcp.tool()
     def memory_blame(id: str, grouped: bool = True,
@@ -114,31 +125,37 @@ def build_server(cfg: Optional[Config] = None):
                      token: Optional[str] = None) -> List[dict]:
         """Who last changed each line. Grouped into author-blocks by default;
         set grouped=false for per-line attribution."""
-        if grouped:
-            return store.annotate_grouped(token, id, space=space, space_id=space_id)
-        return store.annotate(token, id, space=space, space_id=space_id)
+        with pool.connection() as conn:
+            s = _store(conn)
+            if grouped:
+                return s.annotate_grouped(token, id, space=space, space_id=space_id)
+            return s.annotate(token, id, space=space, space_id=space_id)
 
     @mcp.tool()
     def memory_history(id: str, space: Optional[str] = None,
                        space_id: Optional[str] = None,
                        token: Optional[str] = None) -> List[dict]:
         """The full change chain (diffs, provenance, hashes) for a memory."""
-        return store.history(token, id, space=space, space_id=space_id)
+        with pool.connection() as conn:
+            return _store(conn).history(token, id, space=space, space_id=space_id)
 
     @mcp.tool()
     def memory_move(id: str, new_path: str, reason: Optional[str] = None,
                     space: Optional[str] = None, space_id: Optional[str] = None,
                     token: Optional[str] = None) -> dict:
         """Move a memory to a new tree path (cascades its subtree)."""
-        return _mem(store.move(token, id, new_path, reason=reason,
-                               space=space, space_id=space_id))
+        with pool.connection() as conn:
+            return _mem(_store(conn).move(token, id, new_path, reason=reason,
+                                          space=space, space_id=space_id))
 
     @mcp.tool()
     def memory_forget(id: str, space: Optional[str] = None,
                       space_id: Optional[str] = None,
                       token: Optional[str] = None) -> dict:
         """Permanently delete a memory and its history (GDPR erasure)."""
-        return {"forgotten": store.forget(token, id, space=space, space_id=space_id)}
+        with pool.connection() as conn:
+            return {"forgotten": _store(conn).forget(
+                token, id, space=space, space_id=space_id)}
 
     # ─── identity: spaces & tokens (open/managed modes) ─────────────────────
     @mcp.tool()
@@ -147,8 +164,8 @@ def build_server(cfg: Optional[Config] = None):
         with you — with each one's id, name, description, permission and whether
         it's your default. Use a returned `id` as `space_id` to target a shared
         space; use your own space's `name` as `space`."""
-        with conn.transaction():
-            return identity.list_spaces(conn, _uid(token))
+        with pool.connection() as conn, conn.transaction():
+            return identity.list_spaces(conn, _uid(conn, token))
 
     @mcp.tool()
     def memory_issue_token(permission: str = "write", space: Optional[str] = None,
@@ -162,8 +179,8 @@ def build_server(cfg: Optional[Config] = None):
         exp = None
         if expires_days:
             exp = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=expires_days)
-        with conn.transaction():
-            uid = _admin_uid(token)
+        with pool.connection() as conn, conn.transaction():
+            uid = _admin_uid(conn, token)
             nsid = space_id
             if nsid is not None:
                 # can only scope a new token to a namespace the caller can reach
@@ -182,8 +199,8 @@ def build_server(cfg: Optional[Config] = None):
     @mcp.tool()
     def memory_list_tokens(token: Optional[str] = None) -> List[dict]:
         """List your tokens (metadata only — never the secret)."""
-        with conn.transaction():
-            out = identity.list_tokens(conn, _admin_uid(token))
+        with pool.connection() as conn, conn.transaction():
+            out = identity.list_tokens(conn, _admin_uid(conn, token))
         for d in out:                                  # make timestamps JSON-safe
             for key in ("expires_at", "revoked_at", "last_used_at", "created_at"):
                 d[key] = str(d[key]) if d[key] else None
@@ -192,8 +209,8 @@ def build_server(cfg: Optional[Config] = None):
     @mcp.tool()
     def memory_revoke_token(token_id: str, token: Optional[str] = None) -> dict:
         """Revoke one of your tokens by id (kills it immediately)."""
-        with conn.transaction():
-            uid = _admin_uid(token)
+        with pool.connection() as conn, conn.transaction():
+            uid = _admin_uid(conn, token)
             owned = {t["id"] for t in identity.list_tokens(conn, uid)}
             if token_id not in owned:
                 raise identity.AuthError("not your token")

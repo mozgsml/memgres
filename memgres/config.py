@@ -72,8 +72,11 @@ class Config:
     embed_api_base: str
     # database
     database_url: str
+    pool_size: int               # max pooled connections (HTTP + http-MCP servers)
 
     def validate(self) -> None:
+        if self.pool_size < 1:
+            raise ValueError("MEMGRES_POOL_SIZE must be >= 1")
         if self.max_write_bytes > self.max_body_bytes:
             raise ValueError(
                 "MEMGRES_MAX_WRITE_BYTES must be <= MEMGRES_MAX_BODY_BYTES"
@@ -116,6 +119,7 @@ def load() -> Config:
         embed_api_key=_str("MEMGRES_EMBED_API_KEY", ""),
         embed_api_base=_str("MEMGRES_EMBED_API_BASE", ""),
         database_url=_str("MEMGRES_DATABASE_URL", ""),
+        pool_size=_int("MEMGRES_POOL_SIZE", 4),
     )
     cfg.validate()
     return cfg
