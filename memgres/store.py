@@ -22,6 +22,7 @@ from typing import List, Optional, Sequence
 
 import psycopg
 
+from . import identity
 from .config import Config
 from .diffing import apply_diff, byte_len, content_hash, make_diff
 from .embeddings import Embedder, get_embedder
@@ -76,6 +77,9 @@ class Store:
                  conn: Optional["psycopg.Connection"] = None):
         self.cfg = cfg
         self.embedder = embedder if embedder is not None else get_embedder(cfg)
+        # v0.2 identity is on for open/managed; single mode keeps the legacy
+        # namespace = '' (or hash(token) when MEMGRES_NAMESPACES) behavior.
+        self._identity_on = cfg.key_mode != "single"
         self._own_conn = conn is None
         self._conn = conn or psycopg.connect(cfg.database_url or "")
         # Qdrant holds vectors out-of-band; pgvector keeps them in-row (default).
@@ -89,8 +93,10 @@ class Store:
         if self._own_conn:
             self._conn.close()
 
-    # ─── namespace / ttl helpers ────────────────────────────────────────────
-    def _ns(self, token: Optional[str]) -> str:
+    # ─── namespace resolution / authorization ───────────────────────────────
+    def _ns_legacy(self, token: Optional[str]) -> str:
+        """single-mode namespace: '' by default, or hash(token) under the legacy
+        MEMGRES_NAMESPACES flag. No users/permissions — the v0.1 behavior."""
         if not self.cfg.namespaces_enabled:
             return ""
         token = token or self.cfg.token      # env/MCP default for single-tenant setups
@@ -98,6 +104,26 @@ class Store:
             raise PermissionError("MEMGRES_NAMESPACES is on: a token is required "
                                   "(pass one, or set MEMGRES_TOKEN)")
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _authorize(self, token: Optional[str], *, space: Optional[str] = None,
+                   space_id: Optional[str] = None, need: str = "read",
+                   for_write: bool = False) -> str:
+        """Resolve (token, space) to the namespace id-string to operate in, and
+        enforce ``need`` (read|write|admin). In single mode this is the legacy
+        namespace and no auth happens. In open/managed mode a token is required;
+        the returned string is a namespace uuid (or '' never)."""
+        if not self._identity_on:
+            return self._ns_legacy(token)
+        token = token or self.cfg.token or None
+        with self._conn.transaction():
+            principal = identity.resolve(self._conn, self.cfg, token)
+            nsid, perm = identity.resolve_space(
+                self._conn, principal, space=space, space_id=space_id,
+                for_write=for_write)
+        if not identity.perm_at_least(perm, need):
+            raise identity.AuthError(
+                f"{need} permission required for this namespace (token grants {perm})")
+        return nsid
 
     def _expiry_sql(self, ttl_days: Optional[int]) -> str:
         days = ttl_days if ttl_days is not None else self.cfg.retention_days
@@ -134,9 +160,13 @@ class Store:
               body: Optional[str] = None, diff: Optional[str] = None,
               base_hash: Optional[str] = None, path: Optional[str] = None,
               tags: Optional[Sequence[str]] = None, source: Optional[str] = None,
-              reason: Optional[str] = None, ttl_days: Optional[int] = None) -> Memory:
-        ns = self._ns(token)
+              reason: Optional[str] = None, ttl_days: Optional[int] = None,
+              space: Optional[str] = None, space_id: Optional[str] = None) -> Memory:
         with self._conn.transaction():
+            # authorize inside the tx so a lazily-created user/namespace commits
+            # atomically with the write (or rolls back together on failure).
+            ns = self._authorize(token, space=space, space_id=space_id,
+                                 need="write", for_write=True)
             if id is None:
                 return self._create(ns, body, path, tags, source, reason, ttl_days)
             return self._update(ns, id, body, diff, base_hash, path, tags,
@@ -303,21 +333,27 @@ class Store:
     # ─── recall: lexical / semantic / hybrid ────────────────────────────────
     def recall(self, token: Optional[str], query: str, *, k: int = 10,
                tags: Optional[Sequence[str]] = None,
-               path_prefix: Optional[str] = None, mode: str = "auto"):
+               path_prefix: Optional[str] = None, mode: str = "auto",
+               space: Optional[str] = None, space_id: Optional[str] = None):
         from .search import recall as _recall
-        return _recall(self._conn, self.cfg, self.embedder, self._ns(token),
+        ns = self._authorize(token, space=space, space_id=space_id, need="read")
+        return _recall(self._conn, self.cfg, self.embedder, ns,
                        query, k=k, tags=tags, path_prefix=path_prefix, mode=mode,
                        qdrant=self._qdrant)
 
     # ─── convenience: move ──────────────────────────────────────────────────
     def move(self, token: Optional[str], id: str, new_path: str,
-             *, source: Optional[str] = None, reason: Optional[str] = None) -> Memory:
-        return self.write(token, id=id, path=new_path, source=source, reason=reason)
+             *, source: Optional[str] = None, reason: Optional[str] = None,
+             space: Optional[str] = None, space_id: Optional[str] = None) -> Memory:
+        return self.write(token, id=id, path=new_path, source=source, reason=reason,
+                          space=space, space_id=space_id)
 
     # ─── read ───────────────────────────────────────────────────────────────
     def get(self, token: Optional[str], id: str, *, renew: bool = True,
-            _ns: Optional[str] = None) -> Memory:
-        ns = _ns if _ns is not None else self._ns(token)
+            _ns: Optional[str] = None, space: Optional[str] = None,
+            space_id: Optional[str] = None) -> Memory:
+        ns = _ns if _ns is not None else self._authorize(
+            token, space=space, space_id=space_id, need="read")
         cur = self._conn.cursor()
         cur.execute(
             "SELECT id, body, content_hash, tags, path::text, seq, created_at, "
@@ -334,8 +370,9 @@ class Store:
         return Memory(str(row[0]), row[1], row[2], list(row[3]), row[4], row[5],
                       row[6], row[7], row[8])
 
-    def history(self, token: Optional[str], id: str) -> List[dict]:
-        ns = self._ns(token)
+    def history(self, token: Optional[str], id: str, *, space: Optional[str] = None,
+                space_id: Optional[str] = None) -> List[dict]:
+        ns = self._authorize(token, space=space, space_id=space_id, need="read")
         cur = self._conn.cursor()
         cur.execute("SELECT 1 FROM memory WHERE id=%s AND namespace=%s", (id, ns))
         if cur.fetchone() is None:
@@ -352,29 +389,38 @@ class Store:
 
     def annotate(self, token: Optional[str], id: str,
                  upto_seq: Optional[int] = None,
-                 lines: Optional[Sequence[int]] = None) -> List[dict]:
+                 lines: Optional[Sequence[int]] = None, *,
+                 space: Optional[str] = None, space_id: Optional[str] = None) -> List[dict]:
         """Blame: the body with each line tagged by who last changed it. Pass
         `lines` (1-based line numbers) to return only those lines."""
         from .blame import annotate as _annotate
-        return _annotate(self.history(token, id), upto_seq, lines)
+        return _annotate(self.history(token, id, space=space, space_id=space_id),
+                         upto_seq, lines)
 
     def annotate_grouped(self, token: Optional[str], id: str,
                          upto_seq: Optional[int] = None,
-                         include_text: bool = True) -> List[dict]:
+                         include_text: bool = True, *,
+                         space: Optional[str] = None,
+                         space_id: Optional[str] = None) -> List[dict]:
         """Blame as runs: consecutive same-author lines collapse into one block.
         `include_text=False` returns a pure ownership map (ranges, no body)."""
         from .blame import annotate_grouped as _grouped
-        return _grouped(self.history(token, id), upto_seq, include_text)
+        return _grouped(self.history(token, id, space=space, space_id=space_id),
+                        upto_seq, include_text)
 
     def reconstruct(self, token: Optional[str], id: str,
-                    upto_seq: Optional[int] = None) -> str:
+                    upto_seq: Optional[int] = None, *,
+                    space: Optional[str] = None, space_id: Optional[str] = None) -> str:
         """The exact body text at a past version (default current)."""
         from .blame import reconstruct as _reconstruct
-        return _reconstruct(self.history(token, id), upto_seq)
+        return _reconstruct(self.history(token, id, space=space, space_id=space_id),
+                            upto_seq)
 
-    def verify_history(self, token: Optional[str], id: str) -> bool:
+    def verify_history(self, token: Optional[str], id: str, *,
+                       space: Optional[str] = None,
+                       space_id: Optional[str] = None) -> bool:
         """Recompute the chain; True if untampered."""
-        rows = self.history(token, id)
+        rows = self.history(token, id, space=space, space_id=space_id)
         prev = None
         for r in rows:
             expect = _row_hash(prev, id, r["seq"], r["op"], r["diff"],
@@ -386,8 +432,9 @@ class Store:
         return True
 
     # ─── forget: real erasure ───────────────────────────────────────────────
-    def forget(self, token: Optional[str], id: str) -> bool:
-        ns = self._ns(token)
+    def forget(self, token: Optional[str], id: str, *, space: Optional[str] = None,
+               space_id: Optional[str] = None) -> bool:
+        ns = self._authorize(token, space=space, space_id=space_id, need="write")
         with self._conn.transaction():
             cur = self._conn.cursor()
             cur.execute("DELETE FROM memory WHERE id=%s AND namespace=%s", (id, ns))

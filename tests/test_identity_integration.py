@@ -23,6 +23,7 @@ from memgres.identity import (  # noqa: E402
     AuthError, SpaceNotFound, Principal, new_token, valid_format,
     TOKEN_RE,
 )
+from memgres.store import NotFound as NotFoundErr  # noqa: E402
 
 DSN = os.environ.get("MEMGRES_TEST_DSN",
                      "postgresql://memgres:memgres@localhost:55432/memgres")
@@ -251,6 +252,63 @@ def test_request_access_approve_grants_membership(conn):
     assert ident.list_requests(conn, shared) == []
     nsid, perm = ident.resolve_space(conn, jp, space_id=shared)
     assert nsid == shared and perm == "read"
+
+
+# ─── Store end-to-end under identity (open/managed) ──────────────────────────
+def _store(conn, *, key_mode="open", admin_token=""):
+    from memgres.store import Store
+    c = psycopg.connect(DSN)                      # own non-autocommit conn
+    s = Store(cfg(conn, key_mode=key_mode, admin_token=admin_token), conn=c)
+    s._own_conn = True                            # so s.close() closes c (no leaked tx)
+    return s
+
+
+def test_store_open_mode_isolates_tenants(conn):
+    s = _store(conn, key_mode="open")
+    alice, bob = new_token(), new_token()
+    # each token lazily gets its own user + default namespace on first write
+    ma = s.write(alice, body="alice private\n", tags=["x"])
+    mb = s.write(bob, body="bob private\n", tags=["x"])
+    # each reads only their own
+    assert s.get(alice, ma.id).body == "alice private\n"
+    assert s.get(bob, mb.id).body == "bob private\n"
+    with pytest.raises(NotFoundErr):
+        s.get(alice, mb.id)                       # cross-tenant read blocked
+    hits = s.recall(alice, "private")
+    assert [h.id for h in hits] == [ma.id]        # recall scoped to alice
+    s.close()
+
+
+def test_store_read_only_token_cannot_write(conn):
+    uid = ident.create_user(conn)
+    ns = ident.create_namespace(conn, uid, "n")
+    ro, _ = ident.issue_token(conn, uid, permission="read")
+    rw, _ = ident.issue_token(conn, uid, permission="write")
+    s = _store(conn, key_mode="managed")
+    m = s.write(rw, body="seed\n", space="n")
+    assert s.get(ro, m.id, space="n").body == "seed\n"       # read ok
+    with pytest.raises(AuthError):
+        s.write(ro, body="nope\n", space="n")               # write denied
+    s.close()
+
+
+def test_store_managed_rejects_unknown_token(conn):
+    s = _store(conn, key_mode="managed")
+    with pytest.raises(AuthError):
+        s.write(new_token(), body="x\n")
+    s.close()
+
+
+def test_store_named_spaces_same_token(conn):
+    uid = ident.create_user(conn)
+    tok, _ = ident.issue_token(conn, uid, permission="write")   # unscoped
+    s = _store(conn, key_mode="managed")
+    a = s.write(tok, body="in a\n", space="a")
+    b = s.write(tok, body="in b\n", space="b")
+    # one token, two named namespaces, isolated recall
+    assert [h.id for h in s.recall(tok, "in", space="a")] == [a.id]
+    assert [h.id for h in s.recall(tok, "in", space="b")] == [b.id]
+    s.close()
 
 
 def test_list_spaces_flags(conn):

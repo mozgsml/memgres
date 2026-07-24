@@ -145,5 +145,44 @@ def test_namespace_token_required(monkeypatch):
                           headers={"X-Memgres-Token": "alice-tok"}).status_code == 200
 
 
+def test_identity_open_mode_over_http(monkeypatch):
+    from memgres import identity
+    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    for k in list(os.environ):
+        if k.startswith("MEMGRES_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
+    monkeypatch.setenv("MEMGRES_KEY_MODE", "open")
+    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
+    monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
+    app = create_app(load())
+    alice, bob = identity.new_token(), identity.new_token()
+    with TestClient(app) as client:
+        # no token -> 401
+        assert client.post("/memories", json={"body": "x\n"}).status_code == 401
+        # alice writes into a named space (lazily created)
+        ha = {"Authorization": f"Bearer {alice}"}
+        hb = {"Authorization": f"Bearer {bob}"}
+        r = client.post("/memories", json={"body": "alice secret\n", "space": "vault"},
+                        headers=ha)
+        assert r.status_code == 201
+        mid = r.json()["id"]
+        # bob can't read alice's memory
+        assert client.get(f"/memories/{mid}", headers=hb).status_code == 404
+        # alice reads it back by naming her space
+        assert client.get(f"/memories/{mid}", params={"space": "vault"},
+                          headers=ha).json()["body"] == "alice secret\n"
+        # /spaces lists alice's vault
+        spaces = client.get("/spaces", headers=ha).json()
+        assert [s["name"] for s in spaces] == ["vault"]
+        # bob writes into his own default space
+        assert client.post("/memories", json={"body": "bob note\n"},
+                           headers=hb).status_code == 201
+        # recall is scoped: bob sees his note but never alice's secret
+        assert client.get("/recall", params={"q": "note"}, headers=hb).json()
+        assert client.get("/recall", params={"q": "secret"}, headers=hb).json() == []
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

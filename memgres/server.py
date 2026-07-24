@@ -26,6 +26,7 @@ from typing import List, Optional
 from .config import Config, load
 from .diffing import DiffConflict
 from .embeddings import get_embedder
+from .identity import SpaceNotFound
 from .schema import migrate
 from .store import Conflict, NoParent, NotFound, Store, TooLarge
 
@@ -76,6 +77,8 @@ def create_app(cfg: Optional[Config] = None):
         source: Optional[str] = None
         reason: Optional[str] = None
         ttl_days: Optional[int] = None
+        space: Optional[str] = None          # namespace name (your own)
+        space_id: Optional[str] = None       # namespace id (canonical; shared spaces)
 
     class EditBody(BaseModel):
         body: Optional[str] = None
@@ -86,11 +89,15 @@ def create_app(cfg: Optional[Config] = None):
         source: Optional[str] = None
         reason: Optional[str] = None
         ttl_days: Optional[int] = None
+        space: Optional[str] = None
+        space_id: Optional[str] = None
 
     class MoveBody(BaseModel):
         path: str
         source: Optional[str] = None
         reason: Optional[str] = None
+        space: Optional[str] = None
+        space_id: Optional[str] = None
 
     # ─── auth: extract the namespace token ──────────────────────────────────
     def token(authorization: Optional[str] = Header(None),
@@ -99,8 +106,9 @@ def create_app(cfg: Optional[Config] = None):
         if not tok and authorization and authorization.lower().startswith("bearer "):
             tok = authorization[7:]
         tok = tok or cfg.token          # env default (single-tenant deployments)
-        if cfg.namespaces_enabled and not tok:
-            raise HTTPException(401, "namespace token required")
+        auth_required = cfg.namespaces_enabled or cfg.key_mode != "single"
+        if auth_required and not tok:
+            raise HTTPException(401, "token required")
         return tok
 
     def _mem(m) -> dict:
@@ -116,7 +124,7 @@ def create_app(cfg: Optional[Config] = None):
         """Run a store call, mapping store exceptions to HTTP codes."""
         try:
             return fn()
-        except NotFound:
+        except (NotFound, SpaceNotFound):
             raise HTTPException(404, "not found")
         except (Conflict, DiffConflict) as e:
             raise HTTPException(409, str(e))
@@ -139,13 +147,16 @@ def create_app(cfg: Optional[Config] = None):
         with pool.connection() as conn:
             m = _guard(lambda: _store(conn).write(
                 tok, body=req.body, path=req.path, tags=req.tags,
-                source=req.source, reason=req.reason, ttl_days=req.ttl_days))
+                source=req.source, reason=req.reason, ttl_days=req.ttl_days,
+                space=req.space, space_id=req.space_id))
             return _mem(m)
 
     @app.get("/memories/{mid}")
-    def read(mid: str, tok: Optional[str] = Depends(token)):
+    def read(mid: str, tok: Optional[str] = Depends(token),
+             space: Optional[str] = None, space_id: Optional[str] = None):
         with pool.connection() as conn:
-            return _mem(_guard(lambda: _store(conn).get(tok, mid)))
+            return _mem(_guard(lambda: _store(conn).get(
+                tok, mid, space=space, space_id=space_id)))
 
     @app.patch("/memories/{mid}")
     def edit(mid: str, req: EditBody, tok: Optional[str] = Depends(token)):
@@ -153,32 +164,38 @@ def create_app(cfg: Optional[Config] = None):
             m = _guard(lambda: _store(conn).write(
                 tok, id=mid, body=req.body, diff=req.diff, base_hash=req.base_hash,
                 path=req.path, tags=req.tags, source=req.source, reason=req.reason,
-                ttl_days=req.ttl_days))
+                ttl_days=req.ttl_days, space=req.space, space_id=req.space_id))
             return _mem(m)
 
     @app.post("/memories/{mid}/move")
     def move(mid: str, req: MoveBody, tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
             m = _guard(lambda: _store(conn).move(
-                tok, mid, req.path, source=req.source, reason=req.reason))
+                tok, mid, req.path, source=req.source, reason=req.reason,
+                space=req.space, space_id=req.space_id))
             return _mem(m)
 
     @app.delete("/memories/{mid}", status_code=204)
-    def forget(mid: str, tok: Optional[str] = Depends(token)):
+    def forget(mid: str, tok: Optional[str] = Depends(token),
+               space: Optional[str] = None, space_id: Optional[str] = None):
         with pool.connection() as conn:
-            ok = _guard(lambda: _store(conn).forget(tok, mid))
+            ok = _guard(lambda: _store(conn).forget(
+                tok, mid, space=space, space_id=space_id))
             if not ok:
                 raise HTTPException(404, "not found")
 
     @app.get("/memories/{mid}/history")
-    def history(mid: str, tok: Optional[str] = Depends(token)):
+    def history(mid: str, tok: Optional[str] = Depends(token),
+                space: Optional[str] = None, space_id: Optional[str] = None):
         with pool.connection() as conn:
-            return _guard(lambda: _store(conn).history(tok, mid))
+            return _guard(lambda: _store(conn).history(
+                tok, mid, space=space, space_id=space_id))
 
     @app.get("/memories/{mid}/blame")
     def blame(mid: str, upto_seq: Optional[int] = None,
               group: bool = True, text: bool = True,
               lines: Optional[str] = Query(None, description="e.g. '2' or '1,3-5'"),
+              space: Optional[str] = None, space_id: Optional[str] = None,
               tok: Optional[str] = Depends(token)):
         """Who last changed each line. Grouped into author-blocks by default
         (`group=false` for per-line); `text=false` drops bodies for a pure
@@ -187,27 +204,48 @@ def create_app(cfg: Optional[Config] = None):
         with pool.connection() as conn:
             s = _store(conn)
             if want is not None or not group:
-                return _guard(lambda: s.annotate(tok, mid, upto_seq, want))
-            return _guard(lambda: s.annotate_grouped(tok, mid, upto_seq, text))
+                return _guard(lambda: s.annotate(
+                    tok, mid, upto_seq, want, space=space, space_id=space_id))
+            return _guard(lambda: s.annotate_grouped(
+                tok, mid, upto_seq, text, space=space, space_id=space_id))
 
     @app.get("/memories/{mid}/at/{seq}")
-    def at_version(mid: str, seq: int, tok: Optional[str] = Depends(token)):
+    def at_version(mid: str, seq: int, tok: Optional[str] = Depends(token),
+                   space: Optional[str] = None, space_id: Optional[str] = None):
         """The exact body as it was at version `seq` (reconstructed from history)."""
         with pool.connection() as conn:
-            body = _guard(lambda: _store(conn).reconstruct(tok, mid, seq))
+            body = _guard(lambda: _store(conn).reconstruct(
+                tok, mid, seq, space=space, space_id=space_id))
             return {"seq": seq, "body": body}
 
     @app.get("/recall")
     def recall(q: str, k: int = 10, mode: str = "auto",
                tags: Optional[str] = Query(None, description="comma-separated"),
                path_prefix: Optional[str] = None,
+               space: Optional[str] = None, space_id: Optional[str] = None,
                tok: Optional[str] = Depends(token)):
         taglist = [t for t in (tags.split(",") if tags else []) if t]
         with pool.connection() as conn:
             hits = _guard(lambda: _store(conn).recall(
-                tok, q, k=k, tags=taglist or None, path_prefix=path_prefix, mode=mode))
+                tok, q, k=k, tags=taglist or None, path_prefix=path_prefix,
+                mode=mode, space=space, space_id=space_id))
             return [{"id": h.id, "body": h.body, "tags": h.tags,
                      "path": h.path, "score": h.score} for h in hits]
+
+    # ─── spaces: what this token can reach ──────────────────────────────────
+    @app.get("/spaces")
+    def spaces(tok: Optional[str] = Depends(token)):
+        """List the namespaces this token can reach (identity modes only)."""
+        if cfg.key_mode == "single":
+            return []
+        from . import identity
+        with pool.connection() as conn:
+            def _list():
+                p = identity.resolve(conn, cfg, tok)
+                if p.user_id is None:      # admin or provisional → nothing to list
+                    return []
+                return identity.list_spaces(conn, p.user_id)
+            return _guard(_list)
 
     return app
 
