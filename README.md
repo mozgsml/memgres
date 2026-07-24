@@ -237,10 +237,28 @@ just works. Two *optional*, unrelated tokens exist:
   lexical-only need none. This is the key from your embedding provider.
 - **Namespace token** (only if `MEMGRES_NAMESPACES=true`, for multi-tenant) — each
   caller sends a secret string; memgres stores `hash(token)` as the namespace, so
-  callers only ever see their own memories. You mint and hand out these strings
-  yourself (any high-entropy secret); there's no built-in issuer. Sent as
-  `Authorization: Bearer <token>` / `X-Memgres-Token` (HTTP) or the `token`
-  argument (library/MCP). One wallet/app can back many clients via distinct tokens.
+  callers only ever see their own memories.
+
+  **Getting one:** there's no issuer or registration — you mint it. It's just a
+  high-entropy secret you generate:
+  ```bash
+  python -c "import secrets; print(secrets.token_urlsafe(32))"   # or: openssl rand -base64 32
+  ```
+  First use creates its namespace implicitly (by hash). Sent as `Authorization:
+  Bearer <token>` / `X-Memgres-Token` (HTTP), the `token` argument (library/MCP), or
+  as `MEMGRES_TOKEN` in the env. One wallet/app can back many clients via distinct
+  tokens.
+
+  **Storing it (stdio MCP):** put it in the client config's `env` block
+  (`MEMGRES_TOKEN`) — the same file that holds `command`. That file is plaintext on
+  your machine, so treat the token like a password (lock the file to your user; or
+  keep it in an OS keychain / secrets manager and inject via shell env).
+
+  **Two caveats:** it's a *bearer* secret with **no recovery** — the server keeps
+  only `hash(token)`, so losing it loses access to that namespace and leaking it
+  hands it over. And **rotating the token moves you to a new, empty namespace**
+  (namespace = `hash(token)`); rotate-without-data-loss would need a `token →
+  namespace` mapping, which isn't built in.
 
 ---
 
