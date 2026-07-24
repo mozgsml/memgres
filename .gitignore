@@ -17,3 +17,6 @@ env/
 # OS/editor
 .DS_Store
 *.swp
+
+# Internal working design notes — not for publication
+docs/IDENTITY_DESIGN.md
