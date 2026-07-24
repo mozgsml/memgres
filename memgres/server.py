@@ -67,7 +67,7 @@ def create_app(cfg: Optional[Config] = None):
         yield
         pool.close()
 
-    app = FastAPI(title="memgres", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="memgres", version="0.2.0", lifespan=lifespan)
 
     # ─── request bodies ─────────────────────────────────────────────────────
     class CreateBody(BaseModel):

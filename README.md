@@ -151,7 +151,10 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_MAX_WRITE_BYTES` | `16384` | ceiling for one write/diff payload (≤ body) |
 | `MEMGRES_RETENTION_DAYS` | `0` | `0` = keep forever; `>0` = expire N days after last touch |
 | `MEMGRES_RENEW_ON_READ` | `true` | a read pushes the expiry clock forward |
-| `MEMGRES_NAMESPACES` | `false` | `true` = each caller sends a secret token; namespace = its hash |
+| `MEMGRES_KEY_MODE` | `single` | `single` (no auth, one space) · `open` (bring-your-own token, self-registers) · `managed` (admin-provisioned). See [docs/TENANCY.md](docs/TENANCY.md) |
+| `MEMGRES_ADMIN_TOKEN` | — | global admin bearer for provisioning (managed mode) |
+| `MEMGRES_TOKEN` | — | default token used when a call passes none (single-tenant endpoints) |
+| `MEMGRES_NAMESPACES` | `false` | legacy single-mode flag: `true` = namespace is `hash(token)` (superseded by `MEMGRES_KEY_MODE`) |
 | `MEMGRES_TREE` | `true` | `ltree` path column + GiST index (fast subtree select) |
 | `MEMGRES_REQUIRE_PARENT` | `false` | `true` = a node's parent path must already exist |
 | `MEMGRES_HISTORY` | `true` | keep the hash-chained diff history (deleted with the record) |
@@ -173,9 +176,16 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `GET` | `/memories/{id}/blame` | line attribution; `?group`, `?text`, `?lines=1,3-5` |
 | `GET` | `/memories/{id}/at/{seq}` | body reconstructed at a version |
 | `GET` | `/recall` | `?q=&k=&mode=&tags=&path_prefix=` |
+| `GET` | `/spaces` | namespaces this token can reach (identity modes) |
 | `GET` | `/healthz` | liveness |
 
-Namespace token (when `MEMGRES_NAMESPACES=true`) goes in `Authorization: Bearer <token>` or `X-Memgres-Token`. OpenAPI/Swagger is served at `/docs`. Store errors map to status codes: `409` stale-hash conflict, `404` not found, `413` too large, `401` missing token.
+Every memory/recall route also takes optional `space` (one of your namespaces by
+name) and `space_id` (canonical id, for shared spaces). In `open`/`managed` mode
+the token goes in `Authorization: Bearer <token>` or `X-Memgres-Token`; there are
+also request-access and `/admin/*` provisioning routes — see
+[docs/TENANCY.md](docs/TENANCY.md). OpenAPI/Swagger is at `/docs`. Store errors
+map to status codes: `409` stale-hash conflict, `404` not found, `413` too large,
+`401`/`403` auth.
 
 ## Use it with an LLM / agent (MCP)
 
@@ -229,36 +239,29 @@ control the agent loop and decide when to write/recall.
 
 ## Tokens & auth
 
-There is **no token for single-user / local use** — leave everything default and it
-just works. Two *optional*, unrelated tokens exist:
+There is **no token for single-user / local use** — leave everything default
+(`MEMGRES_KEY_MODE=single`) and it just works. Two token concepts exist, unrelated:
 
 - **Embedding API key** (`MEMGRES_EMBED_API_KEY`) — only if you use a *cloud*
   embedding provider (`openai`/`jina`) for semantic recall. Local models and
   lexical-only need none. This is the key from your embedding provider.
-- **Namespace token** (only if `MEMGRES_NAMESPACES=true`, for multi-tenant) — each
-  caller sends a secret string; memgres stores `hash(token)` as the namespace, so
-  callers only ever see their own memories.
+- **Access token** (multi-tenant, `MEMGRES_KEY_MODE=open|managed`) — a bearer
+  credential of the form `mgk_` + 43 url-safe chars, authenticating *as a user*.
+  Tokens are rotatable, expirable, revocable, and restrictable (a permission
+  ceiling + optional scope to one namespace); the secret is stored only as a hash.
+  Rotating a token does **not** move you to a new empty space — many tokens can
+  back one user, and namespaces are addressed by name/id, not by `hash(token)`.
 
-  **Getting one:** there's no issuer or registration — you mint it. It's just a
-  high-entropy secret you generate:
   ```bash
-  python -c "import secrets; print(secrets.token_urlsafe(32))"   # or: openssl rand -base64 32
+  python -c "import secrets; print('mgk_'+secrets.token_urlsafe(32))"   # open mode: mint your own
   ```
-  First use creates its namespace implicitly (by hash). Sent as `Authorization:
-  Bearer <token>` / `X-Memgres-Token` (HTTP), the `token` argument (library/MCP), or
-  as `MEMGRES_TOKEN` in the env. One wallet/app can back many clients via distinct
-  tokens.
 
-  **Storing it (stdio MCP):** put it in the client config's `env` block
-  (`MEMGRES_TOKEN`) — the same file that holds `command`. That file is plaintext on
-  your machine, so treat the token like a password (lock the file to your user; or
-  keep it in an OS keychain / secrets manager and inject via shell env).
+  Sent as `Authorization: Bearer <token>` / `X-Memgres-Token` (HTTP), the `token`
+  argument (library/MCP), or `MEMGRES_TOKEN` in env for a single-tenant endpoint.
+  It's a bearer secret with **no recovery** — treat it like a password.
 
-  **Two caveats:** it's a *bearer* secret with **no recovery** — the server keeps
-  only `hash(token)`, so losing it loses access to that namespace and leaking it
-  hands it over. And **rotating the token moves you to a new, empty namespace**
-  (namespace = `hash(token)`); rotate-without-data-loss would need a `token →
-  namespace` mapping, which isn't built in.
+Full model — users, namespaces, permissions, request-access, admin
+provisioning — in **[docs/TENANCY.md](docs/TENANCY.md)**.
 
 ---
 
