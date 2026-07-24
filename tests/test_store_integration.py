@@ -174,5 +174,27 @@ def test_namespace_isolation(monkeypatch):
     conn.close()
 
 
+def test_default_token_from_config(monkeypatch):
+    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    for k in list(os.environ):
+        if k.startswith("MEMGRES_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
+    monkeypatch.setenv("MEMGRES_NAMESPACES", "true")
+    monkeypatch.setenv("MEMGRES_TOKEN", "single-tenant-secret")   # env default
+    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
+    monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
+    cfg = load(); conn = psycopg.connect(DSN); migrate(conn, cfg)
+    s = Store(cfg, conn=conn)
+    # no token passed -> falls back to MEMGRES_TOKEN, so writes/reads work
+    m = s.write(None, body="via default token\n")
+    assert s.get(None, m.id).body == "via default token\n"
+    # an explicit different token is a different namespace -> can't see it
+    with pytest.raises(NotFound):
+        s.get("other-secret", m.id)
+    conn.close()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

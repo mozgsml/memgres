@@ -93,8 +93,10 @@ class Store:
     def _ns(self, token: Optional[str]) -> str:
         if not self.cfg.namespaces_enabled:
             return ""
+        token = token or self.cfg.token      # env/MCP default for single-tenant setups
         if not token:
-            raise PermissionError("MEMGRES_NAMESPACES is on: a token is required")
+            raise PermissionError("MEMGRES_NAMESPACES is on: a token is required "
+                                  "(pass one, or set MEMGRES_TOKEN)")
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
     def _expiry_sql(self, ttl_days: Optional[int]) -> str:

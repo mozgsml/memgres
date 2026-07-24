@@ -50,6 +50,8 @@ class Config:
     renew_on_read: bool          # a read pushes the expiry clock forward
     # multi-tenant isolation
     namespaces_enabled: bool     # False = single space; True = secret-token namespaces
+    token: str                   # default namespace token when a call passes none
+                                 # (set in MCP/env for a single-tenant deployment)
     # organization
     tree_enabled: bool           # ltree path column + GiST index for fast subtree selection
     require_parent: bool         # False = sparse paths (create food.apple with no food row);
@@ -95,6 +97,7 @@ def load() -> Config:
         retention_days=_int("MEMGRES_RETENTION_DAYS", 0),
         renew_on_read=_bool("MEMGRES_RENEW_ON_READ", True),
         namespaces_enabled=_bool("MEMGRES_NAMESPACES", False),
+        token=_str("MEMGRES_TOKEN", ""),
         tree_enabled=_bool("MEMGRES_TREE", True),
         require_parent=_bool("MEMGRES_REQUIRE_PARENT", False),
         history_enabled=_bool("MEMGRES_HISTORY", True),

@@ -98,6 +98,7 @@ def create_app(cfg: Optional[Config] = None):
         tok = x_memgres_token
         if not tok and authorization and authorization.lower().startswith("bearer "):
             tok = authorization[7:]
+        tok = tok or cfg.token          # env default (single-tenant deployments)
         if cfg.namespaces_enabled and not tok:
             raise HTTPException(401, "namespace token required")
         return tok

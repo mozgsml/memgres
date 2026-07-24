@@ -177,28 +177,44 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 
 Namespace token (when `MEMGRES_NAMESPACES=true`) goes in `Authorization: Bearer <token>` or `X-Memgres-Token`. OpenAPI/Swagger is served at `/docs`. Store errors map to status codes: `409` stale-hash conflict, `404` not found, `413` too large, `401` missing token.
 
-## Use it with an LLM / agent
+## Use it with an LLM / agent (MCP)
 
 memgres itself **never calls an LLM** — it's the memory, not the model. Your LLM
 uses it one of two ways:
 
 **A. Via MCP** — the model calls memgres tools directly (Claude Desktop, Cursor,
-Cline, any MCP client). This is the zero-code path.
+Cline, any MCP client). Zero code. Two ways to point the client at a server:
 
-```bash
-pip install "memgres[mcp]"     # installs the `memgres-mcp` command
+**No local install — run the MCP server from the container.** The client launches
+the published image; nothing to `pip install`:
+
+```json
+{
+  "mcpServers": {
+    "memgres": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-e", "MEMGRES_DATABASE_URL=postgresql://memgres:memgres@host.docker.internal:5432/memgres",
+        "ghcr.io/mozgsml/memgres", "memgres-mcp"
+      ]
+    }
+  }
+}
 ```
 
-Add it to your MCP client config (e.g. Claude Desktop's `claude_desktop_config.json`):
+`-i` is required (the client speaks JSON-RPC over stdin/stdout). Point
+`MEMGRES_DATABASE_URL` at a reachable Postgres — `host.docker.internal:5432` for
+one on the host, or add `--network` / a real host:port for one elsewhere.
+
+**Or install the command** (`pip install "memgres[mcp]"`) and run it directly:
 
 ```json
 {
   "mcpServers": {
     "memgres": {
       "command": "memgres-mcp",
-      "env": {
-        "MEMGRES_DATABASE_URL": "postgresql://memgres:memgres@localhost:5432/memgres"
-      }
+      "env": { "MEMGRES_DATABASE_URL": "postgresql://memgres:memgres@localhost:5432/memgres" }
     }
   }
 }
@@ -206,10 +222,21 @@ Add it to your MCP client config (e.g. Claude Desktop's `claude_desktop_config.j
 
 Restart the client — the model now has tools `memory_write`, `memory_recall`,
 `memory_get`, `memory_blame`, `memory_history`, `memory_move`, `memory_forget`.
-Tell it *"remember X"* / *"what do you know about Y?"* and it will call them. (If
-`memgres-mcp` isn't on the client's PATH, use the absolute path to it, e.g.
-`/path/to/venv/bin/memgres-mcp`. For semantic recall add the embedding env vars —
-see [docs/BACKENDS.md](docs/BACKENDS.md).)
+Tell it *"remember X"* / *"what do you know about Y?"* and it calls them. (For
+semantic recall add the embedding env vars — see [docs/BACKENDS.md](docs/BACKENDS.md).)
+
+**Multi-tenant from MCP:** set the tenant's token right in the config's env, so the
+client never has to pass it per call:
+
+```json
+"env": {
+  "MEMGRES_DATABASE_URL": "postgresql://…",
+  "MEMGRES_NAMESPACES": "true",
+  "MEMGRES_TOKEN": "this-tenant-secret"
+}
+```
+Every memory that client writes/reads lives in `hash(MEMGRES_TOKEN)` — one config
+per tenant, fully isolated.
 
 **B. From your own agent code** — your loop calls the HTTP API or the `Store`
 library after the model produces text (see the examples above). Use this when you
