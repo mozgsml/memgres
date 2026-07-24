@@ -107,7 +107,20 @@ def build_server(cfg: Optional[Config] = None):
 
 
 def main():  # pragma: no cover - entrypoint
-    build_server().run()
+    """stdio by default (a client spawns this process). Set
+    MEMGRES_MCP_TRANSPORT=http to serve Streamable HTTP at MEMGRES_MCP_HOST:PORT
+    (/mcp) instead — so the server can live in docker compose and clients just
+    point at a URL."""
+    import os
+
+    server = build_server()
+    transport = os.environ.get("MEMGRES_MCP_TRANSPORT", "stdio").lower()
+    if transport in ("http", "streamable-http", "streamable_http"):
+        server.settings.host = os.environ.get("MEMGRES_MCP_HOST", "0.0.0.0")
+        server.settings.port = int(os.environ.get("MEMGRES_MCP_PORT", "8765"))
+        server.run(transport="streamable-http")
+    else:
+        server.run()
 
 
 if __name__ == "__main__":  # pragma: no cover

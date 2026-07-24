@@ -182,33 +182,26 @@ Namespace token (when `MEMGRES_NAMESPACES=true`) goes in `Authorization: Bearer 
 memgres itself **never calls an LLM** — it's the memory, not the model. Your LLM
 uses it one of two ways:
 
-**A. Via MCP** — the model calls memgres tools directly (Claude Desktop, Cursor,
-Cline, any MCP client). Zero code. Two ways to point the client at a server:
+**A. Via MCP** — the model calls memgres tools directly (Cursor, Cline, Claude
+Desktop, any MCP client). Zero code.
 
-**No local install — run the MCP server from the container.** The client launches
-the published image; nothing to `pip install`:
+`docker compose up` already starts an MCP server over Streamable HTTP at
+**`http://localhost:8765/mcp`**. Point a URL-capable MCP client at it — nothing else
+to run:
 
 ```json
 {
   "mcpServers": {
-    "memgres": {
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-e", "MEMGRES_DATABASE_URL=postgresql://memgres:memgres@host.docker.internal:5432/memgres",
-        "ghcr.io/mozgsml/memgres", "memgres-mcp"
-      ]
-    }
+    "memgres": { "url": "http://localhost:8765/mcp" }
   }
 }
 ```
 
-`-i` is required (the client speaks JSON-RPC over stdin/stdout). Point
-`MEMGRES_DATABASE_URL` at a reachable Postgres — `host.docker.internal:5432` for
-one on the host, or add `--network` / a real host:port for one elsewhere.
+For **stdio-only** clients, install the command and let the client spawn it:
 
-**Or install the command** (`pip install "memgres[mcp]"`) and run it directly:
-
+```bash
+pip install "memgres[mcp]"
+```
 ```json
 {
   "mcpServers": {
@@ -220,30 +213,19 @@ one on the host, or add `--network` / a real host:port for one elsewhere.
 }
 ```
 
-Restart the client — the model now has tools `memory_write`, `memory_recall`,
-`memory_get`, `memory_blame`, `memory_history`, `memory_move`, `memory_forget`.
-Tell it *"remember X"* / *"what do you know about Y?"* and it calls them. (For
-semantic recall add the embedding env vars — see [docs/BACKENDS.md](docs/BACKENDS.md).)
+Either way the model gets tools `memory_write`, `memory_recall`, `memory_get`,
+`memory_blame`, `memory_history`, `memory_move`, `memory_forget`. Tell it *"remember
+X"* / *"what do you know about Y?"* and it calls them. (For semantic recall add the
+embedding env vars — see [docs/BACKENDS.md](docs/BACKENDS.md).)
 
-**Multi-tenant from MCP:** set the tenant's token right in the config's env, so the
-client never has to pass it per call:
-
-```json
-"env": {
-  "MEMGRES_DATABASE_URL": "postgresql://…",
-  "MEMGRES_NAMESPACES": "true",
-  "MEMGRES_TOKEN": "this-tenant-secret"
-}
-```
-Every memory that client writes/reads lives in `hash(MEMGRES_TOKEN)` — one config
-per tenant, fully isolated.
+**Isolation:** the compose HTTP endpoint is one tenant — set `MEMGRES_NAMESPACES=true`
++ `MEMGRES_TOKEN=<secret>` on the `mcp` service to scope it. For per-user isolation,
+run one stdio server per user with each user's `MEMGRES_TOKEN` in their client's env;
+every memory then lives in `hash(MEMGRES_TOKEN)`.
 
 **B. From your own agent code** — your loop calls the HTTP API or the `Store`
 library after the model produces text (see the examples above). Use this when you
 control the agent loop and decide when to write/recall.
-
-Either way you need a Postgres running (`docker compose up` gives you one, or point
-`MEMGRES_DATABASE_URL` at your own).
 
 ## Tokens & auth
 

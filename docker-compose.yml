@@ -1,6 +1,6 @@
 # memgres — one command to a working memory service.
 #
-#   docker compose up            → pgvector + memgres on http://localhost:8080
+#   docker compose up            → pgvector + REST API (:8080) + MCP server (:8765)
 #   docker compose --profile qdrant up   → also start Qdrant (optional vector backend)
 #
 # By default this pulls the published image (no build). Pin a version with
@@ -51,6 +51,39 @@ services:
       timeout: 4s
       retries: 5
       start_period: 20s     # migrate runs on startup before serving
+    restart: unless-stopped
+
+  # MCP server over Streamable HTTP — point an MCP client at http://localhost:8765/mcp.
+  # Same image, just a different command + transport.
+  mcp:
+    image: ghcr.io/mozgsml/memgres:${MEMGRES_VERSION:-latest}
+    # build: .
+    command: memgres-mcp
+    environment:
+      MEMGRES_DATABASE_URL: postgresql://memgres:memgres@db:5432/memgres
+      MEMGRES_MCP_TRANSPORT: http
+      MEMGRES_MCP_HOST: 0.0.0.0
+      MEMGRES_MCP_PORT: "8765"
+      QDRANT_URL: http://qdrant:6333
+      # single-tenant token (optional): uncomment to isolate this endpoint
+      # MEMGRES_NAMESPACES: "true"
+      # MEMGRES_TOKEN: change-me
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "${MEMGRES_MCP_HOST_PORT:-8765}:8765"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # override the image's :8080 check — this service listens on :8765 (MCP)
+      test: ["CMD", "python", "-c",
+             "import socket; socket.create_connection(('localhost',8765),3).close()"]
+      interval: 10s
+      timeout: 4s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 
   # Optional separate vector backend. Only used if MEMGRES_VECTOR_BACKEND=qdrant.
