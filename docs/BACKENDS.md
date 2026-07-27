@@ -104,7 +104,16 @@ MEMGRES_VECTOR_BACKEND=qdrant
 QDRANT_URL=http://localhost:6333
 QDRANT_API_KEY=                      # if your Qdrant requires one
 MEMGRES_QDRANT_COLLECTION=memgres    # default
+MEMGRES_QDRANT_CA=                   # path to a CA/self-signed cert (only for https)
 ```
+`MEMGRES_QDRANT_CA` is only for an `https://` Qdrant whose certificate the system
+trust store doesn't already know — a self-signed or private-CA deployment. Point it
+at the PEM and the client verifies against exactly that cert; leave it unset for
+plain http or a publicly-trusted certificate. Reusing a Qdrant you already run? Give
+memgres its own `MEMGRES_QDRANT_COLLECTION` — a collection is the isolation unit, so
+your other collections are untouched, and within it every point is tagged by
+namespace for tenant-scoped search.
+
 With docker compose, start Qdrant alongside the service:
 ```bash
 docker compose --profile qdrant up

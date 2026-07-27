@@ -13,7 +13,13 @@ So tag/tree/TTL changes never need to touch Qdrant — only a body change re-emb
 (upsert) and `forget` deletes the point. Config for the connection:
 
   QDRANT_URL (default http://localhost:6333) · QDRANT_API_KEY ·
-  MEMGRES_QDRANT_COLLECTION (default "memgres")
+  MEMGRES_QDRANT_COLLECTION (default "memgres") ·
+  MEMGRES_QDRANT_CA (path to a CA/self-signed cert to trust for an https URL)
+
+MEMGRES_QDRANT_CA is only needed when Qdrant serves TLS with a certificate the
+system trust store doesn't already know (a self-signed or private-CA deployment):
+point it at the PEM to verify against. Leave it unset for plain http or a
+publicly-trusted cert.
 
 Needs the `[qdrant]` extra (qdrant-client).
 """
@@ -26,14 +32,19 @@ from typing import List, Optional, Sequence, Tuple
 
 class QdrantIndex:
     def __init__(self, dim: int, url: Optional[str] = None,
-                 api_key: Optional[str] = None, collection: Optional[str] = None):
+                 api_key: Optional[str] = None, collection: Optional[str] = None,
+                 ca_cert: Optional[str] = None):
         from qdrant_client import QdrantClient
 
         self.dim = dim
         self.collection = collection or os.environ.get("MEMGRES_QDRANT_COLLECTION", "memgres")
         url = url or os.environ.get("QDRANT_URL", "http://localhost:6333")
         api_key = api_key or os.environ.get("QDRANT_API_KEY") or None
-        self.client = QdrantClient(url=url, api_key=api_key)
+        ca_cert = ca_cert or os.environ.get("MEMGRES_QDRANT_CA") or None
+        # A self-signed / private-CA https endpoint isn't in the system trust store;
+        # `verify=<pem>` makes the underlying httpx client trust exactly that cert.
+        extra = {"verify": ca_cert} if ca_cert else {}
+        self.client = QdrantClient(url=url, api_key=api_key, **extra)
         self._ensure()
 
     def _ensure(self) -> None:
