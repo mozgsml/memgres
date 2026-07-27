@@ -44,6 +44,7 @@ class QdrantIndex:
                 self.collection,
                 vectors_config=VectorParams(size=self.dim, distance=Distance.COSINE),
             )
+            self._ensure_namespace_index()
             return
         info = self.client.get_collection(self.collection)
         size = info.config.params.vectors.size
@@ -53,6 +54,22 @@ class QdrantIndex:
                 f"Qdrant collection '{self.collection}' has dim {size}, model emits "
                 f"{self.dim} — re-embed into a fresh collection, don't mix models."
             )
+        self._ensure_namespace_index()
+
+    def _ensure_namespace_index(self) -> None:
+        """Keyword payload index on `namespace` so tenant-filtered ANN search
+        stays fast as the collection grows (isolation is enforced by the query
+        filter regardless; this is purely the speed of that filter). Idempotent:
+        check the existing payload schema rather than catch a re-create error."""
+        from qdrant_client.models import PayloadSchemaType
+
+        info = self.client.get_collection(self.collection)
+        if "namespace" in (info.payload_schema or {}):
+            return
+        self.client.create_payload_index(
+            self.collection, field_name="namespace",
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
 
     def upsert(self, id: str, vector: Sequence[float], namespace: str) -> None:
         from qdrant_client.models import PointStruct

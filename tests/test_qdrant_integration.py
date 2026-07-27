@@ -96,6 +96,16 @@ def test_no_pgvector_column_when_qdrant(store):
     assert "embedding" not in cols
 
 
+def test_namespace_payload_index_created(store):
+    # tenant-scoped ANN search filters on `namespace`; a keyword payload index
+    # keeps that filter fast as the collection grows (isolation holds either way)
+    from qdrant_client import QdrantClient
+    qc = QdrantClient(url=QURL)
+    schema = qc.get_collection(COLL).payload_schema or {}
+    assert "namespace" in schema
+    assert str(schema["namespace"].data_type).lower().endswith("keyword")
+
+
 def test_semantic_recall_via_qdrant(store):
     store.write(body="I love apple pie\n", path="food.apple", tags=["fruit"])
     store.write(body="banana bread recipe\n", path="food.banana", tags=["fruit"])
