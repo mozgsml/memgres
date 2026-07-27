@@ -11,6 +11,10 @@ mismatch hard-fails instead of silently returning garbage).
 
 ## 1. Embedding providers (`MEMGRES_EMBED_PROVIDER`)
 
+> Choosing between a local and a cloud model, and the operational gotchas
+> (dimension drift, context-window truncation, offline caches)? See the dedicated
+> guide: [EMBEDDINGS.md](EMBEDDINGS.md). The table below is the quick reference.
+
 | Provider | Vectors from | Needs | Notes |
 |---|---|---|---|
 | `none` (default) | — | nothing | Lexical FTS only; no model, API, or GPU. |

@@ -153,7 +153,7 @@ docker pull ghcr.io/mozgsml/memgres:latest
 2. **Your own Postgres** — install the `[server]` extra (above), point `MEMGRES_DATABASE_URL` at it, run `memgres-server` (migrates on startup).
 3. **Embedded library** — install the core package, use `Store` directly, no HTTP at all.
 
-Semantic recall is optional: the default `MEMGRES_EMBED_PROVIDER=none` gives you lexical FTS with zero models. Turn on `local` (sentence-transformers), a cloud API (`openai`/`jina`), or any OpenAI-compatible server (LM Studio, Ollama, …) when you want meaning-based search — see [docs/BACKENDS.md](docs/BACKENDS.md) for copy-paste setups. The model id + dimension get stamped into the schema and a later mismatch hard-fails instead of silently returning garbage.
+Semantic recall is optional: the default `MEMGRES_EMBED_PROVIDER=none` gives you lexical FTS with zero models. Turn on `local` (sentence-transformers), a cloud API (`openai`/`jina`), or any OpenAI-compatible server (LM Studio, Ollama, …) when you want meaning-based search — see [docs/EMBEDDINGS.md](docs/EMBEDDINGS.md) for choosing local vs cloud and [docs/BACKENDS.md](docs/BACKENDS.md) for copy-paste setups. The model id + dimension get stamped into the schema and a later mismatch hard-fails instead of silently returning garbage.
 
 ## Configuration
 
