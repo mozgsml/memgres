@@ -247,8 +247,10 @@ Either way the model gets tools `memory_write`, `memory_recall`, `memory_get`,
 X"* / *"what do you know about Y?"* and it calls them. (For semantic recall add the
 embedding env vars — see [docs/BACKENDS.md](docs/BACKENDS.md).)
 
-**Isolation — pin the identity in the client config; the agent never handles the
-token** (so the model spends nothing echoing a secret and can't switch user):
+### Isolation — pin the identity in the client config
+
+The agent **never handles the token** (so the model spends nothing echoing a
+secret and can't switch user):
 
 - **stdio**: set `MEMGRES_KEY_MODE=open` + `MEMGRES_TOKEN=<mgk_…>` in the client's
   `env` block (above).
@@ -270,7 +272,7 @@ argument for the model to supply — force it either way with
 library after the model produces text (see the examples above). Use this when you
 control the agent loop and decide when to write/recall.
 
-## Tokens & auth
+## Multi-tenant, tokens & isolation
 
 There is **no token for single-user / local use** — leave everything default
 (`MEMGRES_KEY_MODE=single`) and it just works. Two token concepts exist, unrelated:
