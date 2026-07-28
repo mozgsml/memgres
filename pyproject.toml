@@ -18,6 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "psycopg[binary]>=3.1",
+    "pysbd>=0.3",   # sentence segmentation for semantic snippets (pure-Python, ~69 KB, no deps)
 ]
 
 [project.urls]

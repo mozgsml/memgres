@@ -450,6 +450,9 @@ class Store:
         if deleted and self._vectors is not None:
             # drop the out-of-band vector too (no-op for the in-row pgvector backend)
             self._vectors.delete_doc(self._conn, id, ns)
+            # and the durable segment cache (pgvector: FK-cascaded already; qdrant:
+            # a sibling collection, so this is the actual cleanup there)
+            self._vectors.delete_segments(self._conn, id)
         return deleted
 
     def purge_expired(self) -> int:

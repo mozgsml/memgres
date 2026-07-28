@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .config import Config
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are
 # shipped inside the package (see pyproject) and this still resolves.
@@ -87,6 +87,27 @@ def _apply_vector(cur, cfg: Config) -> None:
     cur.execute(
         "CREATE INDEX IF NOT EXISTS memory_embedding_hnsw ON memory "
         "USING hnsw (embedding vector_cosine_ops)"
+    )
+    # Per-memory segment vectors: a durable cache the (future) snippet flow fills
+    # lazily, keyed by the memory's content_hash (`src_hash`) so a body edit — a
+    # new hash — invalidates the cache and `forget` cascades them away. Offsets,
+    # not text: the snippet is sliced from the live body. A memory has few
+    # segments, ranked by a plain scan, so no HNSW here.
+    cur.execute(
+        f"""CREATE TABLE IF NOT EXISTS memory_segment (
+                memory_id uuid NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+                seq       int  NOT NULL,
+                seg_start int  NOT NULL,
+                seg_end   int  NOT NULL,
+                embedding vector({cfg.embed_dim}) NOT NULL,
+                src_hash  text NOT NULL,
+                namespace text NOT NULL,
+                PRIMARY KEY (memory_id, seq)
+            )"""
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS memory_segment_mid "
+        "ON memory_segment (memory_id)"
     )
 
 

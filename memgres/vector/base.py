@@ -13,7 +13,7 @@ so the shared helpers (``Hit``, ``build_filters``, ``_vec_literal``) live here.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Protocol, Sequence
+from typing import List, Optional, Protocol, Sequence, Tuple
 
 
 @dataclass
@@ -48,6 +48,26 @@ class VectorBackend(Protocol):
     def delete_doc(self, conn, id: str, ns: str) -> None: ...
     def search(self, conn, cfg, query_vec: Sequence[float], k: int, ns: str,
                tags: Optional[Sequence[str]], path_prefix: Optional[str]) -> List[Hit]: ...
+
+    # ─── segment vectors (durable per-memory cache for semantic snippets) ─────
+    def upsert_segments(self, conn, memory_id: str, ns: str, src_hash: str,
+                        segments: Sequence[Tuple[int, int, int, Sequence[float]]]
+                        ) -> None:
+        """Replace all cached segments for ``memory_id``. ``segments`` is a list
+        of ``(seq, seg_start, seg_end, vector)``, all stamped with ``src_hash``
+        (the memory's content_hash) + ``ns``."""
+        ...
+
+    def get_segments(self, conn, memory_id: str, src_hash: str
+                     ) -> Optional[List[Tuple[int, int, List[float]]]]:
+        """Fresh cached segments as ``(seq, seg_start, seg_end, vector)`` sorted
+        by seq, or ``None`` when absent OR stale (stored src_hash != requested),
+        signalling the caller to recompute."""
+        ...
+
+    def delete_segments(self, conn, memory_id: str) -> None:
+        """Drop every cached segment for ``memory_id``."""
+        ...
 
 
 def make_backend(cfg, embedder):

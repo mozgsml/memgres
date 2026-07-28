@@ -22,7 +22,8 @@ class _FakeCollectionInfo:
         class _C:
             params = _P()
         self.config = _C()
-        self.payload_schema = {"namespace": object()}  # pretend the index exists
+        # pretend both the doc + segment payload indexes already exist
+        self.payload_schema = {"namespace": object(), "memory_id": object()}
 
 
 class _FakeClient:
@@ -36,6 +37,12 @@ class _FakeClient:
 
     def get_collection(self, _c):
         return _FakeCollectionInfo(dim=8)
+
+    def create_collection(self, *a, **k):  # segment collection (not reached: exists)
+        pass
+
+    def create_payload_index(self, *a, **k):  # index already present in the fake
+        pass
 
 
 @pytest.fixture

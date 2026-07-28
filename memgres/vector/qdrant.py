@@ -27,6 +27,7 @@ Needs the `[qdrant]` extra (qdrant-client).
 from __future__ import annotations
 
 import os
+import uuid
 from typing import List, Optional, Sequence, Tuple
 
 from .base import Hit, build_filters
@@ -40,6 +41,9 @@ class QdrantBackend:
 
         self.dim = dim
         self.collection = collection or os.environ.get("MEMGRES_QDRANT_COLLECTION", "memgres")
+        # Segment vectors live in a sibling collection so doc-level ANN and the
+        # per-memory segment scan never share a point space.
+        self.seg_collection = f"{self.collection}_segments"
         url = url or os.environ.get("QDRANT_URL", "http://localhost:6333")
         api_key = api_key or os.environ.get("QDRANT_API_KEY") or None
         ca_cert = ca_cert or os.environ.get("MEMGRES_QDRANT_CA") or None
@@ -58,6 +62,7 @@ class QdrantBackend:
                 vectors_config=VectorParams(size=self.dim, distance=Distance.COSINE),
             )
             self._ensure_namespace_index()
+            self._ensure_segments()
             return
         info = self.client.get_collection(self.collection)
         size = info.config.params.vectors.size
@@ -68,6 +73,25 @@ class QdrantBackend:
                 f"{self.dim} — re-embed into a fresh collection, don't mix models."
             )
         self._ensure_namespace_index()
+        self._ensure_segments()
+
+    def _ensure_segments(self) -> None:
+        """The segment collection alongside the main one (same dim, cosine), with
+        a keyword payload index on `memory_id` so per-memory scans stay fast."""
+        from qdrant_client.models import (Distance, PayloadSchemaType,
+                                          VectorParams)
+
+        if not self.client.collection_exists(self.seg_collection):
+            self.client.create_collection(
+                self.seg_collection,
+                vectors_config=VectorParams(size=self.dim, distance=Distance.COSINE),
+            )
+        info = self.client.get_collection(self.seg_collection)
+        if "memory_id" not in (info.payload_schema or {}):
+            self.client.create_payload_index(
+                self.seg_collection, field_name="memory_id",
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
 
     def _ensure_namespace_index(self) -> None:
         """Keyword payload index on `namespace` so tenant-filtered ANN search
@@ -137,3 +161,58 @@ class QdrantBackend:
                     for r in cur.fetchall()]
         hits.sort(key=lambda h: h.score, reverse=True)   # Qdrant order, minus PG-filtered
         return hits[:k]
+
+    # ─── segment vectors (sibling collection, out-of-band) ────────────────────
+    @staticmethod
+    def _seg_point_id(memory_id: str, seq: int) -> str:
+        """Deterministic, collision-free point id per (memory_id, seq). Qdrant
+        needs uuid or int ids; a uuid5 of the pair is both."""
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{memory_id}:{seq}"))
+
+    def _seg_filter(self, memory_id: str):
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+        return Filter(must=[FieldCondition(key="memory_id",
+                                           match=MatchValue(value=memory_id))])
+
+    def upsert_segments(self, conn, memory_id: str, ns: str, src_hash: str,
+                        segments: Sequence[Tuple[int, int, int, Sequence[float]]]
+                        ) -> None:
+        from qdrant_client.models import FilterSelector, PointStruct
+
+        # Replace-all: drop this memory's existing segment points, then insert.
+        self.client.delete(self.seg_collection,
+                           points_selector=FilterSelector(filter=self._seg_filter(memory_id)))
+        points = [
+            PointStruct(
+                id=self._seg_point_id(memory_id, seq),
+                vector=list(vec),
+                payload={"memory_id": memory_id, "seq": seq, "seg_start": s,
+                         "seg_end": e, "namespace": ns, "src_hash": src_hash},
+            )
+            for (seq, s, e, vec) in segments
+        ]
+        if points:
+            self.client.upsert(self.seg_collection, points=points)
+
+    def get_segments(self, conn, memory_id: str, src_hash: str
+                     ) -> Optional[List[Tuple[int, int, int, List[float]]]]:
+        points, _ = self.client.scroll(
+            self.seg_collection, scroll_filter=self._seg_filter(memory_id),
+            limit=10_000, with_payload=True, with_vectors=True,
+        )
+        if not points:
+            return None
+        rows = []
+        for p in points:
+            pl = p.payload or {}
+            if pl.get("src_hash") != src_hash:
+                return None  # stale cache → caller recomputes the whole set
+            rows.append((int(pl["seq"]), int(pl["seg_start"]), int(pl["seg_end"]),
+                         [float(x) for x in p.vector]))
+        rows.sort(key=lambda r: r[0])
+        return rows
+
+    def delete_segments(self, conn, memory_id: str) -> None:
+        from qdrant_client.models import FilterSelector
+        self.client.delete(self.seg_collection,
+                           points_selector=FilterSelector(filter=self._seg_filter(memory_id)))
