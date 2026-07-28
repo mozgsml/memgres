@@ -45,6 +45,8 @@ class Config:
     # storage limits (bytes)
     max_body_bytes: int          # whole-record ceiling; grows to this via diffs
     max_write_bytes: int         # one write/diff payload ceiling (<= max_body)
+    max_source_bytes: int        # provenance `source` field ceiling (per write)
+    max_reason_bytes: int        # provenance `reason` field ceiling (per write)
     # retention
     retention_days: int          # 0 = forever; >0 = expire N days after last touch
     renew_on_read: bool          # a read pushes the expiry clock forward
@@ -69,6 +71,8 @@ class Config:
     embed_dim: int               # 0 = infer from provider
     embed_api_key: str
     embed_api_base: str
+    embed_max_seq: int           # 0 = leave the model's default; >0 overrides
+                                 # the local model's max sequence length (tokens)
     # database
     database_url: str
     pool_size: int               # max pooled connections (HTTP + http-MCP servers)
@@ -76,6 +80,12 @@ class Config:
     def validate(self) -> None:
         if self.pool_size < 1:
             raise ValueError("MEMGRES_POOL_SIZE must be >= 1")
+        if self.max_source_bytes < 1:
+            raise ValueError("MEMGRES_MAX_SOURCE_BYTES must be >= 1")
+        if self.max_reason_bytes < 1:
+            raise ValueError("MEMGRES_MAX_REASON_BYTES must be >= 1")
+        if self.embed_max_seq < 0:
+            raise ValueError("MEMGRES_EMBED_MAX_SEQ must be >= 0")
         if self.max_write_bytes > self.max_body_bytes:
             raise ValueError(
                 "MEMGRES_MAX_WRITE_BYTES must be <= MEMGRES_MAX_BODY_BYTES"
@@ -101,6 +111,8 @@ def load() -> Config:
     cfg = Config(
         max_body_bytes=_int("MEMGRES_MAX_BODY_BYTES", 262_144),      # 256 KB
         max_write_bytes=_int("MEMGRES_MAX_WRITE_BYTES", 16_384),      # 16 KB
+        max_source_bytes=_int("MEMGRES_MAX_SOURCE_BYTES", 2_048),     # 2 KB
+        max_reason_bytes=_int("MEMGRES_MAX_REASON_BYTES", 1_024),     # 1 KB
         retention_days=_int("MEMGRES_RETENTION_DAYS", 0),
         renew_on_read=_bool("MEMGRES_RENEW_ON_READ", True),
         token=_str("MEMGRES_TOKEN", ""),
@@ -116,6 +128,7 @@ def load() -> Config:
         embed_dim=_int("MEMGRES_EMBED_DIM", 0),
         embed_api_key=_str("MEMGRES_EMBED_API_KEY", ""),
         embed_api_base=_str("MEMGRES_EMBED_API_BASE", ""),
+        embed_max_seq=_int("MEMGRES_EMBED_MAX_SEQ", 0),
         database_url=_str("MEMGRES_DATABASE_URL", ""),
         pool_size=_int("MEMGRES_POOL_SIZE", 4),
     )

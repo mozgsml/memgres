@@ -42,12 +42,14 @@ class Embedder:
 
 # ─── local: sentence-transformers ────────────────────────────────────────────
 class _LocalEmbedder(Embedder):
-    def __init__(self, model_name: str, want_dim: int):
+    def __init__(self, model_name: str, want_dim: int, max_seq: int = 0):
         from sentence_transformers import SentenceTransformer  # lazy: heavy import
 
         if not model_name:
             raise ValueError("MEMGRES_EMBED_MODEL is required for the local provider")
         self._model = SentenceTransformer(model_name, device="cpu")
+        if max_seq > 0:  # override the model's context window (tokens)
+            self._model.max_seq_length = max_seq
         self.dim = self._model.get_sentence_embedding_dimension()
         if want_dim and want_dim != self.dim:
             raise ValueError(
@@ -122,7 +124,7 @@ def get_embedder(cfg: Config) -> Optional[Embedder]:
     if p == "none":
         return None
     if p == "local":
-        return _LocalEmbedder(cfg.embed_model, cfg.embed_dim)
+        return _LocalEmbedder(cfg.embed_model, cfg.embed_dim, cfg.embed_max_seq)
     if p == "jina":
         return _HttpEmbedder(
             cfg.embed_model, cfg.embed_dim, cfg.embed_api_key,

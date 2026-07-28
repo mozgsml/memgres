@@ -156,6 +156,7 @@ class Store:
             # atomically with the write (or rolls back together on failure).
             ns = self._authorize(token, space=space, space_id=space_id,
                                  need="write", for_write=True)
+            self._check_provenance_size(source, reason)
             if id is None:
                 return self._create(ns, body, path, tags, source, reason, ttl_days)
             return self._update(ns, id, body, diff, base_hash, path, tags,
@@ -172,6 +173,16 @@ class Store:
             raise TooLarge(
                 f"body would be {byte_len(body)}B > MEMGRES_MAX_BODY_BYTES "
                 f"{self.cfg.max_body_bytes}")
+
+    def _check_provenance_size(self, source: Optional[str], reason: Optional[str]):
+        if source is not None and byte_len(source) > self.cfg.max_source_bytes:
+            raise TooLarge(
+                f"source is {byte_len(source)}B > MEMGRES_MAX_SOURCE_BYTES "
+                f"{self.cfg.max_source_bytes}")
+        if reason is not None and byte_len(reason) > self.cfg.max_reason_bytes:
+            raise TooLarge(
+                f"reason is {byte_len(reason)}B > MEMGRES_MAX_REASON_BYTES "
+                f"{self.cfg.max_reason_bytes}")
 
     def _create(self, ns, body, path, tags, source, reason, ttl_days) -> Memory:
         if body is None:
