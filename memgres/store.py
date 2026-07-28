@@ -318,6 +318,36 @@ class Store:
                        query, k=k, tags=tags, path_prefix=path_prefix, mode=mode,
                        backend=self._vectors)
 
+    # ─── list: enumerate a subtree (no query, no ranking) ───────────────────
+    def list(self, token: Optional[str], *, path_prefix: Optional[str] = None,
+             tags: Optional[Sequence[str]] = None, limit: int = 50,
+             offset: int = 0, space: Optional[str] = None,
+             space_id: Optional[str] = None) -> List[dict]:
+        """Browse (enumerate) memories under a subtree — NOT a search: no FTS, no
+        vectors, no scoring. Rows are ordered by path so a subtree reads in tree
+        order. ``build_filters`` scopes by namespace + not-expired + tags +
+        subtree, so this is multi-tenant safe by construction."""
+        from .vector.base import build_filters
+        ns = self._authorize(token, space=space, space_id=space_id, need="read")
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        where, params = build_filters(ns, tags, path_prefix)
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT id, path::text, tags, "
+            "left(split_part(body, E'\\n', 1), %s) AS preview, "
+            "created_at, updated_at "
+            f"FROM memory WHERE {where} ORDER BY path, id LIMIT %s OFFSET %s",
+            [self.cfg.list_preview_chars] + params + [limit, offset])
+        cols = ["id", "path", "tags", "preview", "created_at", "updated_at"]
+        rows = []
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            d["id"] = str(d["id"])
+            d["tags"] = list(d["tags"]) if d["tags"] is not None else []
+            rows.append(d)
+        return rows
+
     # ─── convenience: move ──────────────────────────────────────────────────
     def move(self, token: Optional[str], id: str, new_path: str,
              *, source: Optional[str] = None, reason: Optional[str] = None,

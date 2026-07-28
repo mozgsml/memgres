@@ -101,6 +101,34 @@ def test_recall_tag_and_subtree_filters(client):
     assert len(hits) == 1 and "recipe" in hits[0]["body"]
 
 
+def test_list_memories_route(client):
+    client.post("/memories", json={"body": "gamma line\n", "path": "decisions.c"})
+    client.post("/memories", json={"body": "alpha line\nmore\n", "path": "decisions.a",
+                                    "tags": ["keep"]})
+    client.post("/memories", json={"body": "beta line\n", "path": "decisions.b"})
+    client.post("/memories", json={"body": "other\n", "path": "ops.x"})
+
+    rows = client.get("/memories", params={"path": "decisions"}).json()
+    assert [r["path"] for r in rows] == ["decisions.a", "decisions.b", "decisions.c"]
+    assert rows[0]["preview"] == "alpha line"      # first line only
+    # tag filter narrows
+    only = client.get("/memories", params={"path": "decisions", "tags": "keep"}).json()
+    assert [r["path"] for r in only] == ["decisions.a"]
+    # pagination
+    page = client.get("/memories", params={"path": "decisions", "limit": 1,
+                                           "offset": 1}).json()
+    assert [r["path"] for r in page] == ["decisions.b"]
+
+
+def test_info_route(client):
+    info = client.get("/info").json()
+    assert set(info) == {"limits", "embed", "recall_modes", "vector_backend",
+                         "key_mode", "fts_language"}
+    assert info["recall_modes"] == ["lexical"]     # embed provider none in fixture
+    assert info["key_mode"] == "single"
+    assert "database_url" not in info and "token" not in info
+
+
 def test_blame_lines_query(client):
     r = client.post("/memories", json={"body": "a\nb\nc\nd\ne\n", "source": "x"})
     mid = r.json()["id"]

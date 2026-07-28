@@ -182,6 +182,33 @@ def build_server(cfg: Optional[Config] = None):
                         space=space, space_id=space_id)]
 
     @mcp.tool()
+    def memory_list(path_prefix: Optional[str] = None,
+                    tags: Optional[List[str]] = None, limit: int = 50,
+                    offset: int = 0, space: Optional[str] = None,
+                    space_id: Optional[str] = None,
+                    token: Optional[str] = None, ctx: Context = None) -> List[dict]:
+        """BROWSE (enumerate) a subtree — NOT a search. Lists memories under
+        `path_prefix` (e.g. survey all of 'decisions.*') ordered by path, with a
+        short first-line `preview` of each. No query, no ranking; use
+        `memory_recall` when you want relevance search. Optionally narrow by
+        `tags`; `limit`/`offset` paginate. `space`/`space_id` pick the namespace
+        (default: yours)."""
+        with pool.connection() as conn:
+            return _store(conn).list(
+                _token(ctx, token), path_prefix=path_prefix, tags=tags,
+                limit=limit, offset=offset, space=space, space_id=space_id)
+
+    @mcp.tool()
+    def memory_server_info(ctx: Context = None) -> dict:
+        """The server's effective limits and capabilities (write ceilings, embed
+        provider/model/dim, available recall modes, vector backend, key mode, FTS
+        language). Non-sensitive config only — no secrets. Read it once so you
+        aren't guessing the limits."""
+        from .info import server_info
+        dim = embedder.dim if embedder is not None else None
+        return server_info(cfg, embed_dim=dim)
+
+    @mcp.tool()
     def memory_blame(id: str, grouped: bool = True,
                      space: Optional[str] = None, space_id: Optional[str] = None,
                      token: Optional[str] = None, ctx: Context = None) -> List[dict]:

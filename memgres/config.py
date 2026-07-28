@@ -65,6 +65,8 @@ class Config:
     # search
     fts_language: str            # Postgres FTS dict: simple | english | russian | …
     vector_backend: str          # pgvector (default) | qdrant
+    # listing / browse
+    list_preview_chars: int      # first-line preview length for memory_list (0 = none)
     # embeddings
     embed_provider: str          # none | local | jina | openai | openai-compatible
     embed_model: str
@@ -86,6 +88,8 @@ class Config:
             raise ValueError("MEMGRES_MAX_REASON_BYTES must be >= 1")
         if self.embed_max_seq < 0:
             raise ValueError("MEMGRES_EMBED_MAX_SEQ must be >= 0")
+        if self.list_preview_chars < 0:
+            raise ValueError("MEMGRES_LIST_PREVIEW_CHARS must be >= 0")
         if self.max_write_bytes > self.max_body_bytes:
             raise ValueError(
                 "MEMGRES_MAX_WRITE_BYTES must be <= MEMGRES_MAX_BODY_BYTES"
@@ -123,6 +127,7 @@ def load() -> Config:
         history_enabled=_bool("MEMGRES_HISTORY", True),
         fts_language=_str("MEMGRES_FTS_LANGUAGE", "simple"),
         vector_backend=_str("MEMGRES_VECTOR_BACKEND", "pgvector"),
+        list_preview_chars=_int("MEMGRES_LIST_PREVIEW_CHARS", 120),
         embed_provider=_str("MEMGRES_EMBED_PROVIDER", "none"),
         embed_model=_str("MEMGRES_EMBED_MODEL", ""),
         embed_dim=_int("MEMGRES_EMBED_DIM", 0),

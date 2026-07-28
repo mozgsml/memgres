@@ -225,6 +225,27 @@ def create_app(cfg: Optional[Config] = None):
                 tok, mid, seq, space=space, space_id=space_id))
             return {"seq": seq, "body": body}
 
+    @app.get("/memories")
+    def list_memories(path: Optional[str] = None,
+                      tags: Optional[str] = Query(None, description="comma-separated"),
+                      limit: int = 50, offset: int = 0,
+                      space: Optional[str] = None, space_id: Optional[str] = None,
+                      tok: Optional[str] = Depends(token)):
+        """Browse (enumerate) a subtree — not a search. Lists memories under
+        `path` ordered by path, each with a short first-line `preview`."""
+        taglist = [t for t in (tags.split(",") if tags else []) if t]
+        with pool.connection() as conn:
+            return _guard(lambda: _store(conn).list(
+                tok, path_prefix=path, tags=taglist or None, limit=limit,
+                offset=offset, space=space, space_id=space_id))
+
+    @app.get("/info")
+    def info():
+        """Effective server limits + capabilities (non-sensitive config only)."""
+        from .info import server_info
+        dim = embedder.dim if embedder is not None else None
+        return server_info(cfg, embed_dim=dim)
+
     @app.get("/recall")
     def recall(q: str, k: int = 10, mode: str = "auto",
                tags: Optional[str] = Query(None, description="comma-separated"),
