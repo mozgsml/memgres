@@ -64,6 +64,7 @@ class Config:
     history_enabled: bool        # keep hash-chained diff history (deleted with record)
     # search
     fts_language: str            # Postgres FTS dict: simple | english | russian | …
+    lexical_match: str           # any (OR-any words, default) | all (AND-all words)
     vector_backend: str          # pgvector (default) | qdrant
     # listing / browse
     list_preview_chars: int      # first-line preview length for memory_list (0 = none)
@@ -98,6 +99,8 @@ class Config:
                 "none", "local", "jina", "openai",
                 "openai-compatible", "compatible", "custom"):
             raise ValueError(f"unknown MEMGRES_EMBED_PROVIDER: {self.embed_provider}")
+        if self.lexical_match not in ("any", "all"):
+            raise ValueError(f"unknown MEMGRES_LEXICAL_MATCH: {self.lexical_match}")
         if self.vector_backend not in ("pgvector", "qdrant"):
             raise ValueError(f"unknown MEMGRES_VECTOR_BACKEND: {self.vector_backend}")
         if self.key_mode not in ("single", "open", "managed"):
@@ -126,6 +129,7 @@ def load() -> Config:
         require_parent=_bool("MEMGRES_REQUIRE_PARENT", False),
         history_enabled=_bool("MEMGRES_HISTORY", True),
         fts_language=_str("MEMGRES_FTS_LANGUAGE", "simple"),
+        lexical_match=_str("MEMGRES_LEXICAL_MATCH", "any"),
         vector_backend=_str("MEMGRES_VECTOR_BACKEND", "pgvector"),
         list_preview_chars=_int("MEMGRES_LIST_PREVIEW_CHARS", 120),
         embed_provider=_str("MEMGRES_EMBED_PROVIDER", "none"),

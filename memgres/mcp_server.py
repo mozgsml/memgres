@@ -25,7 +25,7 @@ either. (``single`` mode needs no token at all.)
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from mcp.server.fastmcp import Context
 
@@ -165,20 +165,25 @@ def build_server(cfg: Optional[Config] = None):
                                          space=space, space_id=space_id))
 
     @mcp.tool()
-    def memory_recall(query: str, k: int = 10, mode: str = "auto",
+    def memory_recall(query: str, k: int = 10,
+                      mode: Literal["lexical", "semantic", "hybrid", "auto"] = "auto",
+                      match: Optional[Literal["any", "all"]] = None,
                       tags: Optional[List[str]] = None,
                       path_prefix: Optional[str] = None,
                       space: Optional[str] = None, space_id: Optional[str] = None,
                       token: Optional[str] = None, ctx: Context = None) -> List[dict]:
-        """Search memories. `mode`: lexical | semantic | hybrid | auto. Optionally
-        scope to a tag set (`tags`) or a subtree (`path_prefix`, e.g. 'ops.postgres').
-        `space`/`space_id` pick which namespace to search (default: yours)."""
+        """Search memories. `mode`: lexical | semantic | hybrid | auto. `match`
+        governs lexical word combination — defaults to OR-any (any query word
+        matches, forgiving recall); set 'all' to require every word (narrow).
+        Optionally scope to a tag set (`tags`) or a subtree (`path_prefix`, e.g.
+        'ops.postgres'). `space`/`space_id` pick which namespace to search
+        (default: yours)."""
         with pool.connection() as conn:
             return [{"id": h.id, "body": h.body, "tags": h.tags, "path": h.path,
                      "score": h.score}
                     for h in _store(conn).recall(
                         _token(ctx, token), query, k=k, tags=tags,
-                        path_prefix=path_prefix, mode=mode,
+                        path_prefix=path_prefix, mode=mode, match=match,
                         space=space, space_id=space_id)]
 
     @mcp.tool()
@@ -325,6 +330,26 @@ def build_server(cfg: Optional[Config] = None):
             _req = _params.get("required")
             if isinstance(_req, list) and "token" in _req:
                 _req.remove("token")
+
+    # Best-effort: with no embedder configured there is no vector backend, so
+    # semantic/hybrid recall can't run — drop them from memory_recall's `mode`
+    # enum so the model isn't offered modes that will only ever error. Purely
+    # cosmetic (same defensive style as the token pruning above): recall()'s
+    # backstop still raises on semantic-without-backend, and `lexical`/`auto`
+    # (auto resolves to lexical here) stay. Missing keys simply no-op.
+    if cfg.embed_provider == "none":
+        for _t in getattr(getattr(mcp, "_tool_manager", None), "_tools", {}).values():
+            if getattr(_t, "name", None) != "memory_recall":
+                continue
+            _params = getattr(_t, "parameters", None)
+            if not isinstance(_params, dict):
+                continue
+            _mode = _params.get("properties", {}).get("mode")
+            if not isinstance(_mode, dict):
+                continue
+            _enum = _mode.get("enum")
+            if isinstance(_enum, list):
+                _mode["enum"] = [m for m in _enum if m not in ("semantic", "hybrid")]
 
     return mcp
 

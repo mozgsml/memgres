@@ -57,5 +57,21 @@ def test_tree_default_on(monkeypatch):
     assert load().tree_enabled is True
 
 
+def test_lexical_match_defaults_to_any(monkeypatch):
+    monkeypatch.delenv("MEMGRES_LEXICAL_MATCH", raising=False)
+    assert load().lexical_match == "any"
+
+
+def test_lexical_match_all(monkeypatch):
+    monkeypatch.setenv("MEMGRES_LEXICAL_MATCH", "all")
+    assert load().lexical_match == "all"
+
+
+def test_unknown_lexical_match_rejected(monkeypatch):
+    monkeypatch.setenv("MEMGRES_LEXICAL_MATCH", "some")
+    with pytest.raises(ValueError, match="LEXICAL_MATCH"):
+        load()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

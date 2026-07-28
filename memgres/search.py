@@ -21,16 +21,29 @@ from .vector.base import Hit, build_filters
 RRF_K = 60  # standard RRF damping constant
 
 
-def _lexical(conn, cfg, ns, query, k, tags, path_prefix) -> List[Hit]:
+def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
+             match: Optional[str] = None) -> List[Hit]:
+    match = match or cfg.lexical_match
+    # One tsquery expression, reused in both the ts_rank score and the @@ filter.
+    #   all -> plainto_tsquery: every word ANDed (narrow; current behavior).
+    #   any -> websearch_to_tsquery over the words joined by " or ": OR-any
+    #          (forgiving). websearch_to_tsquery is injection-safe and reads
+    #          bare `or` as the OR operator, so user text can't inject syntax.
+    if match == "all":
+        tsq = "plainto_tsquery(%s::regconfig, %s)"
+        qtext = query
+    else:
+        tsq = "websearch_to_tsquery(%s::regconfig, %s)"
+        qtext = " or ".join(query.split())  # empty query -> "" -> no matches
     where, params = build_filters(ns, tags, path_prefix)
     sql = (
         "SELECT id, body, tags, path::text, "
-        "ts_rank(fts, plainto_tsquery(%s::regconfig, %s)) AS score "
+        f"ts_rank(fts, {tsq}) AS score "
         f"FROM memory WHERE {where} "
-        "AND fts @@ plainto_tsquery(%s::regconfig, %s) "
+        f"AND fts @@ {tsq} "
         "ORDER BY score DESC LIMIT %s"
     )
-    args = [cfg.fts_language, query] + params + [cfg.fts_language, query, k]
+    args = [cfg.fts_language, qtext] + params + [cfg.fts_language, qtext, k]
     with conn.cursor() as cur:
         cur.execute(sql, args)
         return [Hit(str(r[0]), r[1], list(r[2]), r[3], float(r[4]))
@@ -52,11 +65,12 @@ def _rrf(lists: Sequence[List[Hit]], k: int) -> List[Hit]:
 
 def recall(conn, cfg, embedder, ns: str, query: str, *, k: int = 10,
            tags: Optional[Sequence[str]] = None, path_prefix: Optional[str] = None,
-           mode: str = "auto", backend=None) -> List[Hit]:
+           mode: str = "auto", match: Optional[str] = None,
+           backend=None) -> List[Hit]:
     if mode == "auto":
         mode = "semantic" if backend else "lexical"
     if mode == "lexical":
-        return _lexical(conn, cfg, ns, query, k, tags, path_prefix)
+        return _lexical(conn, cfg, ns, query, k, tags, path_prefix, match)
     if mode == "semantic":
         if backend is None:
             raise RuntimeError(
@@ -67,7 +81,7 @@ def recall(conn, cfg, embedder, ns: str, query: str, *, k: int = 10,
         if backend is None:
             raise RuntimeError(
                 "semantic recall needs an embedder (MEMGRES_EMBED_PROVIDER)")
-        lex = _lexical(conn, cfg, ns, query, k, tags, path_prefix)
+        lex = _lexical(conn, cfg, ns, query, k, tags, path_prefix, match)
         sem = backend.search(conn, cfg, embedder.embed_query(query), k, ns,
                              tags, path_prefix)
         return _rrf([sem, lex], k)
