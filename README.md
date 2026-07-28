@@ -35,11 +35,12 @@ Reach for memgres when you want **auditable, authored, versioned text memory**.
 | **Hash-chained, GDPR-deletable history** | Tamper-evident provenance you can *still* erase: `forget()` hard-deletes the row, its vectors, and crypto-shreds the chain — no ["ghost vectors" left reconstructible in the index](https://arxiv.org/pdf/2606.18497). |
 | **Lexical works with zero embeddings** | Deploy with no model, no API, no GPU — Postgres full-text search out of the box. Turn on semantic recall only when you want it. |
 | **Lexical *and* semantic (hybrid)** | Exact identifiers/codes go to lexical (where [dense retrieval alone stumbles](https://tianpan.co/blog/2026-04-12-hybrid-search-production-bm25-dense-embeddings)); meaning-based queries go to vectors; hybrid fuses both with RRF. |
+| **Snippets, not walls of text** | Recall returns the most relevant slice of each hit plus its line number — semantic hits pick their best segment (embedded once, then cached), lexical uses `ts_headline`. Pass `full_body=false` for just the snippet. |
 | **Embedding-model safety by construction** | The model id + dimension are stamped into the schema; a mismatch **hard-fails** instead of silently returning garbage. |
-| **TTL renewed on read** | Active memory persists because it's used; abandoned memory expires itself. Storage self-cleans instead of growing forever. |
+| **Optional TTL, renewed on read** | Off by default — memory is kept forever. Turn on a retention window and active memory persists because it's used, while abandoned memory expires itself: storage self-cleans instead of growing. |
 | **Optional multi-tenant identity** | Users, namespaces and rotatable scoped tokens when you need isolation; nothing to configure for single-user. |
 | **Fast subtree recall via `ltree`** | Memories form a real tree; `path <@ 'a.b'` pulls a whole subtree in one GiST index scan, no recursive walk that degrades with depth. |
-| **Git-blame + version reconstruct** | Every line carries who last changed it (grouped into author-blocks); any past version reconstructs from history — no replaying diffs yourself. |
+| **Git-like blame + version reconstruct** | Every line carries who last changed it (grouped into author-blocks); any past version reconstructs from history — no replaying diffs yourself. |
 | **One Postgres, one backup** | The whole thing is `pg_dump`-able; the vector index rebuilds from the source of truth. No second datastore to run or back up. |
 | **Drop-in module, not a framework** | `pip install`, or `docker compose up`, or point at your own Postgres. No platform to adopt. |
 
@@ -79,7 +80,7 @@ docker compose up
 
 Defaults suit a single-user setup with no auth. To change limits, the embedding provider, tokens, … drop a `.env` beside it — every `MEMGRES_*` is optional (see [Configuration](#configuration) or [.env.example](.env.example)).
 
-**Give it to an LLM / agent — no code (MCP).** Point any URL-capable MCP client (Cursor, Cline, Claude Desktop, …) at the running server; the model gets `memory_write`, `memory_recall`, `memory_get`, `memory_blame`, `memory_history`, `memory_move`, `memory_forget` as tools:
+**Give it to an LLM / agent — no code (MCP).** Point any URL-capable MCP client (Cursor, Cline, Claude Desktop, …) at the running server; the model gets `memory_write`, `memory_recall`, `memory_get`, `memory_list`, `memory_blame`, `memory_history`, `memory_move`, `memory_forget`, `memory_server_info` as tools:
 
 ```json
 {
@@ -165,7 +166,8 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_POOL_SIZE` | `4` | max pooled DB connections (HTTP + http-MCP servers); raise for many concurrent clients, `1` to serialize |
 | `MEMGRES_MAX_BODY_BYTES` | `262144` | ceiling for a whole record body (256 KB) |
 | `MEMGRES_MAX_WRITE_BYTES` | `16384` | ceiling for one write/diff payload (≤ body) |
-| `MEMGRES_RETENTION_DAYS` | `0` | `0` = keep forever; `>0` = expire N days after last touch |
+| `MEMGRES_MAX_SOURCE_BYTES` / `_MAX_REASON_BYTES` | `2048` / `1024` | ceilings for a write's `source` / `reason` provenance |
+| `MEMGRES_RETENTION_DAYS` | `0` | `0` = keep forever (TTL off); `>0` = expire N days after last touch |
 | `MEMGRES_RENEW_ON_READ` | `true` | a read pushes the expiry clock forward |
 | `MEMGRES_KEY_MODE` | `single` | `single` (no auth, one space) · `open` (bring-your-own token, self-registers) · `managed` (admin-provisioned). See [docs/TENANCY.md](docs/TENANCY.md) |
 | `MEMGRES_ADMIN_TOKEN` | — | global admin bearer for provisioning (managed mode) |
@@ -174,9 +176,13 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_REQUIRE_PARENT` | `false` | `true` = a node's parent path must already exist |
 | `MEMGRES_HISTORY` | `true` | keep the hash-chained diff history (deleted with the record) |
 | `MEMGRES_FTS_LANGUAGE` | `simple` | Postgres FTS dictionary (`simple`/`english`/…) |
+| `MEMGRES_LEXICAL_MATCH` | `any` | lexical query words OR-ed (`any`) or AND-ed (`all`); per-call `match` overrides |
+| `MEMGRES_SNIPPET` | `true` | attach a best-match snippet + line to each hit (`MEMGRES_SNIPPET_*` tune size/semantic; `full_body` per call) |
+| `MEMGRES_LIST_PREVIEW_CHARS` | `120` | first-line preview length returned by `memory_list` |
 | `MEMGRES_VECTOR_BACKEND` | `pgvector` | `pgvector` (same DB) or `qdrant` (set `QDRANT_URL`, `QDRANT_API_KEY`, `MEMGRES_QDRANT_COLLECTION`) |
 | `MEMGRES_EMBED_PROVIDER` | `none` | `none` / `local` / `openai` / `jina` / `openai-compatible` (LM Studio, Ollama, vLLM, TEI…) |
 | `MEMGRES_EMBED_MODEL` / `_DIM` / `_API_KEY` / `_API_BASE` | — | model id · dimension (HTTP providers require it, `local` infers) · token · server URL |
+| `MEMGRES_EMBED_MAX_SEQ` | `0` | override the local model's max input length in tokens (`0` = the model's default) |
 
 ## HTTP API
 
@@ -243,9 +249,10 @@ pip install "memgres[mcp]"
 ```
 
 Either way the model gets tools `memory_write`, `memory_recall`, `memory_get`,
-`memory_blame`, `memory_history`, `memory_move`, `memory_forget`. Tell it *"remember
-X"* / *"what do you know about Y?"* and it calls them. (For semantic recall add the
-embedding env vars — see [docs/BACKENDS.md](docs/BACKENDS.md).)
+`memory_list`, `memory_blame`, `memory_history`, `memory_move`, `memory_forget`,
+`memory_server_info`. Tell it *"remember X"* / *"what do you know about Y?"* and it
+calls them. (For semantic recall add the embedding env vars — see
+[docs/BACKENDS.md](docs/BACKENDS.md).)
 
 ### Isolation — pin the identity in the client config
 
