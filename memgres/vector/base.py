@@ -19,10 +19,16 @@ from typing import List, Optional, Protocol, Sequence, Tuple
 @dataclass
 class Hit:
     id: str
-    body: str
+    body: Optional[str]           # the whole body; None when full_body is off
     tags: List[str]
     path: Optional[str]
     score: float
+    # filled in by search.attach_snippets after ranking: the most relevant slice
+    # of the body plus its 1-based line (line is None for the ts_headline path,
+    # which has no offset). Trailing defaults keep Hit(id, body, tags, path,
+    # score) call sites in the backends working unchanged.
+    snippet: Optional[str] = None
+    line: Optional[int] = None
 
 
 def _vec_literal(vec: Sequence[float]) -> str:

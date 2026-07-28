@@ -312,12 +312,14 @@ class Store:
                tags: Optional[Sequence[str]] = None,
                path_prefix: Optional[str] = None, mode: str = "auto",
                match: Optional[str] = None,
+               snippet: Optional[bool] = None, full_body: Optional[bool] = None,
                space: Optional[str] = None, space_id: Optional[str] = None):
         from .search import recall as _recall
         ns = self._authorize(token, space=space, space_id=space_id, need="read")
         return _recall(self._conn, self.cfg, self.embedder, ns,
                        query, k=k, tags=tags, path_prefix=path_prefix, mode=mode,
-                       match=match, backend=self._vectors)
+                       match=match, backend=self._vectors,
+                       snippet=snippet, full_body=full_body)
 
     # ─── list: enumerate a subtree (no query, no ranking) ───────────────────
     def list(self, token: Optional[str], *, path_prefix: Optional[str] = None,

@@ -250,15 +250,23 @@ def create_app(cfg: Optional[Config] = None):
     def recall(q: str, k: int = 10, mode: str = "auto",
                tags: Optional[str] = Query(None, description="comma-separated"),
                path_prefix: Optional[str] = None,
+               snippet: Optional[bool] = None, full_body: Optional[bool] = None,
                space: Optional[str] = None, space_id: Optional[str] = None,
                tok: Optional[str] = Depends(token)):
         taglist = [t for t in (tags.split(",") if tags else []) if t]
         with pool.connection() as conn:
             hits = _guard(lambda: _store(conn).recall(
                 tok, q, k=k, tags=taglist or None, path_prefix=path_prefix,
-                mode=mode, space=space, space_id=space_id))
-            return [{"id": h.id, "body": h.body, "tags": h.tags,
-                     "path": h.path, "score": h.score} for h in hits]
+                mode=mode, snippet=snippet, full_body=full_body,
+                space=space, space_id=space_id))
+            out = []
+            for h in hits:
+                d = {"id": h.id, "tags": h.tags, "path": h.path,
+                     "score": h.score, "snippet": h.snippet, "line": h.line}
+                if h.body is not None:
+                    d["body"] = h.body
+                out.append(d)
+            return out
 
     # ─── spaces: what this token can reach ──────────────────────────────────
     from . import identity

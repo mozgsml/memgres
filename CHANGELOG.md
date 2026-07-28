@@ -8,6 +8,13 @@ patch = fixes).
 ## [Unreleased]
 
 ### Added
+- **Recall snippets** — each hit now carries a `snippet` (the most relevant slice
+  of its body) plus a `line` number. Semantic/hybrid hits pick their
+  best-matching *segment*, lazily embedded and cached per body-hash (recomputed
+  when the body changes); lexical/hybrid fall back to Postgres `ts_headline`.
+  Tunable via `MEMGRES_SNIPPET*` settings plus per-call `snippet` / `full_body`
+  params on `memory_recall` and `GET /recall` — pass `full_body=false` for just
+  the snippet.
 - **Pluggable vector backend** (`memgres/vector/`): pgvector and Qdrant now sit
   behind one `VectorBackend` interface, so the store and search never branch on
   which one is configured and a new backend is a single module. Internal
@@ -38,6 +45,11 @@ patch = fixes).
   no longer advertises `semantic`/`hybrid` modes — the model only sees what works.
 - pgvector writes the embedding via a separate `UPDATE` within the same write
   transaction (was inline in the INSERT). No visible behavior change.
+
+### Notes
+- With a **paid** embedding API, semantic snippets add model calls on first sight
+  of each hit (segments are embedded, then cached). Set
+  `MEMGRES_SNIPPET_SEMANTIC=false` to disable them and use `ts_headline` instead.
 
 ### Documentation
 - New `docs/EMBEDDINGS.md` — choosing and operating a local vs cloud embedding

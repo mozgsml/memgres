@@ -170,21 +170,31 @@ def build_server(cfg: Optional[Config] = None):
                       match: Optional[Literal["any", "all"]] = None,
                       tags: Optional[List[str]] = None,
                       path_prefix: Optional[str] = None,
+                      snippet: Optional[bool] = None,
+                      full_body: Optional[bool] = None,
                       space: Optional[str] = None, space_id: Optional[str] = None,
                       token: Optional[str] = None, ctx: Context = None) -> List[dict]:
         """Search memories. `mode`: lexical | semantic | hybrid | auto. `match`
         governs lexical word combination — defaults to OR-any (any query word
         matches, forgiving recall); set 'all' to require every word (narrow).
         Optionally scope to a tag set (`tags`) or a subtree (`path_prefix`, e.g.
-        'ops.postgres'). `space`/`space_id` pick which namespace to search
-        (default: yours)."""
+        'ops.postgres'). Each hit carries a `snippet` (+`line`) by default —
+        semantic/hybrid use the best-matching segment, lexical uses ts_headline;
+        pass `full_body=false` to get just the snippet, `snippet=false` for none.
+        `space`/`space_id` pick which namespace to search (default: yours)."""
         with pool.connection() as conn:
-            return [{"id": h.id, "body": h.body, "tags": h.tags, "path": h.path,
-                     "score": h.score}
-                    for h in _store(conn).recall(
-                        _token(ctx, token), query, k=k, tags=tags,
-                        path_prefix=path_prefix, mode=mode, match=match,
-                        space=space, space_id=space_id)]
+            out = []
+            for h in _store(conn).recall(
+                    _token(ctx, token), query, k=k, tags=tags,
+                    path_prefix=path_prefix, mode=mode, match=match,
+                    snippet=snippet, full_body=full_body,
+                    space=space, space_id=space_id):
+                d = {"id": h.id, "tags": h.tags, "path": h.path,
+                     "score": h.score, "snippet": h.snippet, "line": h.line}
+                if h.body is not None:
+                    d["body"] = h.body
+                out.append(d)
+            return out
 
     @mcp.tool()
     def memory_list(path_prefix: Optional[str] = None,

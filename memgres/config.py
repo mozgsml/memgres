@@ -66,6 +66,14 @@ class Config:
     fts_language: str            # Postgres FTS dict: simple | english | russian | …
     lexical_match: str           # any (OR-any words, default) | all (AND-all words)
     vector_backend: str          # pgvector (default) | qdrant
+    # snippets (a relevant slice of each recall hit's body + its line number)
+    snippet: bool                # attach a snippet+line to each hit
+    full_body: bool              # also return the whole body (off = snippet only)
+    snippet_semantic: bool       # semantic/hybrid hits use the best-matching
+                                 # segment (needs the model); off = ts_headline,
+                                 # avoiding per-query model calls on a paid API
+    snippet_seg_chars: int       # segment size for the best-segment snippet cache
+    snippet_seg_overlap: int     # chars shared between consecutive segments
     # listing / browse
     list_preview_chars: int      # first-line preview length for memory_list (0 = none)
     # embeddings
@@ -91,6 +99,10 @@ class Config:
             raise ValueError("MEMGRES_EMBED_MAX_SEQ must be >= 0")
         if self.list_preview_chars < 0:
             raise ValueError("MEMGRES_LIST_PREVIEW_CHARS must be >= 0")
+        if self.snippet_seg_chars < 1:
+            raise ValueError("MEMGRES_SNIPPET_SEG_CHARS must be >= 1")
+        if self.snippet_seg_overlap < 0:
+            raise ValueError("MEMGRES_SNIPPET_SEG_OVERLAP must be >= 0")
         if self.max_write_bytes > self.max_body_bytes:
             raise ValueError(
                 "MEMGRES_MAX_WRITE_BYTES must be <= MEMGRES_MAX_BODY_BYTES"
@@ -131,6 +143,11 @@ def load() -> Config:
         fts_language=_str("MEMGRES_FTS_LANGUAGE", "simple"),
         lexical_match=_str("MEMGRES_LEXICAL_MATCH", "any"),
         vector_backend=_str("MEMGRES_VECTOR_BACKEND", "pgvector"),
+        snippet=_bool("MEMGRES_SNIPPET", True),
+        full_body=_bool("MEMGRES_FULL_BODY", True),
+        snippet_semantic=_bool("MEMGRES_SNIPPET_SEMANTIC", True),
+        snippet_seg_chars=_int("MEMGRES_SNIPPET_SEG_CHARS", 400),
+        snippet_seg_overlap=_int("MEMGRES_SNIPPET_SEG_OVERLAP", 80),
         list_preview_chars=_int("MEMGRES_LIST_PREVIEW_CHARS", 120),
         embed_provider=_str("MEMGRES_EMBED_PROVIDER", "none"),
         embed_model=_str("MEMGRES_EMBED_MODEL", ""),
