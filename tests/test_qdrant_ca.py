@@ -48,23 +48,23 @@ def fake_qdrant(monkeypatch):
 
 def test_ca_cert_forwarded_as_verify(fake_qdrant, monkeypatch):
     monkeypatch.setenv("MEMGRES_QDRANT_CA", "/etc/ssl/my-ca.pem")
-    from memgres.qdrant_backend import QdrantIndex
-    QdrantIndex(dim=8, url="https://qdrant.example:6333")
+    from memgres.vector.qdrant import QdrantBackend
+    QdrantBackend(dim=8, url="https://qdrant.example:6333")
     assert _FakeClient.last_kwargs.get("verify") == "/etc/ssl/my-ca.pem"
 
 
 def test_no_ca_means_no_verify_kwarg(fake_qdrant, monkeypatch):
     monkeypatch.delenv("MEMGRES_QDRANT_CA", raising=False)
-    from memgres.qdrant_backend import QdrantIndex
-    QdrantIndex(dim=8, url="http://qdrant.example:6333")
+    from memgres.vector.qdrant import QdrantBackend
+    QdrantBackend(dim=8, url="http://qdrant.example:6333")
     # default trust store path: don't pin `verify` at all
     assert "verify" not in _FakeClient.last_kwargs
 
 
 def test_explicit_ca_arg_beats_env(fake_qdrant, monkeypatch):
     monkeypatch.setenv("MEMGRES_QDRANT_CA", "/env/ca.pem")
-    from memgres.qdrant_backend import QdrantIndex
-    QdrantIndex(dim=8, url="https://qdrant.example:6333", ca_cert="/arg/ca.pem")
+    from memgres.vector.qdrant import QdrantBackend
+    QdrantBackend(dim=8, url="https://qdrant.example:6333", ca_cert="/arg/ca.pem")
     assert _FakeClient.last_kwargs.get("verify") == "/arg/ca.pem"
 
 

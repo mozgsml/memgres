@@ -26,6 +26,7 @@ from . import identity
 from .config import Config
 from .diffing import apply_diff, byte_len, content_hash, make_diff
 from .embeddings import Embedder, get_embedder
+from .vector import make_backend
 
 
 class Conflict(RuntimeError):
@@ -57,10 +58,6 @@ class Memory:
     expires_at: object
 
 
-def _vec_literal(vec: Sequence[float]) -> str:
-    return "[" + ",".join(repr(float(x)) for x in vec) + "]"
-
-
 def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
               diff: Optional[str], hash_after: Optional[str],
               path_after: Optional[str], tags_after: Optional[Sequence[str]],
@@ -82,12 +79,9 @@ class Store:
         self._identity_on = cfg.key_mode != "single"
         self._own_conn = conn is None
         self._conn = conn or psycopg.connect(cfg.database_url or "")
-        # Qdrant holds vectors out-of-band; pgvector keeps them in-row (default).
-        self._use_qdrant = (cfg.vector_backend == "qdrant" and self.embedder is not None)
-        self._qdrant = None
-        if self._use_qdrant:
-            from .qdrant_backend import QdrantIndex
-            self._qdrant = QdrantIndex(self.embedder.dim)
+        # Vector backend picks itself from config (pgvector in-row by default,
+        # Qdrant out-of-band); None when there's no embedder (lexical-only).
+        self._vectors = make_backend(cfg, self.embedder)
 
     def close(self):
         if self._own_conn:
@@ -136,13 +130,6 @@ class Store:
         if not self.embedder:
             return None
         return self.embedder.embed_documents([body])[0]
-
-    def _embed(self, body: str) -> Optional[str]:
-        """pgvector literal for the in-row embedding column. Returns None when
-        embeddings are off OR vectors live in Qdrant (out-of-band)."""
-        if not self.embedder or self._use_qdrant:
-            return None
-        return _vec_literal(self.embedder.embed_documents([body])[0])
 
     # ─── write: create, replace, diff, move, retag (one entrypoint) ─────────
     def write(self, token: Optional[str] = None, *, id: Optional[str] = None,
@@ -193,24 +180,19 @@ class Store:
         tags = list(tags or [])
         cur = self._conn.cursor()
         self._check_parent(cur, ns, path)
-        emb = self._embed(body)
-        emb_col = ", embedding" if emb else ""
-        emb_val = ", %s::vector" if emb else ""
-        params = [ns, body, chash, tags, path, self.cfg.fts_language, body]
-        if emb:
-            params.append(emb)
         cur.execute(
-            f"""INSERT INTO memory (namespace, body, content_hash, tags, path, fts{emb_col},
+            f"""INSERT INTO memory (namespace, body, content_hash, tags, path, fts,
                     seq, expires_at)
                 VALUES (%s, %s, %s, %s, %s::ltree,
-                        to_tsvector(%s::regconfig, %s){emb_val},
+                        to_tsvector(%s::regconfig, %s),
                         1, {self._expiry_sql(ttl_days)})
                 RETURNING id, created_at, updated_at, expires_at""",
-            params,
+            [ns, body, chash, tags, path, self.cfg.fts_language, body],
         )
         mid, created, updated, expires = cur.fetchone()
-        if self._use_qdrant:
-            self._qdrant.upsert(str(mid), self._raw_vec(body), ns)
+        if self._vectors is not None:
+            # pgvector: a second UPDATE in this same tx; qdrant: point upsert.
+            self._vectors.upsert_doc(self._conn, str(mid), self._raw_vec(body), ns)
         # store create as a diff-from-empty so the whole history is a self-contained
         # chain (empty → current), replayable forward for reconstruct/annotate.
         self._append_history(str(mid), 1, "create", make_diff("", body), None, chash,
@@ -282,23 +264,18 @@ class Store:
                 "WHERE namespace=%s AND path <@ %s::ltree AND id <> %s",
                 (new_path, cur_path, ns, cur_path, id))
 
-        emb = self._embed(new_body) if body_changed else None
-        set_embedding = ", embedding=%s::vector" if emb else ""
-        params = [new_body, new_hash, new_tags, new_path,
-                  self.cfg.fts_language, new_body]
-        if emb:
-            params.append(emb)
-        params.append(id)
         cur.execute(
             f"""UPDATE memory SET body=%s, content_hash=%s, tags=%s, path=%s::ltree,
-                    fts=to_tsvector(%s::regconfig, %s){set_embedding},
+                    fts=to_tsvector(%s::regconfig, %s),
                     seq=seq+1, updated_at=now(), expires_at={self._expiry_sql(ttl_days)}
                 WHERE id=%s
                 RETURNING seq, created_at, updated_at, expires_at""",
-            params)
+            [new_body, new_hash, new_tags, new_path,
+             self.cfg.fts_language, new_body, id])
         new_seq, created, updated, expires = cur.fetchone()
-        if self._use_qdrant and body_changed:
-            self._qdrant.upsert(str(id), self._raw_vec(new_body), ns)
+        if body_changed and self._vectors is not None:
+            # pgvector: a second UPDATE in this same tx; qdrant: point upsert.
+            self._vectors.upsert_doc(self._conn, str(id), self._raw_vec(new_body), ns)
         # store the canonical diff (recomputed) even for a whole-body replace, so
         # every body change is line-attributable and the chain stays replayable.
         stored_diff = make_diff(cur_body, new_body) if body_changed else None
@@ -339,7 +316,7 @@ class Store:
         ns = self._authorize(token, space=space, space_id=space_id, need="read")
         return _recall(self._conn, self.cfg, self.embedder, ns,
                        query, k=k, tags=tags, path_prefix=path_prefix, mode=mode,
-                       qdrant=self._qdrant)
+                       backend=self._vectors)
 
     # ─── convenience: move ──────────────────────────────────────────────────
     def move(self, token: Optional[str], id: str, new_path: str,
@@ -439,8 +416,9 @@ class Store:
             cur = self._conn.cursor()
             cur.execute("DELETE FROM memory WHERE id=%s AND namespace=%s", (id, ns))
             deleted = cur.rowcount > 0
-        if deleted and self._use_qdrant:
-            self._qdrant.delete(id)      # drop the out-of-band vector too
+        if deleted and self._vectors is not None:
+            # drop the out-of-band vector too (no-op for the in-row pgvector backend)
+            self._vectors.delete_doc(self._conn, id, ns)
         return deleted
 
     def purge_expired(self) -> int:

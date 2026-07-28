@@ -29,8 +29,10 @@ from __future__ import annotations
 import os
 from typing import List, Optional, Sequence, Tuple
 
+from .base import Hit, build_filters
 
-class QdrantIndex:
+
+class QdrantBackend:
     def __init__(self, dim: int, url: Optional[str] = None,
                  api_key: Optional[str] = None, collection: Optional[str] = None,
                  ca_cert: Optional[str] = None):
@@ -60,7 +62,7 @@ class QdrantIndex:
         info = self.client.get_collection(self.collection)
         size = info.config.params.vectors.size
         if size != self.dim:
-            from .schema import SchemaMismatch
+            from ..schema import SchemaMismatch
             raise SchemaMismatch(
                 f"Qdrant collection '{self.collection}' has dim {size}, model emits "
                 f"{self.dim} — re-embed into a fresh collection, don't mix models."
@@ -82,6 +84,7 @@ class QdrantIndex:
             field_schema=PayloadSchemaType.KEYWORD,
         )
 
+    # ─── point ops ──────────────────────────────────────────────────────────
     def upsert(self, id: str, vector: Sequence[float], namespace: str) -> None:
         from qdrant_client.models import PointStruct
 
@@ -108,3 +111,29 @@ class QdrantIndex:
             query_filter=flt, with_payload=False,
         ).points
         return [(str(p.id), float(p.score)) for p in res]
+
+    # ─── VectorBackend interface (conn is unused: vectors are out-of-band) ────
+    def upsert_doc(self, conn, id: str, vec: Sequence[float], ns: str) -> None:
+        self.upsert(id, vec, ns)
+
+    def delete_doc(self, conn, id: str, ns: str) -> None:
+        self.delete(id)
+
+    def search(self, conn, cfg, query_vec: Sequence[float], k: int, ns: str,
+               tags: Optional[Sequence[str]], path_prefix: Optional[str]) -> List[Hit]:
+        """Rank in Qdrant (namespace-scoped), then fetch + filter bodies in Postgres.
+        Over-fetch when tag/subtree filters apply, since those are enforced in PG."""
+        overfetch = k if not (tags or path_prefix) else min(max(k * 10, k), 500)
+        pairs = self.query(query_vec, overfetch, ns)     # [(id, score)] cosine similarity
+        if not pairs:
+            return []
+        score = {pid: s for pid, s in pairs}
+        where, params = build_filters(ns, tags, path_prefix)  # ns, expiry, tags, subtree
+        sql = (f"SELECT id, body, tags, path::text FROM memory "
+               f"WHERE {where} AND id = ANY(%s)")
+        with conn.cursor() as cur:
+            cur.execute(sql, params + [list(score.keys())])
+            hits = [Hit(str(r[0]), r[1], list(r[2]), r[3], score[str(r[0])])
+                    for r in cur.fetchall()]
+        hits.sort(key=lambda h: h.score, reverse=True)   # Qdrant order, minus PG-filtered
+        return hits[:k]
