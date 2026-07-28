@@ -65,13 +65,13 @@ class PgvectorBackend:
                     "VALUES (%s,%s,%s,%s,%s::vector,%s,%s)",
                     rows)
 
-    def get_segments(self, conn, memory_id: str, src_hash: str
+    def get_segments(self, conn, memory_id: str, ns: str, src_hash: str
                      ) -> Optional[List[Tuple[int, int, int, List[float]]]]:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT seq, seg_start, seg_end, embedding::text FROM memory_segment "
-                "WHERE memory_id=%s AND src_hash=%s ORDER BY seq",
-                (memory_id, src_hash))
+                "WHERE memory_id=%s AND namespace=%s AND src_hash=%s ORDER BY seq",
+                (memory_id, ns, src_hash))
             rows = cur.fetchall()
         if not rows:
             return None  # absent OR src_hash mismatch → caller recomputes

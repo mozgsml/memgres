@@ -169,10 +169,12 @@ class QdrantBackend:
         needs uuid or int ids; a uuid5 of the pair is both."""
         return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{memory_id}:{seq}"))
 
-    def _seg_filter(self, memory_id: str):
+    def _seg_filter(self, memory_id: str, ns: Optional[str] = None):
         from qdrant_client.models import FieldCondition, Filter, MatchValue
-        return Filter(must=[FieldCondition(key="memory_id",
-                                           match=MatchValue(value=memory_id))])
+        must = [FieldCondition(key="memory_id", match=MatchValue(value=memory_id))]
+        if ns is not None:
+            must.append(FieldCondition(key="namespace", match=MatchValue(value=ns)))
+        return Filter(must=must)
 
     def upsert_segments(self, conn, memory_id: str, ns: str, src_hash: str,
                         segments: Sequence[Tuple[int, int, int, Sequence[float]]]
@@ -194,10 +196,10 @@ class QdrantBackend:
         if points:
             self.client.upsert(self.seg_collection, points=points)
 
-    def get_segments(self, conn, memory_id: str, src_hash: str
+    def get_segments(self, conn, memory_id: str, ns: str, src_hash: str
                      ) -> Optional[List[Tuple[int, int, int, List[float]]]]:
         points, _ = self.client.scroll(
-            self.seg_collection, scroll_filter=self._seg_filter(memory_id),
+            self.seg_collection, scroll_filter=self._seg_filter(memory_id, ns),
             limit=10_000, with_payload=True, with_vectors=True,
         )
         if not points:

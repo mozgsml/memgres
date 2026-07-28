@@ -143,7 +143,7 @@ def _roundtrip(store):
 
     # round-trip
     v.upsert_segments(conn, m.id, ns, h, SEGS)
-    got = v.get_segments(conn, m.id, h)
+    got = v.get_segments(conn, m.id, ns, h)
     assert got is not None
     assert _seg_set(got) == _seg_set(SEGS)
     by_seq = {r[0]: r for r in got}
@@ -152,16 +152,18 @@ def _roundtrip(store):
         assert _approx(by_seq[seq][3], vec)
 
     # stale invalidation: a different src_hash → None (caller recomputes)
-    assert v.get_segments(conn, m.id, "deadbeefdeadbeef") is None
+    assert v.get_segments(conn, m.id, ns, "deadbeefdeadbeef") is None
+    # wrong namespace → None even with the right memory_id + src_hash (defense-in-depth)
+    assert v.get_segments(conn, m.id, "no-such-ns", h) is None
 
     # re-upsert replaces (old seqs gone)
     v.upsert_segments(conn, m.id, ns, h, [(0, 0, 4, [5.0, 0.0, 0.0])])
-    got2 = v.get_segments(conn, m.id, h)
+    got2 = v.get_segments(conn, m.id, ns, h)
     assert _seg_set(got2) == {(0, 0, 4)}
 
     # explicit delete
     v.delete_segments(conn, m.id)
-    assert v.get_segments(conn, m.id, h) is None
+    assert v.get_segments(conn, m.id, ns, h) is None
     return m
 
 
@@ -171,9 +173,9 @@ def _forget_cascade(store):
     ns = _ns(store)
     m = store.write(body="apple pie to forget\n")
     v.upsert_segments(conn, m.id, ns, m.content_hash, SEGS)
-    assert v.get_segments(conn, m.id, m.content_hash) is not None
+    assert v.get_segments(conn, m.id, ns, m.content_hash) is not None
     store.forget(None, m.id)
-    assert v.get_segments(conn, m.id, m.content_hash) is None
+    assert v.get_segments(conn, m.id, ns, m.content_hash) is None
 
 
 # ─── pgvector ────────────────────────────────────────────────────────────────
@@ -199,7 +201,7 @@ def test_pg_segments_carry_namespace(pg_store):
         cur.execute("SELECT namespace FROM memory_segment WHERE memory_id=%s", (a.id,))
         assert {r[0] for r in cur.fetchall()} == {ns}
     # querying b's id never returns a's segments (memory_id isolation)
-    assert _seg_set(v.get_segments(conn, b.id, b.content_hash)) == {(0, 0, 3)}
+    assert _seg_set(v.get_segments(conn, b.id, ns, b.content_hash)) == {(0, 0, 3)}
 
 
 # ─── qdrant ──────────────────────────────────────────────────────────────────
@@ -239,7 +241,7 @@ def test_qdrant_segments_carry_namespace(qdrant_store):
         with_payload=True, limit=100)
     assert pts and all(p.payload["namespace"] == ns for p in pts)
     # b's id never yields a's segments
-    assert _seg_set(v.get_segments(conn, b.id, b.content_hash)) == {(0, 0, 3)}
+    assert _seg_set(v.get_segments(conn, b.id, ns, b.content_hash)) == {(0, 0, 3)}
 
 
 def test_qdrant_two_namespaces_isolated(qdrant_store, monkeypatch):
@@ -261,12 +263,14 @@ def test_qdrant_two_namespaces_isolated(qdrant_store, monkeypatch):
     v = s._vectors
     v.upsert_segments(conn, a.id, ns_a, a.content_hash, [(0, 0, 3, [1.0, 0.0, 0.0])])
     v.upsert_segments(conn, b.id, ns_b, b.content_hash, [(0, 0, 3, [0.0, 1.0, 0.0])])
-    assert _seg_set(v.get_segments(conn, a.id, a.content_hash)) == {(0, 0, 3)}
-    assert _seg_set(v.get_segments(conn, b.id, b.content_hash)) == {(0, 0, 3)}
+    assert _seg_set(v.get_segments(conn, a.id, ns_a, a.content_hash)) == {(0, 0, 3)}
+    assert _seg_set(v.get_segments(conn, b.id, ns_b, b.content_hash)) == {(0, 0, 3)}
+    # A's segments are invisible under B's namespace even with A's memory_id
+    assert v.get_segments(conn, a.id, ns_b, a.content_hash) is None
     # forget A drops A's segments; B's remain
     s.forget(tok_a, a.id)
-    assert v.get_segments(conn, a.id, a.content_hash) is None
-    assert v.get_segments(conn, b.id, b.content_hash) is not None
+    assert v.get_segments(conn, a.id, ns_a, a.content_hash) is None
+    assert v.get_segments(conn, b.id, ns_b, b.content_hash) is not None
 
 
 if __name__ == "__main__":

@@ -106,7 +106,7 @@ def _best_segment_snippet(conn, cfg, embedder, backend, ns: str, hit: Hit,
         hit.snippet, hit.line = "", 1
         return
     src = content_hash(body)
-    segs = backend.get_segments(conn, hit.id, src)  # (seq, start, end, vec) or None
+    segs = backend.get_segments(conn, hit.id, ns, src)  # (seq, start, end, vec) or None
     if segs is None:
         spans = segment(body, cfg.snippet_seg_chars, cfg.snippet_seg_overlap)
         vecs = embedder.embed_documents([body[s:e] for (s, e) in spans])

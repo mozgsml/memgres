@@ -163,7 +163,7 @@ def _cache_populate_reuse(store):
     m = store.write(body=BODY)
     first = _find(store.recall(None, QUERY, mode="semantic"), m.id).snippet
     # segments were computed + stored under the body's content_hash
-    segs = store._vectors.get_segments(store._conn, m.id, content_hash(BODY))
+    segs = store._vectors.get_segments(store._conn, m.id, _ns(store), content_hash(BODY))
     assert segs is not None and len(segs) >= 2
     # a second recall reuses them and returns the same snippet
     second = _find(store.recall(None, QUERY, mode="semantic"), m.id).snippet
@@ -187,8 +187,8 @@ def _invalidate_on_edit(store):
     new_hash = m2.content_hash
     h = _find(store.recall(None, QUERY, mode="semantic"), m.id)
     # stale segments recomputed: old hash gone, new hash present
-    assert store._vectors.get_segments(store._conn, m.id, old_hash) is None
-    assert store._vectors.get_segments(store._conn, m.id, new_hash) is not None
+    assert store._vectors.get_segments(store._conn, m.id, _ns(store), old_hash) is None
+    assert store._vectors.get_segments(store._conn, m.id, _ns(store), new_hash) is not None
     # snippet now reflects the edited body
     assert "apples" in h.snippet and "orchard" in h.snippet
     assert "Bananas" not in h.snippet
@@ -246,7 +246,7 @@ def _semantic_disabled_no_segments(store):
     h = _find(store.recall(None, QUERY, mode="semantic"), m.id)
     # fell back to ts_headline: a snippet, but no segment cache for this id
     assert h.snippet is not None
-    assert store._vectors.get_segments(store._conn, m.id, content_hash(BODY)) is None
+    assert store._vectors.get_segments(store._conn, m.id, _ns(store), content_hash(BODY)) is None
 
 
 def test_pg_semantic_disabled_no_segments(monkeypatch, pg_store):

@@ -46,10 +46,21 @@ patch = fixes).
 - pgvector writes the embedding via a separate `UPDATE` within the same write
   transaction (was inline in the INSERT). No visible behavior change.
 
+### Security
+- Segment-cache reads (`get_segments`) now filter by `namespace` in addition to
+  `memory_id`, so a tenant's snippet cache is *structurally* scoped rather than
+  relying on memory-id unguessability. Defense-in-depth — not a fixed exploit
+  (the id was already sourced from a namespace-scoped recall). Verified by an
+  adversarial cross-tenant test (`test_qdrant_two_namespaces_isolated`).
+- `GET /info` / `memory_server_info` are unauthenticated by design and return no
+  secrets (config metadata only) — documented so `managed` deployments can gate
+  it at the proxy if even that must stay private.
+
 ### Notes
 - With a **paid** embedding API, semantic snippets add model calls on first sight
   of each hit (segments are embedded, then cached). Set
   `MEMGRES_SNIPPET_SEMANTIC=false` to disable them and use `ts_headline` instead.
+  With a local model the cost is negligible (CPU/GPU only).
 
 ### Documentation
 - New `docs/EMBEDDINGS.md` — choosing and operating a local vs cloud embedding

@@ -196,8 +196,10 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `GET` | `/memories/{id}/history` | raw change chain |
 | `GET` | `/memories/{id}/blame` | line attribution; `?group`, `?text`, `?lines=1,3-5` |
 | `GET` | `/memories/{id}/at/{seq}` | body reconstructed at a version |
-| `GET` | `/recall` | `?q=&k=&mode=&tags=&path_prefix=` |
+| `GET` | `/recall` | `?q=&k=&mode=&tags=&path_prefix=&match=&snippet=&full_body=` |
+| `GET` | `/memories` | list a subtree, no query: `?path_prefix=&tags=&limit=&offset=` |
 | `GET` | `/spaces` | namespaces this token can reach (identity modes) |
+| `GET` | `/info` | effective config: limits, embed provider/model/dim, recall modes, backend |
 | `GET` | `/healthz` | liveness |
 
 Every memory/recall route also takes optional `space` (one of your namespaces by
@@ -207,6 +209,14 @@ also request-access and `/admin/*` provisioning routes — see
 [docs/TENANCY.md](docs/TENANCY.md). OpenAPI/Swagger is at `/docs`. Store errors
 map to status codes: `409` stale-hash conflict, `404` not found, `413` too large,
 `401`/`403` auth.
+
+`/healthz` and `/info` are intentionally unauthenticated (and the MCP
+`memory_server_info` tool is always available): `/info` returns only effective
+configuration — limits, embedding provider/model/dimension, available recall
+modes, vector backend, key mode — and **never** a secret (no DB URL, token, API
+key, or admin token). It exists so a client can discover a deployment's
+capabilities before authenticating. If a `managed` deployment must not disclose
+even that metadata, put it behind your reverse proxy's auth.
 
 ## Use it with an LLM / agent (MCP)
 

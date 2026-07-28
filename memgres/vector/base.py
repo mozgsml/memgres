@@ -64,11 +64,13 @@ class VectorBackend(Protocol):
         (the memory's content_hash) + ``ns``."""
         ...
 
-    def get_segments(self, conn, memory_id: str, src_hash: str
+    def get_segments(self, conn, memory_id: str, ns: str, src_hash: str
                      ) -> Optional[List[Tuple[int, int, List[float]]]]:
         """Fresh cached segments as ``(seq, seg_start, seg_end, vector)`` sorted
         by seq, or ``None`` when absent OR stale (stored src_hash != requested),
-        signalling the caller to recompute."""
+        signalling the caller to recompute. Scoped by ``ns`` as well as
+        ``memory_id``: defense-in-depth so a tenant never reads another's
+        segment cache even if a foreign memory_id were somehow supplied."""
         ...
 
     def delete_segments(self, conn, memory_id: str) -> None:
