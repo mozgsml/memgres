@@ -7,6 +7,8 @@ patch = fixes).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-31
+
 ### Added
 - **Recall snippets** — each hit now carries a `snippet` (the most relevant slice
   of its body) plus a `line` number. Semantic/hybrid hits pick their
