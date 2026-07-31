@@ -115,7 +115,7 @@ def qdrant_store(monkeypatch):
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
 def _ns(store, token=None):
-    return store._authorize(token, need="read")
+    return store._authorize(token, need="read")[0]
 
 
 def _approx(a, b, eps=1e-5):
@@ -257,8 +257,8 @@ def test_qdrant_two_namespaces_isolated(qdrant_store, monkeypatch):
     tok_a, tok_b = new_token(), new_token()
     a = s.write(tok_a, body="apple in A\n")
     b = s.write(tok_b, body="banana in B\n")
-    ns_a = s._authorize(tok_a, need="read")
-    ns_b = s._authorize(tok_b, need="read")
+    ns_a = s._authorize(tok_a, need="read")[0]
+    ns_b = s._authorize(tok_b, need="read")[0]
     assert ns_a != ns_b
     v = s._vectors
     v.upsert_segments(conn, a.id, ns_a, a.content_hash, [(0, 0, 3, [1.0, 0.0, 0.0])])

@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .config import Config
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are
 # shipped inside the package (see pyproject) and this still resolves.
@@ -49,6 +49,10 @@ def migrate(conn, cfg: Config) -> None:
             cur.execute(_sql("0001_core.sql"))
             # identity tables (always applied, idempotent; empty in single mode)
             cur.execute(_sql("0002_identity.sql"))
+            # author columns on history (always applied, idempotent; NULL in
+            # single mode). Folded into the hash chain only when present, so
+            # pre-upgrade chains stay verifiable — see store._row_hash.
+            cur.execute(_sql("0003_history_author.sql"))
             _apply_tree(cur, cfg)
             _apply_vector(cur, cfg)
             _stamp(cur, cfg)

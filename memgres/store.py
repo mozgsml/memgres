@@ -61,12 +61,27 @@ class Memory:
 def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
               diff: Optional[str], hash_after: Optional[str],
               path_after: Optional[str], tags_after: Optional[Sequence[str]],
-              source: Optional[str], reason: Optional[str]) -> str:
-    h = hashlib.sha256()
+              source: Optional[str], reason: Optional[str],
+              author_user_id: Optional[str] = None,
+              author_token_id: Optional[str] = None) -> str:
     parts = [prev or "", memory_id, str(seq), op, diff or "", hash_after or "",
              path_after or "", ",".join(tags_after or []), source or "", reason or ""]
-    h.update("\x1f".join(parts).encode("utf-8"))
-    return h.hexdigest()
+    base = hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+    # User-less writes — single mode and the global-admin env token — return the
+    # base digest unchanged, byte-identical to the pre-authorship formula, so
+    # chains written before history_author still verify.
+    if not author_user_id:
+        return base
+    # Fold the author through a DOMAIN-SEPARATED outer hash over the fixed-width
+    # base digest — never by appending more \x1f-joined fields. `source`/`reason`
+    # are client free text that may contain the \x1f separator; concatenating
+    # author alongside them would let a crafted `reason` absorb the delimiter and
+    # collide an authored row with an author-less one (forging/stripping
+    # authorship undetectably). The base digest is fixed-width hex and the ids are
+    # uuids — none can carry \x1f — so the outer join is unambiguous.
+    outer = "\x1f".join(("memgres.author.v1", base,
+                         author_user_id, author_token_id or ""))
+    return hashlib.sha256(outer.encode("utf-8")).hexdigest()
 
 
 class Store:
@@ -90,13 +105,15 @@ class Store:
     # ─── namespace resolution / authorization ───────────────────────────────
     def _authorize(self, token: Optional[str], *, space: Optional[str] = None,
                    space_id: Optional[str] = None, need: str = "read",
-                   for_write: bool = False) -> str:
-        """Resolve (token, space) to the namespace id-string to operate in, and
-        enforce ``need`` (read|write|admin). In single mode there is one shared
-        space ('') and no auth. In open/managed mode a token is required; the
-        returned string is a namespace uuid."""
+                   for_write: bool = False):
+        """Resolve (token, space) to ``(namespace_id, author)`` and enforce
+        ``need`` (read|write|admin). ``author`` is ``(user_id, token_id)`` for the
+        authenticated principal — stamped into history on writes — or ``None`` for
+        a user-less caller (single mode, or the global-admin env token). In single
+        mode there is one shared space ('') and no auth; in open/managed mode a
+        token is required and the returned id-string is a namespace uuid."""
         if not self._identity_on:
-            return ""
+            return "", None
         token = token or self.cfg.token or None
         with self._conn.transaction():
             principal = identity.resolve(self._conn, self.cfg, token)
@@ -106,7 +123,10 @@ class Store:
         if not identity.perm_at_least(perm, need):
             raise identity.AuthError(
                 f"{need} permission required for this namespace (token grants {perm})")
-        return nsid
+        # user_id is set by now for any materialized principal (open-mode
+        # provisional users are created inside resolve_space on for_write).
+        author = (principal.user_id, principal.token_id)
+        return nsid, author
 
     def _expiry_sql(self, ttl_days: Optional[int]) -> str:
         days = ttl_days if ttl_days is not None else self.cfg.retention_days
@@ -141,12 +161,13 @@ class Store:
         with self._conn.transaction():
             # authorize inside the tx so a lazily-created user/namespace commits
             # atomically with the write (or rolls back together on failure).
-            ns = self._authorize(token, space=space, space_id=space_id,
-                                 need="write", for_write=True)
+            ns, author = self._authorize(token, space=space, space_id=space_id,
+                                         need="write", for_write=True)
             self._check_provenance_size(source, reason)
             if id is None:
-                return self._create(ns, body, path, tags, source, reason, ttl_days)
-            return self._update(ns, id, body, diff, base_hash, path, tags,
+                return self._create(ns, author, body, path, tags, source, reason,
+                                    ttl_days)
+            return self._update(ns, author, id, body, diff, base_hash, path, tags,
                                 source, reason, ttl_days)
 
     def _check_write_size(self, payload: Optional[str]):
@@ -171,7 +192,7 @@ class Store:
                 f"reason is {byte_len(reason)}B > MEMGRES_MAX_REASON_BYTES "
                 f"{self.cfg.max_reason_bytes}")
 
-    def _create(self, ns, body, path, tags, source, reason, ttl_days) -> Memory:
+    def _create(self, ns, author, body, path, tags, source, reason, ttl_days) -> Memory:
         if body is None:
             raise ValueError("create needs a body (diffs apply to an existing memory)")
         self._check_write_size(body)
@@ -196,7 +217,7 @@ class Store:
         # store create as a diff-from-empty so the whole history is a self-contained
         # chain (empty → current), replayable forward for reconstruct/annotate.
         self._append_history(str(mid), 1, "create", make_diff("", body), None, chash,
-                             None, path, None, tags, source, reason)
+                             None, path, None, tags, source, reason, author)
         return Memory(str(mid), body, chash, tags, path, 1, created, updated, expires)
 
     def _load(self, cur, ns, id) -> tuple:
@@ -208,7 +229,7 @@ class Store:
             raise NotFound(id)
         return row  # body, content_hash, tags, path, seq
 
-    def _update(self, ns, id, body, diff, base_hash, path, tags,
+    def _update(self, ns, author, id, body, diff, base_hash, path, tags,
                 source, reason, ttl_days) -> Memory:
         cur = self._conn.cursor()
         cur_body, cur_hash, cur_tags, cur_path, seq = self._load(cur, ns, id)
@@ -290,27 +311,31 @@ class Store:
                              new_path if path_changed else None,
                              list(cur_tags) if tags_changed else None,
                              new_tags if tags_changed else None,
-                             source, reason)
+                             source, reason, author)
         return Memory(str(id), new_body, new_hash, new_tags, new_path, new_seq,
                       created, updated, expires)
 
     def _append_history(self, memory_id, seq, op, diff, hash_before, hash_after,
                         path_before, path_after, tags_before, tags_after,
-                        source, reason):
+                        source, reason, author=None):
+        author_user_id, author_token_id = author or (None, None)
         cur = self._conn.cursor()
         cur.execute("SELECT row_hash FROM memory_history WHERE memory_id=%s "
                     "ORDER BY seq DESC LIMIT 1", (memory_id,))
         prev = cur.fetchone()
         prev_hash = prev[0] if prev else None
         rhash = _row_hash(prev_hash, memory_id, seq, op, diff, hash_after,
-                          path_after, tags_after, source, reason)
+                          path_after, tags_after, source, reason,
+                          author_user_id, author_token_id)
         cur.execute(
             """INSERT INTO memory_history (memory_id, seq, op, diff, hash_before,
                    hash_after, path_before, path_after, tags_before, tags_after,
-                   source, reason, prev_row_hash, row_hash)
-               VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s)""",
+                   source, reason, author_user_id, author_token_id,
+                   prev_row_hash, row_hash)
+               VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (memory_id, seq, op, diff, hash_before, hash_after, path_before,
-             path_after, tags_before, tags_after, source, reason, prev_hash, rhash))
+             path_after, tags_before, tags_after, source, reason,
+             author_user_id, author_token_id, prev_hash, rhash))
 
     # ─── recall: lexical / semantic / hybrid ────────────────────────────────
     def recall(self, token: Optional[str], query: str, *, k: int = 10,
@@ -320,7 +345,7 @@ class Store:
                snippet: Optional[bool] = None, full_body: Optional[bool] = None,
                space: Optional[str] = None, space_id: Optional[str] = None):
         from .search import recall as _recall
-        ns = self._authorize(token, space=space, space_id=space_id, need="read")
+        ns, _ = self._authorize(token, space=space, space_id=space_id, need="read")
         return _recall(self._conn, self.cfg, self.embedder, ns,
                        query, k=k, tags=tags, path_prefix=path_prefix, mode=mode,
                        match=match, backend=self._vectors,
@@ -336,7 +361,7 @@ class Store:
         order. ``build_filters`` scopes by namespace + not-expired + tags +
         subtree, so this is multi-tenant safe by construction."""
         from .vector.base import build_filters
-        ns = self._authorize(token, space=space, space_id=space_id, need="read")
+        ns, _ = self._authorize(token, space=space, space_id=space_id, need="read")
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
         where, params = build_filters(ns, tags, path_prefix)
@@ -368,7 +393,7 @@ class Store:
             _ns: Optional[str] = None, space: Optional[str] = None,
             space_id: Optional[str] = None) -> Memory:
         ns = _ns if _ns is not None else self._authorize(
-            token, space=space, space_id=space_id, need="read")
+            token, space=space, space_id=space_id, need="read")[0]
         cur = self._conn.cursor()
         cur.execute(
             "SELECT id, body, content_hash, tags, path::text, seq, created_at, "
@@ -387,18 +412,24 @@ class Store:
 
     def history(self, token: Optional[str], id: str, *, space: Optional[str] = None,
                 space_id: Optional[str] = None) -> List[dict]:
-        ns = self._authorize(token, space=space, space_id=space_id, need="read")
+        ns, _ = self._authorize(token, space=space, space_id=space_id, need="read")
         cur = self._conn.cursor()
         cur.execute("SELECT 1 FROM memory WHERE id=%s AND namespace=%s", (id, ns))
         if cur.fetchone() is None:
             raise NotFound(id)
+        # LEFT JOIN so a since-deleted author still reads back as its bare id
+        # (author_name NULL) — the audit stamp survives the user row.
         cur.execute(
-            "SELECT seq, op, diff, hash_before, hash_after, path_before::text, "
-            "path_after::text, tags_before, tags_after, source, reason, "
-            "prev_row_hash, row_hash, created_at FROM memory_history "
-            "WHERE memory_id=%s ORDER BY seq", (id,))
+            "SELECT h.seq, h.op, h.diff, h.hash_before, h.hash_after, "
+            "h.path_before::text, h.path_after::text, h.tags_before, h.tags_after, "
+            "h.source, h.reason, h.author_user_id::text, h.author_token_id::text, "
+            "NULLIF(u.name, '') AS author_name, "
+            "h.prev_row_hash, h.row_hash, h.created_at FROM memory_history h "
+            "LEFT JOIN app_user u ON u.id = h.author_user_id "
+            "WHERE h.memory_id=%s ORDER BY h.seq", (id,))
         cols = ["seq", "op", "diff", "hash_before", "hash_after", "path_before",
                 "path_after", "tags_before", "tags_after", "source", "reason",
+                "author_user_id", "author_token_id", "author_name",
                 "prev_row_hash", "row_hash", "created_at"]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
@@ -440,7 +471,8 @@ class Store:
         for r in rows:
             expect = _row_hash(prev, id, r["seq"], r["op"], r["diff"],
                                r["hash_after"], r["path_after"], r["tags_after"],
-                               r["source"], r["reason"])
+                               r["source"], r["reason"],
+                               r["author_user_id"], r["author_token_id"])
             if expect != r["row_hash"] or (r["prev_row_hash"] or None) != prev:
                 return False
             prev = r["row_hash"]
@@ -449,7 +481,7 @@ class Store:
     # ─── forget: real erasure ───────────────────────────────────────────────
     def forget(self, token: Optional[str], id: str, *, space: Optional[str] = None,
                space_id: Optional[str] = None) -> bool:
-        ns = self._authorize(token, space=space, space_id=space_id, need="write")
+        ns, _ = self._authorize(token, space=space, space_id=space_id, need="write")
         with self._conn.transaction():
             cur = self._conn.cursor()
             cur.execute("DELETE FROM memory WHERE id=%s AND namespace=%s", (id, ns))

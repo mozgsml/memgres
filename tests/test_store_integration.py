@@ -95,6 +95,110 @@ def test_malformed_diff_raises_and_does_not_bump_seq(store):
     assert again.seq == 1                          # seq NOT bumped
 
 
+def test_single_mode_history_has_no_author(store):
+    # Single mode has no identity: history rows carry NULL author, and the chain
+    # verifies (the no-author path hashes exactly as before history_author).
+    m = store.write(body="x\n", source="s", reason="r")
+    store.write(id=m.id, body="y\n", reason="edit")
+    h = store.history(None, m.id)
+    assert [r["op"] for r in h] == ["create", "replace"]
+    for r in h:
+        assert r["author_user_id"] is None
+        assert r["author_token_id"] is None
+        assert r["author_name"] is None
+    assert store.verify_history(None, m.id) is True
+
+
+def test_history_author_stamped_and_attributed(monkeypatch):
+    """In a shared namespace, each history row records WHO made it (server-stamped
+    from the authenticated principal), the chain verifies, and blame credits lines
+    to the right author."""
+    from memgres import identity
+
+    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    for k in list(os.environ):
+        if k.startswith("MEMGRES_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
+    monkeypatch.setenv("MEMGRES_KEY_MODE", "managed")
+    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
+    monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
+    cfg = load(); conn = psycopg.connect(DSN); migrate(conn, cfg)
+
+    # provision: Alice owns a namespace, Bob is a write-member of it
+    with conn.transaction():
+        uid_a = identity.create_user(conn, name="Alice")
+        uid_b = identity.create_user(conn, name="Bob")
+        nsid = identity.create_namespace(conn, uid_a, "shared")
+        identity.add_member(conn, nsid, uid_b, "write")
+        tok_a, tid_a = identity.issue_token(conn, uid_a, namespace_id=nsid,
+                                            permission="write")
+        tok_b, tid_b = identity.issue_token(conn, uid_b, namespace_id=nsid,
+                                            permission="write")
+
+    s = Store(cfg, conn=conn)
+    m = s.write(tok_a, body="line one\n", space_id=nsid, source="seed")
+    d = make_diff("line one\n", "line one\nline two (bob)\n")
+    s.write(tok_b, id=m.id, diff=d, base_hash=m.content_hash, space_id=nsid,
+            reason="add a line")
+
+    h = s.history(tok_a, m.id, space_id=nsid)
+    assert h[0]["author_user_id"] == uid_a and h[0]["author_name"] == "Alice"
+    assert h[0]["author_token_id"] == tid_a
+    assert h[1]["author_user_id"] == uid_b and h[1]["author_name"] == "Bob"
+    assert h[1]["author_token_id"] == tid_b
+    # the chain now folds author in and still verifies end-to-end
+    assert s.verify_history(tok_a, m.id, space_id=nsid) is True
+
+    # blame credits the added line to Bob, the seed line to Alice
+    blame = s.annotate(tok_a, m.id, space_id=nsid)
+    by_text = {b["text"].strip(): b for b in blame}
+    assert by_text["line one"]["author_name"] == "Alice"
+    assert by_text["line two (bob)"]["author_name"] == "Bob"
+    conn.close()
+
+
+def test_deleted_author_leaves_verifiable_stamp(monkeypatch):
+    """Deleting the author user must NOT break the audit chain: the id stays
+    stamped (name resolves to NULL), and verify_history stays True — because the
+    hash folds the id, which is retained, not the joined name."""
+    from memgres import identity
+
+    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    for k in list(os.environ):
+        if k.startswith("MEMGRES_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
+    monkeypatch.setenv("MEMGRES_KEY_MODE", "managed")
+    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
+    monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
+    cfg = load(); conn = psycopg.connect(DSN); migrate(conn, cfg)
+
+    with conn.transaction():
+        uid_a = identity.create_user(conn, name="Alice")
+        uid_admin = identity.create_user(conn, name="Admin")
+        nsid = identity.create_namespace(conn, uid_admin, "shared")
+        identity.add_member(conn, nsid, uid_a, "write")
+        tok_a, tid_a = identity.issue_token(conn, uid_a, namespace_id=nsid,
+                                            permission="write")
+        tok_admin, _ = identity.issue_token(conn, uid_admin, namespace_id=nsid,
+                                            permission="admin")
+
+    s = Store(cfg, conn=conn)
+    m = s.write(tok_a, body="alice wrote this\n", space_id=nsid)
+    # delete Alice (cascades her token; membership rows go too)
+    with conn.transaction(), conn.cursor() as cur:
+        cur.execute("DELETE FROM app_user WHERE id=%s", (uid_a,))
+
+    h = s.history(tok_admin, m.id, space_id=nsid)
+    assert h[0]["author_user_id"] == uid_a       # bare id retained
+    assert h[0]["author_name"] is None            # user row gone → no name
+    assert s.verify_history(tok_admin, m.id, space_id=nsid) is True
+    conn.close()
+
+
 def test_replace_and_retag(store):
     m = store.write(body="body\n", tags=["old"])
     m2 = store.write(id=m.id, body="new body\n", tags=["new"], reason="replace")

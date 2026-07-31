@@ -20,7 +20,8 @@ from typing import Iterable, List, Optional, Tuple
 
 from .diffing import _HUNK
 
-_ATTR_KEYS = ("seq", "op", "source", "reason", "created_at")
+_ATTR_KEYS = ("seq", "op", "source", "reason", "created_at",
+              "author_user_id", "author_token_id", "author_name")
 
 
 def _apply_attributed(src: List[Tuple[str, dict]], patch: str,

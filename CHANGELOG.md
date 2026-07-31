@@ -7,6 +7,28 @@ patch = fixes).
 
 ## [Unreleased]
 
+### Added
+- **Authoritative authorship in history** — every `memory_history` row now records
+  the server-resolved principal (`author_user_id` + `author_token_id`) on each
+  write, separate from the free-text `source`/`reason` a client supplies. In a
+  shared namespace this answers *who* actually made an edit, not just who claims
+  to have. `history`, `blame` (per-line + grouped), the `memory_history` /
+  `memory_blame` MCP tools and the HTTP `…/history` / `…/blame` endpoints expose
+  it, resolving `author_name` from the user row via LEFT JOIN (a since-deleted
+  author reads back as its bare id). The author is folded into the tamper-evident
+  hash chain, so stripping or swapping authorship is detectable by
+  `verify_history`.
+
+### Notes
+- Backward compatible: user-less writes (single mode, and the global-admin env
+  token) stamp NULL author and hash **exactly** as before, so history chains
+  written before this release still verify. New columns are added by an
+  idempotent migration (schema v4); no reindex or downtime.
+- No foreign key ties the author columns to `app_user`/`token`: the history is an
+  immutable audit record, so deleting a user must not mutate (and break the
+  verifiability of) unrelated memories' chains. A dedicated author-purge is a
+  future admin op.
+
 ## [0.3.2] — 2026-07-31
 
 ### Fixed

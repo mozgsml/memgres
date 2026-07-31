@@ -231,7 +231,9 @@ def build_server(cfg: Optional[Config] = None):
                      space: Optional[str] = None, space_id: Optional[str] = None,
                      token: Optional[str] = None, ctx: Context = None) -> List[dict]:
         """Who last changed each line. Grouped into author-blocks by default;
-        set grouped=false for per-line attribution."""
+        set grouped=false for per-line attribution. Each entry carries the
+        server-stamped author (author_user_id / author_name) alongside
+        seq/op/source/reason — in a shared namespace this says who, authoritatively."""
         with pool.connection() as conn:
             s = _store(conn)
             tok = _token(ctx, token)
@@ -243,7 +245,10 @@ def build_server(cfg: Optional[Config] = None):
     def memory_history(id: str, space: Optional[str] = None,
                        space_id: Optional[str] = None,
                        token: Optional[str] = None, ctx: Context = None) -> List[dict]:
-        """The full change chain (diffs, provenance, hashes) for a memory."""
+        """The full change chain for a memory: per version the diff, provenance
+        (source/reason), the server-stamped author (author_user_id / author_token_id
+        / resolved author_name), and the hash-chain fields. Author is authoritative
+        (from the authenticated principal), unlike free-text source/reason."""
         with pool.connection() as conn:
             return _store(conn).history(_token(ctx, token), id,
                                         space=space, space_id=space_id)

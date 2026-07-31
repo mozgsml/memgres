@@ -130,7 +130,7 @@ def qdrant_store(monkeypatch):
 
 
 def _ns(store):
-    return store._authorize(None, need="read")
+    return store._authorize(None, need="read")[0]
 
 
 def _find(hits, mid):

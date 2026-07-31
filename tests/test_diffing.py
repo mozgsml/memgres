@@ -76,6 +76,53 @@ def test_empty_patch_is_still_a_noop():
     assert apply_diff("keep\n", "   \n") == "keep\n"
 
 
+# ─── history row_hash stays backward-compatible when there's no author ────
+def test_row_hash_unchanged_without_author():
+    # A history row with no author must hash IDENTICALLY to the pre-authorship
+    # formula, so hash-chains written before history_author still verify after
+    # the upgrade. Single-mode and global-admin writes are exactly this case.
+    import hashlib
+
+    from memgres.store import _row_hash
+
+    parts = ["", "m", "1", "create", "d", "h", "", "t", "s", "r"]
+    legacy = hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+    assert _row_hash(None, "m", 1, "create", "d", "h", None, ["t"], "s", "r") == legacy
+    # None author is the same as omitting it
+    assert _row_hash(None, "m", 1, "create", "d", "h", None, ["t"], "s", "r",
+                     None, None) == legacy
+
+
+def test_row_hash_folds_author_when_present():
+    # An author, once present, changes the row hash — so tampering that strips or
+    # swaps authorship is detectable by verify_history.
+    from memgres.store import _row_hash
+
+    base = _row_hash(None, "m", 1, "create", "d", "h", None, ["t"], "s", "r")
+    with_author = _row_hash(None, "m", 1, "create", "d", "h", None, ["t"], "s", "r",
+                            "user-x", "tok-y")
+    assert with_author != base
+    # the token id participates too: same user, different token → different hash
+    other_tok = _row_hash(None, "m", 1, "create", "d", "h", None, ["t"], "s", "r",
+                          "user-x", "tok-z")
+    assert other_tok != with_author
+
+
+def test_author_cannot_be_forged_via_delimiter_in_reason():
+    # Regression (security review #1): author is folded through a domain-separated
+    # outer hash, NOT appended as more \x1f-joined fields. So an authored row must
+    # NOT collide with an author-less row whose client-controlled `reason` is
+    # crafted to smuggle the author tuple across the field boundary.
+    from memgres.store import _row_hash
+
+    authored = _row_hash(None, "m", 1, "create", "d", "h", None, ["t"],
+                         "src", "why", "user-x", "tok-y")
+    # attacker moves "\x1f user-x \x1f tok-y" into reason and NULLs the author
+    forged = _row_hash(None, "m", 1, "create", "d", "h", None, ["t"],
+                       "src", "why\x1fuser-x\x1ftok-y", None, None)
+    assert authored != forged
+
+
 # ─── byte length is measured in UTF-8, not characters ────────────────────
 def test_byte_len_utf8():
     assert byte_len("abc") == 3
