@@ -27,7 +27,10 @@ from __future__ import annotations
 
 from typing import List, Literal, Optional
 
-from mcp.server.fastmcp import Context
+try:  # mcp SDK >= 2.0 renamed the module fastmcp -> mcpserver
+    from mcp.server.mcpserver import Context
+except ImportError:  # mcp SDK 1.x
+    from mcp.server.fastmcp import Context
 
 from . import identity
 from .config import Config, load

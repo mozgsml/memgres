@@ -7,6 +7,14 @@ patch = fixes).
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-07-31
+
+### Fixed
+- Compatibility with the **mcp SDK 2.0**, which removed the `mcp.server.fastmcp`
+  module (renamed to `mcp.server.mcpserver`). The unguarded `Context` import
+  broke `memgres.mcp_server` on mcp ≥ 2.0 — now imported from either path.
+  memgres works on mcp 1.x and 2.x. (0.3.0 shipped with this import bug.)
+
 ## [0.3.0] — 2026-07-31
 
 ### Added
