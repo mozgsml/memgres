@@ -14,7 +14,7 @@ import pytest  # noqa: E402
 psycopg = pytest.importorskip("psycopg")
 
 from memgres.config import load  # noqa: E402
-from memgres.diffing import make_diff, content_hash  # noqa: E402
+from memgres.diffing import make_diff, content_hash, DiffConflict  # noqa: E402
 from memgres.schema import migrate  # noqa: E402
 from memgres.store import Store, Conflict, NotFound, TooLarge, NoParent  # noqa: E402
 
@@ -78,6 +78,21 @@ def test_diff_requires_base_hash(store):
     m = store.write(body="x\n")
     with pytest.raises(ValueError, match="base_hash"):
         store.write(id=m.id, diff=make_diff("x\n", "y\n"))
+
+
+def test_malformed_diff_raises_and_does_not_bump_seq(store):
+    # Regression (diff_silently_noops): a diff whose hunk header doesn't parse
+    # used to silently apply nothing — body unchanged but seq++ / updated_at
+    # moved, looking like a successful write. Now it raises and touches nothing.
+    m = store.write(body="alpha\nbeta\n")
+    assert m.seq == 1
+    bad = "@@\n-alpha\n+ALPHA\n"          # bare @@ — not a valid unified-diff hunk
+    with pytest.raises(DiffConflict):
+        store.write(id=m.id, diff=bad, base_hash=m.content_hash)
+    again = store.get(None, m.id)
+    assert again.body == "alpha\nbeta\n"          # body untouched
+    assert again.content_hash == m.content_hash   # hash unchanged
+    assert again.seq == 1                          # seq NOT bumped
 
 
 def test_replace_and_retag(store):

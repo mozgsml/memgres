@@ -1,6 +1,6 @@
 [project]
 name = "memgres"
-version = "0.3.1"
+version = "0.3.2"
 description = "Drop-in memory for AI agents: one Postgres, lexical + semantic recall, diff-versioned history, GDPR-erasable."
 readme = "README.md"
 license = "MIT"

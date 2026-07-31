@@ -24,7 +24,7 @@ import psycopg
 
 from . import identity
 from .config import Config
-from .diffing import apply_diff, byte_len, content_hash, make_diff
+from .diffing import DiffConflict, apply_diff, byte_len, content_hash, make_diff
 from .embeddings import Embedder, get_embedder
 from .vector import make_backend
 
@@ -221,6 +221,11 @@ class Store:
                 raise Conflict(f"stale diff: base {base_hash[:12]} != current {cur_hash[:12]}")
             self._check_write_size(diff)
             new_body = apply_diff(cur_body, diff)
+            # A diff that leaves the body identical applied nothing meaningful —
+            # never bump seq on a silent no-op (belt to apply_diff's malformed
+            # guard: also catches an empty or net-zero diff).
+            if new_body == cur_body:
+                raise DiffConflict("diff applied but changed nothing — empty or no-op diff")
             op = "diff"
         elif body is not None:
             if base_hash is not None and base_hash != cur_hash:

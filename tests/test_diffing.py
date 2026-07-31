@@ -53,6 +53,29 @@ def test_apply_to_changed_base_raises():
         apply_diff(drifted, patch)
 
 
+# ─── malformed patches must fail loudly, never silently no-op ────────────
+def test_malformed_hunk_header_raises():
+    # A bare `@@` (no `-a,b +c,d` line spec) is not a valid hunk header. It used
+    # to be silently skipped, so the whole patch applied nothing and the body
+    # came back unchanged — a silent no-op. Now it raises.
+    bad = "@@\n-old line\n+new line\n"
+    with pytest.raises(DiffConflict):
+        apply_diff("old line\n", bad)
+
+
+def test_patch_without_any_hunk_raises():
+    # Non-empty payload that contains no @@ hunk at all applied nothing → raise,
+    # rather than returning the source body untouched.
+    with pytest.raises(DiffConflict):
+        apply_diff("body\n", "-body\n+new\n")
+
+
+def test_empty_patch_is_still_a_noop():
+    # A genuinely empty patch is the one legitimate no-op (unchanged behavior).
+    assert apply_diff("keep\n", "") == "keep\n"
+    assert apply_diff("keep\n", "   \n") == "keep\n"
+
+
 # ─── byte length is measured in UTF-8, not characters ────────────────────
 def test_byte_len_utf8():
     assert byte_len("abc") == 3

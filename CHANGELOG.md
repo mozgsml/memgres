@@ -7,6 +7,16 @@ patch = fixes).
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-07-31
+
+### Fixed
+- **Silent no-op on a malformed diff.** `apply_diff` skipped any line that wasn't
+  a valid `@@ -a,b +c,d @@` header, so a patch with a malformed hunk header (or
+  none at all) applied nothing and returned the body unchanged — while the write
+  still bumped `seq`/`updated_at`, looking like success. It now raises
+  `DiffConflict` (HTTP 409) instead, and a `diff` write that leaves the body
+  identical is likewise rejected. Empty patches remain a legitimate no-op.
+
 ## [0.3.1] — 2026-07-31
 
 ### Fixed

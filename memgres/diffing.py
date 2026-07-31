@@ -69,6 +69,7 @@ def apply_diff(old: str, patch: str) -> str:
     lines = patch.split("\n")
     n = len(lines)
     p = 0
+    hunks = 0                   # guard: a non-empty patch must apply ≥1 hunk
 
     def marker_next(idx: int) -> bool:
         return idx + 1 < n and lines[idx + 1].startswith("\\ No newline")
@@ -80,8 +81,13 @@ def apply_diff(old: str, patch: str) -> str:
             continue
         m = _HUNK.match(line)
         if not m:
+            # A `@@`-line that isn't a valid header is a malformed hunk, not a
+            # skippable stray — reject it rather than silently dropping the edit.
+            if line.startswith("@@"):
+                raise DiffConflict(f"malformed hunk header: {line!r}")
             p += 1
             continue
+        hunks += 1
 
         old_start = int(m.group(1))
         # @@ lines are 1-based; a hunk adding to an empty side uses -0 → 0.
@@ -114,6 +120,11 @@ def apply_diff(old: str, patch: str) -> str:
             p += 1
 
     out.extend(src[i:])
+    # A non-empty patch that matched no hunk header applied nothing — that is a
+    # malformed / non-unified-diff payload, not a legitimate no-op. Fail loudly
+    # instead of silently returning the body unchanged.
+    if hunks == 0:
+        raise DiffConflict("patch contains no @@ hunk — malformed or not a unified diff")
     return "".join(out)
 
 
