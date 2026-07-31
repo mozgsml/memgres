@@ -9,7 +9,13 @@ on:
     tags: ['v*']
 
 jobs:
+  # Gate: a version tag must pass the full suite (the same reusable job CI runs)
+  # before anything is built or published. Prevents a red build reaching PyPI.
+  test:
+    uses: ./.github/workflows/test.yml
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
