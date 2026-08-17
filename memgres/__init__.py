@@ -15,6 +15,7 @@ Quick start::
     hits = store.recall(None, "what did I remember?")            # lexical or semantic
 """
 
+from ._version import __version__
 from .config import Config, load as load_config
 from .diffing import apply_diff, content_hash, make_diff, DiffConflict
 from .embeddings import Embedder, get_embedder
@@ -31,6 +32,7 @@ from .identity import (
 )
 
 __all__ = [
+    "__version__",
     "Config", "load_config",
     "Store", "Memory", "Conflict", "NotFound", "TooLarge", "NoParent",
     "make_diff", "apply_diff", "content_hash", "DiffConflict",

@@ -122,8 +122,9 @@ def test_list_memories_route(client):
 
 def test_info_route(client):
     info = client.get("/info").json()
-    assert set(info) == {"limits", "embed", "recall_modes", "vector_backend",
-                         "key_mode", "fts_language"}
+    assert set(info) == {"version", "schema_version", "limits", "embed",
+                         "recall_modes", "vector_backend", "key_mode", "fts_language"}
+    assert isinstance(info["version"], str) and info["version"]
     assert info["recall_modes"] == ["lexical"]     # embed provider none in fixture
     assert info["key_mode"] == "single"
     assert "database_url" not in info and "token" not in info

@@ -8,6 +8,11 @@ patch = fixes).
 ## [Unreleased]
 
 ### Added
+- **`server_info` now reports `version` and `schema_version`** — a client can tell
+  which memgres it's talking to (and which DB layout) without guessing. The
+  version is read from code (`memgres.__version__`), so an editable/dev checkout
+  reports what it's actually running, not stale install metadata. Exposed on both
+  the `memory_server_info` MCP tool and `GET /info`.
 - **Authoritative authorship in history** — every `memory_history` row now records
   the server-resolved principal (`author_user_id` + `author_token_id`) on each
   write, separate from the free-text `source`/`reason` a client supplies. In a

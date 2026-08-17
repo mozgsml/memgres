@@ -1,6 +1,6 @@
 [project]
 name = "memgres"
-version = "0.3.2"
+dynamic = ["version"]      # single source: memgres/_version.py (read at build time)
 description = "Drop-in memory for AI agents: one Postgres, lexical + semantic recall, diff-versioned history, GDPR-erasable."
 readme = "README.md"
 license = "MIT"
@@ -42,6 +42,9 @@ memgres-mcp = "memgres.mcp_server:main"
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = { attr = "memgres._version.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["memgres*"]

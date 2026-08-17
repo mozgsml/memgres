@@ -29,10 +29,22 @@ def test_top_level_keys_and_limits(monkeypatch):
     monkeypatch.setenv("MEMGRES_MAX_SOURCE_BYTES", "300")
     monkeypatch.setenv("MEMGRES_MAX_REASON_BYTES", "200")
     info = server_info(load())
-    assert set(info) == {"limits", "embed", "recall_modes", "vector_backend",
-                         "key_mode", "fts_language"}
+    assert set(info) == {"version", "schema_version", "limits", "embed",
+                         "recall_modes", "vector_backend", "key_mode", "fts_language"}
     assert info["limits"] == {"max_body_bytes": 9000, "max_write_bytes": 800,
                               "max_source_bytes": 300, "max_reason_bytes": 200}
+
+
+def test_reports_version_and_schema_version(monkeypatch):
+    # server_info must expose the running version (so a client can tell what it's
+    # talking to) and the DB schema version this build migrates to.
+    _clear(monkeypatch)
+    import memgres
+    from memgres.schema import SCHEMA_VERSION
+    info = server_info(load())
+    assert info["version"] == memgres.__version__      # from code, not stale metadata
+    assert isinstance(info["version"], str) and info["version"]
+    assert info["schema_version"] == SCHEMA_VERSION
 
 
 def test_recall_modes_lexical_when_no_embedder(monkeypatch):

@@ -218,10 +218,10 @@ def build_server(cfg: Optional[Config] = None):
 
     @mcp.tool()
     def memory_server_info(ctx: Context = None) -> dict:
-        """The server's effective limits and capabilities (write ceilings, embed
-        provider/model/dim, available recall modes, vector backend, key mode, FTS
-        language). Non-sensitive config only — no secrets. Read it once so you
-        aren't guessing the limits."""
+        """The server's version + schema_version and its effective limits and
+        capabilities (write ceilings, embed provider/model/dim, available recall
+        modes, vector backend, key mode, FTS language). Non-sensitive config only —
+        no secrets. Read it once so you aren't guessing the version or the limits."""
         from .info import server_info
         dim = embedder.dim if embedder is not None else None
         return server_info(cfg, embed_dim=dim)
