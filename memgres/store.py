@@ -229,12 +229,16 @@ class Store:
             raise NotFound(id)
         return row  # body, content_hash, tags, path, seq
 
-    def _update(self, ns, author, id, body, diff, base_hash, path, tags,
-                source, reason, ttl_days) -> Memory:
-        cur = self._conn.cursor()
-        cur_body, cur_hash, cur_tags, cur_path, seq = self._load(cur, ns, id)
+    def _resolve_new_body(self, cur_body, cur_hash, *, body, diff, base_hash):
+        """Decide the new body text + the body-op from whichever edit form was
+        given — a unified ``diff``, a whole ``body``, or neither (metadata-only).
+        Returns ``(new_body, op)`` with ``op`` in ``{"diff", "replace", None}``.
 
-        # decide the new body
+        This is the ONLY place that turns an edit form into ``new_body``: OCC
+        (``base_hash``) and the incoming-payload size limit are enforced here, and
+        everything downstream is a single path that recomputes the canonical diff
+        from ``cur_body → new_body``. New edit forms (e.g. substring replace) get
+        one branch here, never a parallel history path."""
         if diff is not None:
             if base_hash is None:
                 raise ValueError("a diff must carry base_hash (the body it was cut from)")
@@ -247,16 +251,21 @@ class Store:
             # guard: also catches an empty or net-zero diff).
             if new_body == cur_body:
                 raise DiffConflict("diff applied but changed nothing — empty or no-op diff")
-            op = "diff"
-        elif body is not None:
+            return new_body, "diff"
+        if body is not None:
             if base_hash is not None and base_hash != cur_hash:
                 raise Conflict(f"stale replace: base {base_hash[:12]} != current {cur_hash[:12]}")
             self._check_write_size(body)
-            new_body = body
-            op = "replace"
-        else:
-            new_body = cur_body           # metadata-only
-            op = None
+            return body, "replace"
+        return cur_body, None             # metadata-only
+
+    def _update(self, ns, author, id, body, diff, base_hash, path, tags,
+                source, reason, ttl_days) -> Memory:
+        cur = self._conn.cursor()
+        cur_body, cur_hash, cur_tags, cur_path, seq = self._load(cur, ns, id)
+
+        new_body, op = self._resolve_new_body(
+            cur_body, cur_hash, body=body, diff=diff, base_hash=base_hash)
 
         new_hash = content_hash(new_body)
         new_path = path if path is not None else cur_path
