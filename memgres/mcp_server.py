@@ -39,14 +39,36 @@ from .schema import migrate
 from .store import Store
 
 
-def _mcp(name: str):
-    # The SDK renamed FastMCP -> MCPServer; support both.
+# The MCP `initialize` response carries a server-side `instructions` string; a
+# client that honors it (e.g. Claude Code) loads it ONCE at connect, so it guides
+# the model without inflating every tool response. Kept small on purpose.
+MCP_INSTRUCTION_MAX_BYTES = 2048
+
+
+def _instruction_text() -> Optional[str]:
+    """Operator-supplied MCP instructions from ``MEMGRES_INSTRUCTION``, or None to
+    omit the field entirely. Capped at ``MCP_INSTRUCTION_MAX_BYTES`` on a UTF-8
+    boundary (clients truncate anyway; we truncate cleanly)."""
+    import os
+    raw = os.environ.get("MEMGRES_INSTRUCTION", "").strip()
+    if not raw:
+        return None
+    b = raw.encode("utf-8")
+    if len(b) <= MCP_INSTRUCTION_MAX_BYTES:
+        return raw
+    return b[:MCP_INSTRUCTION_MAX_BYTES].decode("utf-8", "ignore")
+
+
+def _mcp(name: str, instructions: Optional[str] = None):
+    # The SDK renamed FastMCP -> MCPServer; support both. ``instructions`` is
+    # emitted in the initialize response; None => the SDK omits it.
+    kw = {"instructions": instructions} if instructions else {}
     try:
         from mcp.server.mcpserver import MCPServer
-        return MCPServer(name)
+        return MCPServer(name, **kw)
     except ImportError:
         from mcp.server.fastmcp import FastMCP
-        return FastMCP(name)
+        return FastMCP(name, **kw)
 
 
 def _mem(m) -> dict:
@@ -65,7 +87,7 @@ def build_server(cfg: Optional[Config] = None):
                           max_size=cfg.pool_size, open=True)
     with pool.connection() as conn:
         migrate(conn, cfg)
-    mcp = _mcp("memgres")
+    mcp = _mcp("memgres", instructions=_instruction_text())
 
     # Should the LLM-facing tools carry a `token` argument at all?
     #   MEMGRES_MCP_TOKEN_ARG = on | off | auto (default).

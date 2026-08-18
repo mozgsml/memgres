@@ -24,6 +24,11 @@ patch = fixes).
   could mislead a model reading it.
 
 ### Added
+- **Server-side MCP `instructions`** — set `MEMGRES_INSTRUCTION` and the text is
+  emitted in the MCP `initialize` response, so a client that honors it (e.g.
+  Claude Code) loads it once at connect to guide how the model uses the memory
+  (without inflating every tool response). Optional — unset, the field is omitted
+  entirely — and byte-capped (2 KB, on a UTF-8 boundary) to stay small.
 - **Curated `title` + `memory_find`** — a memory can carry a short, human-curated
   `title` (set whole, distinct from the body's first-line preview), returned on
   `get`/`list`/recall hits. `memory_find` (MCP) / `GET /find` locate memories by

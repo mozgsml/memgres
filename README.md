@@ -181,6 +181,7 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_FULL_BODY` | `false` | force the whole body on every hit (off = auto: short whole, long sliced); `full_body` per call overrides |
 | `MEMGRES_FULL_BODY_MAX_CHARS` | `500` | a body this short is returned whole (`kind="full"`) instead of sliced |
 | `MEMGRES_LIST_PREVIEW_CHARS` | `120` | first-line preview length returned by `memory_list` |
+| `MEMGRES_INSTRUCTION` | — | server-side MCP instructions emitted at `initialize` (a client like Claude Code loads it once at connect); unset = omitted; capped at 2 KB |
 | `MEMGRES_VECTOR_BACKEND` | `pgvector` | `pgvector` (same DB) or `qdrant` (set `QDRANT_URL`, `QDRANT_API_KEY`, `MEMGRES_QDRANT_COLLECTION`) |
 | `MEMGRES_EMBED_PROVIDER` | `none` | `none` / `local` / `openai` / `jina` / `openai-compatible` (LM Studio, Ollama, vLLM, TEI…) |
 | `MEMGRES_EMBED_MODEL` / `_DIM` / `_API_KEY` / `_API_BASE` | — | model id · dimension (HTTP providers require it, `local` infers) · token · server URL |
