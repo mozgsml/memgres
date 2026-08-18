@@ -82,6 +82,19 @@ patch = fixes).
   hash chain, so stripping or swapping authorship is detectable by
   `verify_history`.
 
+### Security
+- **`replace_all` can no longer amplify a write into an out-of-memory.** A
+  substring `replace_all` multiplies `new` by every occurrence of `old`; the
+  result is now bounded against `MEMGRES_MAX_BODY_BYTES` **before** the string is
+  materialized (projected from the occurrence count), instead of only after —
+  closing a path where one authenticated write could allocate gigabytes.
+- **History hash fold is injective over its fields.** Each dimension folded into
+  the tamper-evident chain (author, title) now reduces every field to its own
+  fixed-width hash before joining, so a `\x1f` inside a client-supplied field
+  (e.g. a crafted title) can't shift a field boundary to collide two logically
+  different rows. (Impact was already negligible — the chain is unkeyed — but the
+  claimed property now actually holds.)
+
 ### Notes
 - Backward compatible: user-less writes (single mode, and the global-admin env
   token) stamp NULL author and hash **exactly** as before, so history chains

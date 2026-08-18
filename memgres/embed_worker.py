@@ -93,8 +93,10 @@ def maybe_start_worker(cfg, embedder, backend,
 
 def wire_server(cfg, embedder):
     """Server-side setup shared by the HTTP and MCP entrypoints: build the vector
-    backend, start the embed worker if warranted, and return ``(worker, cfg)``
-    where ``cfg.embed_async`` is set to match — True **iff** a worker is running.
+    backend ONCE, start the embed worker if warranted, and return
+    ``(worker, cfg, backend)`` where ``cfg.embed_async`` is set to match — True
+    **iff** a worker is running. The caller injects ``backend`` into every
+    per-request ``Store`` so a qdrant client isn't rebuilt each call.
 
     Tying async to the worker's existence is the safety rail: with a worker,
     writes defer to it (fast); without one, writes stay synchronous (embed
@@ -109,4 +111,4 @@ def wire_server(cfg, embedder):
     worker = maybe_start_worker(
         cfg, embedder, backend,
         connect=lambda: psycopg.connect(cfg.database_url or ""))
-    return worker, replace(cfg, embed_async=worker is not None)
+    return worker, replace(cfg, embed_async=worker is not None), backend

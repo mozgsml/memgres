@@ -21,20 +21,26 @@ from .vector.base import HIT_COLUMNS, Hit, build_filters, row_to_hit
 RRF_K = 60  # standard RRF damping constant
 
 
+def _tsquery(cfg, match: Optional[str], query: str):
+    """The tsquery SQL fragment + the query text to bind, shared by every lexical
+    search (body recall and title find). One expression is reused in both the
+    ``ts_rank`` score and the ``@@`` filter of a query.
+
+      all -> plainto_tsquery: every word ANDed (narrow).
+      any -> websearch_to_tsquery over the words joined by " or ": OR-any
+             (forgiving; default). websearch_to_tsquery is injection-safe and
+             reads a bare ``or`` as the operator, so user text can't inject syntax.
+
+    An empty query yields ``""`` → matches nothing (never everything)."""
+    match = match or cfg.lexical_match
+    if match == "all":
+        return "plainto_tsquery(%s::regconfig, %s)", query
+    return "websearch_to_tsquery(%s::regconfig, %s)", " or ".join(query.split())
+
+
 def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
              match: Optional[str] = None) -> List[Hit]:
-    match = match or cfg.lexical_match
-    # One tsquery expression, reused in both the ts_rank score and the @@ filter.
-    #   all -> plainto_tsquery: every word ANDed (narrow; current behavior).
-    #   any -> websearch_to_tsquery over the words joined by " or ": OR-any
-    #          (forgiving). websearch_to_tsquery is injection-safe and reads
-    #          bare `or` as the OR operator, so user text can't inject syntax.
-    if match == "all":
-        tsq = "plainto_tsquery(%s::regconfig, %s)"
-        qtext = query
-    else:
-        tsq = "websearch_to_tsquery(%s::regconfig, %s)"
-        qtext = " or ".join(query.split())  # empty query -> "" -> no matches
+    tsq, qtext = _tsquery(cfg, match, query)
     where, params = build_filters(ns, tags, path_prefix)
     sql = (
         f"SELECT {HIT_COLUMNS}, "
@@ -57,13 +63,7 @@ def find(conn, cfg, ns: str, query: str, *, tags: Optional[Sequence[str]] = None
     filters as recall (so it's multi-tenant safe by construction), but returns
     light rows ``{id, path, title, tags, score}`` — no body, no snippet, no vectors.
     Fast to scan before a heavier body recall, and works without an embedder."""
-    match = match or cfg.lexical_match
-    if match == "all":
-        tsq = "plainto_tsquery(%s::regconfig, %s)"
-        qtext = query
-    else:
-        tsq = "websearch_to_tsquery(%s::regconfig, %s)"
-        qtext = " or ".join(query.split())
+    tsq, qtext = _tsquery(cfg, match, query)
     where, params = build_filters(ns, tags, path_prefix)
     sql = (
         f"SELECT id, path::text, title, tags, ts_rank(title_fts, {tsq}) AS score "

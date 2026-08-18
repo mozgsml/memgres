@@ -258,6 +258,19 @@ def test_replace_edits_body_larger_than_write_cap(store):
     assert m2.body.endswith("DONE\n") and m2.seq == 2
 
 
+def test_replace_all_rejects_amplified_body_before_materializing(store):
+    # replace_all can multiply a small `new` by every occurrence; the result must
+    # be bounded against MAX_BODY_BYTES *before* the giant string is built, not
+    # after. old+new is tiny (passes the write cap), but the projected body isn't.
+    m = store.write(body="x" * 100)                 # 100 occurrences of "x"
+    store.cfg = store.cfg.__class__(**{**store.cfg.__dict__, "max_body_bytes": 200})
+    with pytest.raises(TooLarge):
+        store.write(id=m.id, replace=("x", "yyyy"), replace_all=True)  # →400B
+    # the body was never mutated (rejected up front, no seq bump)
+    after = store.get(None, m.id)
+    assert after.body == "x" * 100 and after.seq == 1
+
+
 def test_replace_requires_id(store):
     with pytest.raises(ValueError, match="id"):
         store.write(replace=("a", "b"))

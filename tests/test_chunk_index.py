@@ -9,6 +9,7 @@ backends. Sync mode (embed inline) so a write is immediately searchable.
 
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -19,6 +20,7 @@ psycopg = pytest.importorskip("psycopg")
 
 from memgres.config import load  # noqa: E402
 from memgres.embeddings import Embedder  # noqa: E402
+from memgres.identity import new_token  # noqa: E402
 from memgres.schema import migrate  # noqa: E402
 from memgres.store import Store  # noqa: E402
 
@@ -156,8 +158,11 @@ def test_qdrant_tail_coverage(qdrant_store):
 
 # ─── one many-chunk doc must not crowd distinct memories out of top-k ─────────
 def _flood_does_not_starve(store):
-    # a huge all-apple document (many chunks) + three small apple notes.
-    store.write(body="apple. " * 120, source="flood")
+    # A huge all-apple document with MORE chunks than one overfetch window
+    # (seg_chars=30 → "apple. "*300 ≈ 70 chunks > overfetch 30 for k=3), so round 1
+    # groups to just the flood and the iterative-exclude loop MUST run to reach the
+    # other memories. Plus three small apple notes.
+    store.write(body="apple. " * 300, source="flood")
     smalls = [store.write(body=f"apple note number {i}.\n").id for i in range(3)]
     hits = store.recall(None, "apple", mode="semantic", k=3)
     ids = [h.id for h in hits]
@@ -191,6 +196,38 @@ def test_pg_filters_apply(pg_store):
 
 def test_qdrant_filters_apply(qdrant_store):
     _filters_apply(qdrant_store)
+
+
+# ─── adversarial: semantic recall never crosses tenants (open mode) ───────────
+def _cross_tenant_semantic_isolation(store):
+    # Rebuild the store in OPEN mode on the same fresh DB + backend: two tokens →
+    # two namespaces. A semantic query in one namespace must never rank, snippet,
+    # or return the other's memory — exercising grouped_chunk_search's namespace
+    # filter AND the fetch_hit_rows namespace re-filter on BOTH backends.
+    cfg = replace(store.cfg, key_mode="open")
+    conn = store._conn
+    migrate(conn, cfg)
+    s = Store(cfg, embedder=store.embedder, conn=conn, backend=store._vectors)
+    ta, tb = new_token(), new_token()
+    a = s.write(ta, body="apple secret belonging to tenant A.\n")
+    b = s.write(tb, body="apple secret belonging to tenant B.\n")
+    assert s._authorize(ta, need="read")[0] != s._authorize(tb, need="read")[0]
+
+    a_hits = s.recall(ta, "apple", mode="semantic")
+    assert [h.id for h in a_hits] == [a.id]                 # only A's own
+    assert all("tenant B" not in (h.snippet or "") for h in a_hits)
+
+    b_hits = s.recall(tb, "apple", mode="semantic")
+    assert [h.id for h in b_hits] == [b.id]                 # only B's own
+    assert a.id not in [h.id for h in b_hits]
+
+
+def test_pg_cross_tenant_semantic_isolation(pg_store):
+    _cross_tenant_semantic_isolation(pg_store)
+
+
+def test_qdrant_cross_tenant_semantic_isolation(qdrant_store):
+    _cross_tenant_semantic_isolation(qdrant_store)
 
 
 if __name__ == "__main__":

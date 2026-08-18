@@ -86,10 +86,13 @@ class Config:
     # embedding pipeline (chunks are the semantic index; see docs/EMBEDDINGS.md)
     embed_async: bool            # write defers chunk-embedding to a background
                                  # worker (fast writes) instead of embedding
-                                 # inline. Off (default) = safe everywhere: the
-                                 # write embeds inline so semantic recall works
-                                 # with no worker (library/embedded). The server
-                                 # turns this on because it runs a worker.
+                                 # inline. NOT an env knob — it would be a footgun
+                                 # (async with no worker → rows flagged that
+                                 # nothing drains → silent semantic gap). It is
+                                 # derived: wire_server sets it True iff it started
+                                 # a worker; everywhere else it stays False (embed
+                                 # inline), so semantic recall is never silently
+                                 # behind. Operators toggle the worker instead.
     embed_worker: bool           # the server starts a background embed worker
     embed_worker_interval: float # seconds the idle worker sleeps between drains
     embed_batch: int             # memories embedded per drain batch
@@ -177,7 +180,7 @@ def load() -> Config:
         snippet_semantic=_bool("MEMGRES_SNIPPET_SEMANTIC", True),
         snippet_seg_chars=_int("MEMGRES_SNIPPET_SEG_CHARS", 400),
         snippet_seg_overlap=_int("MEMGRES_SNIPPET_SEG_OVERLAP", 80),
-        embed_async=_bool("MEMGRES_EMBED_ASYNC", False),
+        embed_async=False,   # runtime-only; wire_server flips it (see field doc)
         embed_worker=_bool("MEMGRES_EMBED_WORKER", True),
         embed_worker_interval=_float("MEMGRES_EMBED_WORKER_INTERVAL", 1.0),
         embed_batch=_int("MEMGRES_EMBED_BATCH", 16),

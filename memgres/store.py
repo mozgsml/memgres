@@ -84,13 +84,16 @@ def _sha(text: str) -> str:
 
 def _fold(digest: str, label: str, *fields: str) -> str:
     """Fold extra fields into a running digest through a DOMAIN-SEPARATED outer
-    hash (``label ‖ digest ‖ fields``) rather than appending to the flat field
-    list. `source`/`reason`/`title` are client free text that may contain the
-    ``\\x1f`` separator; concatenating a dimension alongside them would let a
-    crafted field absorb the delimiter and collide two logically different rows.
-    The label namespaces each dimension and the inner ``digest`` is fixed-width
-    hex, so the outer join can't be smuggled across a boundary."""
-    return _sha("\x1f".join((label, digest, *fields)))
+    hash rather than appending to the flat field list. `source`/`reason`/`title`
+    are client free text that may contain the ``\\x1f`` separator; concatenating
+    them raw would let a crafted field absorb a delimiter and collide two
+    logically different rows. So each field is first reduced to its own
+    fixed-width sha (``_sha(f)``) before the join: the label namespaces the
+    dimension, and every joined part (label, the inner digest, each field-hash) is
+    now fixed-width with no client bytes spanning a boundary — injective across
+    both dimensions AND the fields within one."""
+    parts = [label, digest, *(_sha(f) for f in fields)]
+    return _sha("\x1f".join(parts))
 
 
 def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
@@ -117,7 +120,8 @@ def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
 
 class Store:
     def __init__(self, cfg: Config, embedder: Optional[Embedder] = None,
-                 conn: Optional["psycopg.Connection"] = None):
+                 conn: Optional["psycopg.Connection"] = None,
+                 backend: object = None):
         self.cfg = cfg
         self.embedder = embedder if embedder is not None else get_embedder(cfg)
         # identity is on for open/managed; single mode is one shared space,
@@ -126,8 +130,11 @@ class Store:
         self._own_conn = conn is None
         self._conn = conn or psycopg.connect(cfg.database_url or "")
         # Vector backend picks itself from config (pgvector in-row by default,
-        # Qdrant out-of-band); None when there's no embedder (lexical-only).
-        self._vectors = make_backend(cfg, self.embedder)
+        # Qdrant out-of-band); None when there's no embedder (lexical-only). A
+        # server builds it ONCE and injects it here (a qdrant backend opens a
+        # client + does setup round-trips on construction, so per-request is
+        # wasteful); library/embedded use lets it default.
+        self._vectors = backend if backend is not None else make_backend(cfg, self.embedder)
 
     def close(self):
         if self._own_conn:
@@ -331,6 +338,17 @@ class Store:
                     f"replace text occurs {count}× — pass replace_all, or add "
                     f"surrounding context to make it unique: {old[:60]!r}")
             self._check_write_size(old + new)   # cap old+new, NOT the whole body
+            # Bound the RESULT before materializing it: replace_all over a
+            # many-occurrence body can multiply a 16 KB `new` by thousands of
+            # hits, so `cur_body.replace()` alone could allocate gigabytes (then
+            # hash + diff them) before the after-the-fact body-size check. Project
+            # the byte size from `count` and reject up front.
+            hits = count if replace_all else 1
+            projected = byte_len(cur_body) + hits * (byte_len(new) - byte_len(old))
+            if projected > self.cfg.max_body_bytes:
+                raise TooLarge(
+                    f"replace would grow the body to ~{projected}B > "
+                    f"MEMGRES_MAX_BODY_BYTES {self.cfg.max_body_bytes}")
             new_body = (cur_body.replace(old, new) if replace_all
                         else cur_body.replace(old, new, 1))
             if new_body == cur_body:
@@ -338,8 +356,10 @@ class Store:
             return new_body, "diff"             # lowers to the canonical diff path
         if body is not None:
             if base_hash is not None and base_hash != cur_hash:
-                raise Conflict(f"stale replace: base {base_hash[:12]} != current {cur_hash[:12]}")
+                raise Conflict(f"stale write: base {base_hash[:12]} != current {cur_hash[:12]}")
             self._check_write_size(body)
+            # op "replace" = a whole-body swap; the substring `replace` form above
+            # returns "diff" (it lowers to the canonical diff path).
             return body, "replace"
         return cur_body, None             # metadata-only
 

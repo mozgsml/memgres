@@ -86,7 +86,6 @@ def _base_env(monkeypatch):
     monkeypatch.setenv("MEMGRES_EMBED_MODEL", "stub")
     monkeypatch.setenv("MEMGRES_EMBED_DIM", "3")
     monkeypatch.setenv("MEMGRES_EMBED_API_KEY", "x")
-    monkeypatch.setenv("MEMGRES_EMBED_ASYNC", "true")       # defer to the worker
 
 
 @pytest.fixture
@@ -98,8 +97,8 @@ def async_pg(monkeypatch):
     conn = psycopg.connect(DSN)
     migrate(conn, load())
     emb = _CountingKeyword()
-    s = Store(load(), embedder=emb, conn=conn)
-    assert s.cfg.embed_async is True
+    s = Store(replace(load(), embed_async=True), embedder=emb, conn=conn)
+    assert s.cfg.embed_async is True     # runtime-only flag (no env knob)
     yield s, emb
     conn.close()
 
@@ -122,7 +121,7 @@ def async_qdrant(monkeypatch):
     conn = psycopg.connect(DSN)
     migrate(conn, load())
     emb = _CountingKeyword()
-    s = Store(load(), embedder=emb, conn=conn)
+    s = Store(replace(load(), embed_async=True), embedder=emb, conn=conn)
     yield s, emb
     conn.close()
 

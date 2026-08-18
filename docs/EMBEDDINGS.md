@@ -152,10 +152,11 @@ write is fast no matter how large the body or how slow the model — semantic re
 for that memory becomes available a moment later, once the worker drains it
 (`MEMGRES_EMBED_WORKER_INTERVAL`). Lexical recall is immediate either way.
 
-Embedded/library use (a `Store` with no server loop) keeps embedding **inline** by
-default (`MEMGRES_EMBED_ASYNC=false`), so a write is semantically searchable the
-instant it commits — no worker to run. Turn `MEMGRES_EMBED_ASYNC=true` on only if
-you drive draining yourself.
+Embedded/library use (a `Store` with no server loop) always embeds **inline**, so a
+write is semantically searchable the instant it commits — no worker to run. (The
+async behaviour isn't an env knob: the server derives it from whether it actually
+started a worker, so a deployment can never end up flagging rows that nothing
+drains.)
 
 ### 3. Documents vs queries
 

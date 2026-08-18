@@ -32,6 +32,19 @@ from typing import List, Optional, Tuple
 # ─── token format: mgk_ + 43 url-safe chars (256-bit) ────────────────────────
 TOKEN_RE = re.compile(r"^mgk_[A-Za-z0-9_-]{43}$")
 
+
+def bearer_token(authorization: Optional[str],
+                 x_memgres_token: Optional[str]) -> Optional[str]:
+    """Extract a raw memgres token from request auth headers — ``Authorization:
+    Bearer <tok>`` first, else the ``X-Memgres-Token`` header — or ``None`` if
+    neither is present. One definition for both the HTTP and MCP transports so
+    header parsing can't drift between them."""
+    if authorization and authorization[:7].lower() == "bearer ":
+        return authorization[7:].strip() or None
+    if x_memgres_token:
+        return x_memgres_token.strip() or None
+    return None
+
 # permission lattice
 _RANK = {"read": 1, "write": 2, "admin": 3}
 

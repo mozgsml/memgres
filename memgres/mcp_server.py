@@ -90,7 +90,7 @@ def build_server(cfg: Optional[Config] = None):
     # Start the background embed worker (if warranted) and flip cfg.embed_async to
     # match, so writes defer to it. Kept alive by its own daemon thread.
     from .embed_worker import wire_server
-    _worker, cfg = wire_server(cfg, embedder)
+    _worker, cfg, backend = wire_server(cfg, embedder)
     mcp = _mcp("memgres", instructions=_instruction_text())
 
     # Should the LLM-facing tools carry a `token` argument at all?
@@ -109,7 +109,7 @@ def build_server(cfg: Optional[Config] = None):
         expose_token = cfg.key_mode != "single" and not cfg.default_token
 
     def _store(conn):
-        return Store(cfg, embedder=embedder, conn=conn)
+        return Store(cfg, embedder=embedder, conn=conn, backend=backend)
 
     def _token(ctx, arg: Optional[str] = None) -> Optional[str]:
         """The caller's token, resolved **authoritatively** so a pin can't be
@@ -131,12 +131,10 @@ def build_server(cfg: Optional[Config] = None):
                 req = None
         if req is not None:
             try:
-                auth = req.headers.get("authorization") or ""
-                if auth[:7].lower() == "bearer ":
-                    return auth[7:].strip()
-                xt = req.headers.get("x-memgres-token")
-                if xt:
-                    return xt.strip()
+                tok = identity.bearer_token(req.headers.get("authorization"),
+                                            req.headers.get("x-memgres-token"))
+                if tok:
+                    return tok
             except Exception:
                 pass
         return cfg.default_token or arg or None
@@ -223,9 +221,7 @@ def build_server(cfg: Optional[Config] = None):
         `snippet=false` to skip slicing. `space`/`space_id` pick which namespace
         to search (default: yours)."""
         with pool.connection() as conn:
-            return [{"id": h.id, "title": h.title, "tags": h.tags, "path": h.path,
-                     "score": h.score, "snippet": h.snippet, "kind": h.kind,
-                     "lines": h.lines}
+            return [h.to_recall_dict()
                     for h in _store(conn).recall(
                         _token(ctx, token), query, k=k, tags=tags,
                         path_prefix=path_prefix, mode=mode, match=match,

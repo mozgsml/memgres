@@ -25,6 +25,7 @@ from typing import List, Optional
 
 import psycopg
 
+from . import identity
 from .config import Config, load
 from .diffing import DiffConflict
 from .embeddings import get_embedder
@@ -65,7 +66,7 @@ def create_app(cfg: Optional[Config] = None):
     with psycopg.connect(cfg.database_url or "") as _mc:
         migrate(_mc, cfg)               # idempotent; stamps embed model/dim
     from .embed_worker import wire_server
-    _worker, cfg = wire_server(cfg, embedder)
+    _worker, cfg, backend = wire_server(cfg, embedder)
     pool = ConnectionPool(cfg.database_url or "", min_size=1,
                           max_size=cfg.pool_size, open=False)
 
@@ -115,9 +116,7 @@ def create_app(cfg: Optional[Config] = None):
     # ─── auth: extract the namespace token ──────────────────────────────────
     def token(authorization: Optional[str] = Header(None),
               x_memgres_token: Optional[str] = Header(None)) -> Optional[str]:
-        tok = x_memgres_token
-        if not tok and authorization and authorization.lower().startswith("bearer "):
-            tok = authorization[7:]
+        tok = identity.bearer_token(authorization, x_memgres_token)
         tok = tok or cfg.default_token          # env default (single-tenant deployments)
         if cfg.key_mode != "single" and not tok:
             raise HTTPException(401, "token required")
@@ -127,7 +126,7 @@ def create_app(cfg: Optional[Config] = None):
         return m.to_dict()          # FastAPI JSON-encodes the raw datetimes
 
     def _store(conn):
-        return Store(cfg, embedder=embedder, conn=conn)
+        return Store(cfg, embedder=embedder, conn=conn, backend=backend)
 
     def _guard(fn):
         """Run a store call, mapping store exceptions to HTTP codes."""
@@ -271,9 +270,7 @@ def create_app(cfg: Optional[Config] = None):
                 tok, q, k=k, tags=taglist or None, path_prefix=path_prefix,
                 mode=mode, snippet=snippet, full_body=full_body,
                 space=space, space_id=space_id))
-            return [{"id": h.id, "title": h.title, "tags": h.tags, "path": h.path,
-                     "score": h.score, "snippet": h.snippet, "kind": h.kind,
-                     "lines": h.lines} for h in hits]
+            return [h.to_recall_dict() for h in hits]
 
     @app.get("/find")
     def find(q: str, k: int = 10,
@@ -289,8 +286,6 @@ def create_app(cfg: Optional[Config] = None):
                 match=match, space=space, space_id=space_id))
 
     # ─── spaces: what this token can reach ──────────────────────────────────
-    from . import identity
-
     def _me(conn, tok) -> str:
         """The caller's user id, or 401 if the token has no owning user."""
         p = identity.resolve(conn, cfg, tok)
@@ -377,9 +372,7 @@ def create_app(cfg: Optional[Config] = None):
 
     def admin(authorization: Optional[str] = Header(None),
               x_memgres_token: Optional[str] = Header(None)):
-        tok = x_memgres_token
-        if not tok and authorization and authorization.lower().startswith("bearer "):
-            tok = authorization[7:]
+        tok = identity.bearer_token(authorization, x_memgres_token)
         # constant-time compare; empty admin_token disables admin entirely
         if not cfg.admin_token or not tok or \
                 not _hmac.compare_digest(tok, cfg.admin_token):

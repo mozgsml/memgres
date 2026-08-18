@@ -61,6 +61,14 @@ class Hit:
     # winning chunk, so attach_snippets slices the snippet with no re-embedding.
     chunk_span: Optional[Tuple[int, int]] = None
 
+    def to_recall_dict(self) -> dict:
+        """The recall wire shape — one definition, so the HTTP and MCP layers
+        return the same keys and adding a field is a single edit. Omits the raw
+        body (dropped by attach_snippets) and the internal chunk_span."""
+        return {"id": self.id, "title": self.title, "tags": self.tags,
+                "path": self.path, "score": self.score, "snippet": self.snippet,
+                "kind": self.kind, "lines": self.lines}
+
 
 def _vec_literal(vec: Sequence[float]) -> str:
     """pgvector text literal for a float sequence: ``[a,b,c]``."""

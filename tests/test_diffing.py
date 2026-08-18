@@ -137,6 +137,19 @@ def test_title_and_author_fold_independently():
     assert both != no_author and both != no_title and no_author != no_title
 
 
+def test_title_fold_is_injective_over_its_two_fields():
+    # Security review #3: the two title fields are folded through per-field hashes,
+    # not a raw \x1f-join, so a \x1f inside one title can't shift the field boundary
+    # and collide two logically different retitles.
+    from memgres.store import _row_hash
+
+    a = _row_hash(None, "m", 1, "retitle", None, "h", None, None, None, None,
+                  None, None, "a\x1fb", "c")
+    b = _row_hash(None, "m", 1, "retitle", None, "h", None, None, None, None,
+                  None, None, "a", "b\x1fc")
+    assert a != b
+
+
 def test_author_cannot_be_forged_via_delimiter_in_reason():
     # Regression (security review #1): author is folded through a domain-separated
     # outer hash, NOT appended as more \x1f-joined fields. So an authored row must
