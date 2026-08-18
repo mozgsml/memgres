@@ -107,12 +107,14 @@ def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
 def _ts_headline(conn, cfg, ns: str, query: str, hits: List[Hit]) -> dict:
     """One batched ts_headline over every hit id — the lexical/fallback snippet.
     Returns {id: headline}. ids come from the already-ns-scoped ranked hits, so
-    the WHERE stays inside the caller's namespace (no cross-tenant read)."""
+    the WHERE stays inside the caller's namespace (no cross-tenant read).
+    ``StartSel``/``StopSel`` are emptied so the snippet is clean prose — no
+    ``<b>`` markers to mislead the model reading it."""
     ids = [h.id for h in hits]
     sql = (
         "SELECT id, ts_headline(%s::regconfig, body, "
         "plainto_tsquery(%s::regconfig, %s), "
-        "'MaxWords=40, MinWords=15, ShortWord=3') "
+        "'MaxWords=40, MinWords=15, ShortWord=3, StartSel=\"\", StopSel=\"\"') "
         "FROM memory WHERE namespace=%s AND id = ANY(%s)"
     )
     out: dict = {}
@@ -123,15 +125,31 @@ def _ts_headline(conn, cfg, ns: str, query: str, hits: List[Hit]) -> dict:
     return out
 
 
-def _best_segment_snippet(conn, cfg, embedder, backend, ns: str, hit: Hit,
-                          qvec: Sequence[float]) -> None:
-    """Set ``hit.snippet``/``hit.line`` from the body segment most similar to the
-    query. Uses the durable segment cache: compute+store on first sight of this
-    body, reuse after, recompute when the body changed (src_hash mismatch)."""
+def _lines_for(body: str, start: int, end: int) -> List[int]:
+    """1-based inclusive line range that the ``body[start:end]`` slice spans."""
+    if end <= start:
+        n = body.count("\n", 0, start) + 1
+        return [n, n]
+    return [body.count("\n", 0, start) + 1,
+            body.count("\n", 0, end - 1) + 1]
+
+
+def _set_full(hit: Hit, body: str) -> None:
+    """Return the whole body as the snippet (it's short, or the caller forced it)."""
+    hit.snippet = body
+    hit.kind = "full"
+    hit.lines = [1, body.count("\n") + 1] if body else [1, 1]
+
+
+def _best_segment_span(conn, cfg, embedder, backend, ns: str, hit: Hit,
+                       qvec: Sequence[float]) -> Optional[tuple]:
+    """Return ``(start, end)`` char offsets of the body segment most similar to
+    the query, or ``None`` for an empty/degenerate body. Uses the durable segment
+    cache: compute+store on first sight of this body, reuse after, recompute when
+    the body changed (src_hash mismatch)."""
     body = hit.body or ""
     if not body:
-        hit.snippet, hit.line = "", 1
-        return
+        return None
     src = content_hash(body)
     segs = backend.get_segments(conn, hit.id, ns, src)  # (seq, start, end, vec) or None
     if segs is None:
@@ -146,42 +164,63 @@ def _best_segment_snippet(conn, cfg, embedder, backend, ns: str, hit: Hit,
         sc = _cosine(qvec, vec)
         if best_score is None or sc > best_score:
             best_score, best_span = sc, (s, e)
-    if best_span is None:
-        hit.snippet, hit.line = body[:cfg.snippet_seg_chars], 1
-        return
-    bs, be = best_span
-    hit.snippet = body[bs:be]
-    hit.line = body[:bs].count("\n") + 1
+    return best_span
 
 
 def attach_snippets(conn, cfg, embedder, backend, ns: str, query: str, mode: str,
                     hits: List[Hit], *, snippet: Optional[bool],
                     full_body: Optional[bool]) -> List[Hit]:
-    """After ranking, hang a snippet (+line) on each hit and optionally drop the
-    full body. Semantic/hybrid hits pick their best-matching segment (embedded &
-    cached per body-hash); everything else uses Postgres ``ts_headline``."""
+    """After ranking, give every hit exactly one body view — never both a slice
+    and the whole thing. A hit gets the WHOLE body (``kind="full"``) when the
+    caller opts out of snippeting (``snippet=False``), forces ``full_body=True``,
+    or the body is short enough (≤ ``full_body_max_chars``) that a slice would
+    just repeat it. Otherwise it gets a SLICE (``kind="snippet"``): semantic/hybrid
+    pick the best-matching segment (embedded & cached per body-hash), everything
+    else uses Postgres ``ts_headline``. The raw ``body`` field is always dropped —
+    ``snippet`` carries the returned text, ``kind`` says which view it is."""
     snippet = cfg.snippet if snippet is None else snippet
     full_body = cfg.full_body if full_body is None else full_body
 
-    if snippet and hits:
+    # Partition: whole-body hits are settled now; the rest need a slice.
+    slice_hits: List[Hit] = []
+    for h in hits:
+        body = h.body or ""
+        if full_body or not snippet or len(body) <= cfg.full_body_max_chars:
+            _set_full(h, body)
+        else:
+            slice_hits.append(h)
+
+    if slice_hits:
         use_semantic = (mode in ("semantic", "hybrid") and cfg.snippet_semantic
                         and backend is not None and embedder is not None)
         if use_semantic:
             qvec = embedder.embed_query(query)   # once per call, not per hit
-            for h in hits:
-                _best_segment_snippet(conn, cfg, embedder, backend, ns, h, qvec)
+            for h in slice_hits:
+                body = h.body or ""
+                span = _best_segment_span(conn, cfg, embedder, backend, ns, h, qvec)
+                if span is None:
+                    _set_full(h, body)
+                    continue
+                bs, be = span
+                h.snippet = body[bs:be]
+                h.lines = _lines_for(body, bs, be)
+                h.kind = "snippet"
         else:
-            heads = _ts_headline(conn, cfg, ns, query, hits)  # one batched query
-            for h in hits:
+            heads = _ts_headline(conn, cfg, ns, query, slice_hits)  # one batched query
+            for h in slice_hits:
                 snip = heads.get(h.id)
-                if not snip:  # no match highlighted → a short head of the body
-                    snip = (h.body or "")[:200]
-                h.snippet = snip
-                h.line = None  # ts_headline gives no offset — fine
+                if snip:
+                    h.snippet = snip
+                    h.lines = None       # ts_headline gives no offset
+                    h.kind = "snippet"
+                else:                    # no highlighted match → bounded head slice
+                    body = h.body or ""
+                    h.snippet = body[:cfg.full_body_max_chars]
+                    h.lines = [1, h.snippet.count("\n") + 1]
+                    h.kind = "snippet"
 
-    if not full_body:  # after snippets: the best-segment path needs the body
-        for h in hits:
-            h.body = None
+    for h in hits:      # never leak the raw body as a separate field
+        h.body = None
     return hits
 
 

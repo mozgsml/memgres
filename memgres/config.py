@@ -67,9 +67,12 @@ class Config:
     fts_language: str            # Postgres FTS dict: simple | english | russian | …
     lexical_match: str           # any (OR-any words, default) | all (AND-all words)
     vector_backend: str          # pgvector (default) | qdrant
-    # snippets (a relevant slice of each recall hit's body + its line number)
-    snippet: bool                # attach a snippet+line to each hit
-    full_body: bool              # also return the whole body (off = snippet only)
+    # snippets (a relevant slice of each recall hit's body + its line range)
+    snippet: bool                # extract a relevant slice; off = return the body
+    full_body: bool              # force the whole body on every hit (off = auto:
+                                 # short bodies whole, long bodies sliced)
+    full_body_max_chars: int     # a body this short is returned whole (kind=full)
+                                 # instead of sliced — a slice would just repeat it
     snippet_semantic: bool       # semantic/hybrid hits use the best-matching
                                  # segment (needs the model); off = ts_headline,
                                  # avoiding per-query model calls on a paid API
@@ -106,6 +109,8 @@ class Config:
             raise ValueError("MEMGRES_SNIPPET_SEG_CHARS must be >= 1")
         if self.snippet_seg_overlap < 0:
             raise ValueError("MEMGRES_SNIPPET_SEG_OVERLAP must be >= 0")
+        if self.full_body_max_chars < 0:
+            raise ValueError("MEMGRES_FULL_BODY_MAX_CHARS must be >= 0")
         if self.max_write_bytes > self.max_body_bytes:
             raise ValueError(
                 "MEMGRES_MAX_WRITE_BYTES must be <= MEMGRES_MAX_BODY_BYTES"
@@ -148,7 +153,8 @@ def load() -> Config:
         lexical_match=_str("MEMGRES_LEXICAL_MATCH", "any"),
         vector_backend=_str("MEMGRES_VECTOR_BACKEND", "pgvector"),
         snippet=_bool("MEMGRES_SNIPPET", True),
-        full_body=_bool("MEMGRES_FULL_BODY", True),
+        full_body=_bool("MEMGRES_FULL_BODY", False),
+        full_body_max_chars=_int("MEMGRES_FULL_BODY_MAX_CHARS", 500),
         snippet_semantic=_bool("MEMGRES_SNIPPET_SEMANTIC", True),
         snippet_seg_chars=_int("MEMGRES_SNIPPET_SEG_CHARS", 400),
         snippet_seg_overlap=_int("MEMGRES_SNIPPET_SEG_OVERLAP", 80),

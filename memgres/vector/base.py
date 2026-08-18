@@ -19,17 +19,22 @@ from typing import List, Optional, Protocol, Sequence, Tuple
 @dataclass
 class Hit:
     id: str
-    body: Optional[str]           # the whole body; None when full_body is off
+    body: Optional[str]           # working copy for snippet extraction; always
+                                  # dropped to None before output (see `snippet`)
     tags: List[str]
     path: Optional[str]
     score: float
     title: str = ""               # curated caption (from HIT_COLUMNS)
-    # filled in by search.attach_snippets after ranking: the most relevant slice
-    # of the body plus its 1-based line (line is None for the ts_headline path,
-    # which has no offset). Trailing defaults keep row_to_hit the single
-    # construction point.
+    # filled in by search.attach_snippets after ranking. `snippet` is the text we
+    # return: the most relevant slice, or the whole body when it's short / forced.
+    # `kind` says which — "full" (snippet IS the entire body) vs "snippet" (a
+    # slice). `lines` is the 1-based inclusive line range the snippet spans, or
+    # None for the ts_headline path (Postgres gives no offset). `body` is dropped
+    # before output — the snippet field carries the returned text. Trailing
+    # defaults keep row_to_hit the single construction point.
     snippet: Optional[str] = None
-    line: Optional[int] = None
+    kind: Optional[str] = None
+    lines: Optional[List[int]] = None
 
 
 def _vec_literal(vec: Sequence[float]) -> str:

@@ -112,7 +112,7 @@ def test_semantic_recall_via_qdrant(store):
     store.write(body="cherry orchard notes\n", path="misc.cherry", tags=["tree"])
 
     top = store.recall(None, "apple apple", mode="semantic", k=1)
-    assert len(top) == 1 and "apple" in top[0].body
+    assert len(top) == 1 and "apple" in top[0].snippet
 
     # tag filter (enforced in PG after Qdrant ranks)
     fruit = store.recall(None, "cherry", mode="semantic", tags=["fruit"])

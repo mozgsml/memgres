@@ -266,14 +266,9 @@ def create_app(cfg: Optional[Config] = None):
                 tok, q, k=k, tags=taglist or None, path_prefix=path_prefix,
                 mode=mode, snippet=snippet, full_body=full_body,
                 space=space, space_id=space_id))
-            out = []
-            for h in hits:
-                d = {"id": h.id, "title": h.title, "tags": h.tags, "path": h.path,
-                     "score": h.score, "snippet": h.snippet, "line": h.line}
-                if h.body is not None:
-                    d["body"] = h.body
-                out.append(d)
-            return out
+            return [{"id": h.id, "title": h.title, "tags": h.tags, "path": h.path,
+                     "score": h.score, "snippet": h.snippet, "kind": h.kind,
+                     "lines": h.lines} for h in hits]
 
     @app.get("/find")
     def find(q: str, k: int = 10,

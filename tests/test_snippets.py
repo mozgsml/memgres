@@ -92,6 +92,9 @@ def _base_env(monkeypatch):
     # small segments so each sentence is its own tile (default 400 = one tile)
     monkeypatch.setenv("MEMGRES_SNIPPET_SEG_CHARS", "45")
     monkeypatch.setenv("MEMGRES_SNIPPET_SEG_OVERLAP", "0")
+    # force slicing for the multi-sentence bodies (≈101 chars): a low
+    # short-body threshold, else they'd be returned whole (kind="full").
+    monkeypatch.setenv("MEMGRES_FULL_BODY_MAX_CHARS", "20")
 
 
 @pytest.fixture
@@ -147,7 +150,8 @@ def _semantic_best_segment(store):
     h = _find(hits, m.id)
     assert "apples" in h.snippet
     assert "Bananas" not in h.snippet and "Cherries" not in h.snippet
-    assert h.line == 2                      # the apples sentence is line 2
+    assert h.kind == "snippet"
+    assert h.lines == [2, 2]                 # the apples sentence is line 2
 
 
 def test_pg_semantic_best_segment(pg_store):
@@ -206,10 +210,11 @@ def test_qdrant_invalidate_on_edit(qdrant_store):
 def _lexical_ts_headline(store):
     m = store.write(body=BODY)
     h = _find(store.recall(None, QUERY, mode="lexical"), m.id)
-    # ts_headline marks the matched word (default <b>…</b>)
+    # ts_headline snippet is clean prose — markers stripped (StartSel/StopSel="")
     assert "apples" in h.snippet
-    assert "<b>" in h.snippet or "<b>apples</b>" in h.snippet
-    assert h.line is None                    # ts_headline has no offset
+    assert "<b>" not in h.snippet
+    assert h.kind == "snippet"
+    assert h.lines is None                    # ts_headline has no offset
 
 
 def test_pg_lexical_ts_headline(pg_store):
@@ -220,16 +225,24 @@ def test_qdrant_lexical_ts_headline(qdrant_store):
     _lexical_ts_headline(qdrant_store)
 
 
-# ─── flags: snippet off / full_body off ──────────────────────────────────────
+# ─── flags: one body view per hit, never both ────────────────────────────────
 def _flags(store):
     m = store.write(body=BODY)
 
+    # snippet=False → skip slicing, return the whole body labelled full.
     no_snip = _find(store.recall(None, QUERY, mode="semantic", snippet=False), m.id)
-    assert no_snip.snippet is None and no_snip.body is not None
+    assert no_snip.kind == "full"
+    assert no_snip.snippet == BODY and no_snip.body is None
+    assert no_snip.lines == [1, BODY.count("\n") + 1]
 
-    no_body = _find(store.recall(None, QUERY, mode="semantic", full_body=False), m.id)
-    assert no_body.body is None and no_body.snippet is not None
-    assert "apples" in no_body.snippet
+    # full_body=True → force the whole body even though it would otherwise slice.
+    whole = _find(store.recall(None, QUERY, mode="semantic", full_body=True), m.id)
+    assert whole.kind == "full" and whole.snippet == BODY and whole.body is None
+
+    # default (long body > threshold) → a slice, body dropped.
+    sliced = _find(store.recall(None, QUERY, mode="semantic"), m.id)
+    assert sliced.kind == "snippet" and sliced.body is None
+    assert "apples" in sliced.snippet and sliced.snippet != BODY
 
 
 def test_pg_flags(pg_store):
@@ -238,6 +251,25 @@ def test_pg_flags(pg_store):
 
 def test_qdrant_flags(qdrant_store):
     _flags(qdrant_store)
+
+
+# ─── short body is returned whole (a slice would just repeat it) ──────────────
+def _short_body_full(store):
+    short = "Just apples here.\n"          # ≈18 chars < threshold (20)
+    m = store.write(body=short)
+    for mode in ("semantic", "lexical"):
+        h = _find(store.recall(None, QUERY, mode=mode), m.id)
+        assert h.kind == "full", mode
+        assert h.snippet == short and h.body is None
+        assert h.lines == [1, short.count("\n") + 1]
+
+
+def test_pg_short_body_full(pg_store):
+    _short_body_full(pg_store)
+
+
+def test_qdrant_short_body_full(qdrant_store):
+    _short_body_full(qdrant_store)
 
 
 # ─── MEMGRES_SNIPPET_SEMANTIC=false → ts_headline, no segments created ────────

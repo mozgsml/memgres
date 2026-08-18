@@ -189,23 +189,22 @@ def build_server(cfg: Optional[Config] = None):
         governs lexical word combination — defaults to OR-any (any query word
         matches, forgiving recall); set 'all' to require every word (narrow).
         Optionally scope to a tag set (`tags`) or a subtree (`path_prefix`, e.g.
-        'ops.postgres'). Each hit carries a `snippet` (+`line`) by default —
-        semantic/hybrid use the best-matching segment, lexical uses ts_headline;
-        pass `full_body=false` to get just the snippet, `snippet=false` for none.
-        `space`/`space_id` pick which namespace to search (default: yours)."""
+        'ops.postgres'). Each hit carries a `snippet` plus `kind` and `lines`:
+        `kind="snippet"` is the most relevant slice (semantic/hybrid pick the
+        best-matching segment, lexical uses ts_headline) with `lines`=[start,end];
+        `kind="full"` means the snippet IS the whole body (short body, or
+        `full_body=true`). Pass `full_body=true` to force whole bodies,
+        `snippet=false` to skip slicing. `space`/`space_id` pick which namespace
+        to search (default: yours)."""
         with pool.connection() as conn:
-            out = []
-            for h in _store(conn).recall(
-                    _token(ctx, token), query, k=k, tags=tags,
-                    path_prefix=path_prefix, mode=mode, match=match,
-                    snippet=snippet, full_body=full_body,
-                    space=space, space_id=space_id):
-                d = {"id": h.id, "title": h.title, "tags": h.tags, "path": h.path,
-                     "score": h.score, "snippet": h.snippet, "line": h.line}
-                if h.body is not None:
-                    d["body"] = h.body
-                out.append(d)
-            return out
+            return [{"id": h.id, "title": h.title, "tags": h.tags, "path": h.path,
+                     "score": h.score, "snippet": h.snippet, "kind": h.kind,
+                     "lines": h.lines}
+                    for h in _store(conn).recall(
+                        _token(ctx, token), query, k=k, tags=tags,
+                        path_prefix=path_prefix, mode=mode, match=match,
+                        snippet=snippet, full_body=full_body,
+                        space=space, space_id=space_id)]
 
     @mcp.tool()
     def memory_list(path_prefix: Optional[str] = None,

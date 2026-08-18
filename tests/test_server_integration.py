@@ -77,7 +77,7 @@ def test_crud_flow(client):
 
     # recall (lexical, auto)
     hits = client.get("/recall", params={"q": "there"}).json()
-    assert any("there" in h["body"] for h in hits)
+    assert any("there" in h["snippet"] for h in hits)   # short body → snippet==body
 
     # move
     r = client.post(f"/memories/{mid}/move", json={"path": "moved.here"})
@@ -116,10 +116,10 @@ def test_recall_tag_and_subtree_filters(client):
                                    "path": "markets.apple"})
     # tag filter
     hits = client.get("/recall", params={"q": "apple", "tags": "finance"}).json()
-    assert len(hits) == 1 and "ticker" in hits[0]["body"]
+    assert len(hits) == 1 and "ticker" in hits[0]["snippet"]
     # subtree filter
     hits = client.get("/recall", params={"q": "apple", "path_prefix": "recipes"}).json()
-    assert len(hits) == 1 and "recipe" in hits[0]["body"]
+    assert len(hits) == 1 and "recipe" in hits[0]["snippet"]
 
 
 def test_list_memories_route(client):

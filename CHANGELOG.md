@@ -7,6 +7,22 @@ patch = fixes).
 
 ## [Unreleased]
 
+### Changed
+- **Recall returns one body view per hit — never both a slice and the whole
+  body.** Each hit now carries `snippet` plus `kind` (`"snippet"` | `"full"`) and
+  `lines` (`[start, end]`, 1-based inclusive), replacing the old separate `body`
+  field and scalar `line`. A hit gets a **slice** (`kind="snippet"`) when its body
+  is long; semantic/hybrid pick the best-matching segment with an exact `lines`
+  range, lexical uses `ts_headline`. A body short enough that a slice would just
+  repeat it comes back **whole** (`kind="full"`, `lines=[1,N]`) — the threshold is
+  the new `MEMGRES_FULL_BODY_MAX_CHARS` (default 500). `MEMGRES_FULL_BODY` now
+  **defaults to `false`** (was `true`): pass `full_body=true` (per call or via env)
+  to force whole bodies, `snippet=false` to skip slicing. This trims recall
+  responses so an agent isn't handed a slice *and* a wall of text for every hit.
+- **Lexical/fallback snippets are now clean prose** — `ts_headline` runs with
+  empty `StartSel`/`StopSel`, so the returned text has no `<b>…</b>` markup that
+  could mislead a model reading it.
+
 ### Added
 - **Curated `title` + `memory_find`** — a memory can carry a short, human-curated
   `title` (set whole, distinct from the body's first-line preview), returned on

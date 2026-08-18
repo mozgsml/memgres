@@ -35,7 +35,7 @@ Reach for memgres when you want **auditable, authored, versioned text memory**.
 | **Hash-chained, GDPR-deletable history** | Tamper-evident provenance you can *still* erase: `forget()` hard-deletes the row, its vectors, and crypto-shreds the chain — no ["ghost vectors" left reconstructible in the index](https://arxiv.org/pdf/2606.18497). |
 | **Lexical works with zero embeddings** | Deploy with no model, no API, no GPU — Postgres full-text search out of the box. Turn on semantic recall only when you want it. |
 | **Lexical *and* semantic (hybrid)** | Exact identifiers/codes go to lexical (where [dense retrieval alone stumbles](https://tianpan.co/blog/2026-04-12-hybrid-search-production-bm25-dense-embeddings)); meaning-based queries go to vectors; hybrid fuses both with RRF. |
-| **Snippets, not walls of text** | Recall returns the most relevant slice of each hit plus its line number — semantic hits pick their best segment (embedded once, then cached), lexical uses `ts_headline`. Pass `full_body=false` for just the snippet. |
+| **Snippets, not walls of text** | Recall returns one body view per hit — never both a slice and the whole thing. Long hits come back as the most relevant slice (`kind="snippet"`) with its `lines` range; semantic hits pick their best segment (embedded once, then cached), lexical uses a clean `ts_headline` (no markup). A body short enough that a slice would just repeat it comes back whole (`kind="full"`). Pass `full_body=true` to force whole bodies. |
 | **Embedding-model safety by construction** | The model id + dimension are stamped into the schema; a mismatch **hard-fails** instead of silently returning garbage. |
 | **Optional TTL, renewed on read** | Off by default — memory is kept forever. Turn on a retention window and active memory persists because it's used, while abandoned memory expires itself: storage self-cleans instead of growing. |
 | **Optional multi-tenant identity** | Users, namespaces and rotatable scoped tokens when you need isolation; nothing to configure for single-user. |
@@ -177,7 +177,9 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_HISTORY` | `true` | keep the hash-chained diff history (deleted with the record) |
 | `MEMGRES_FTS_LANGUAGE` | `simple` | Postgres FTS dictionary (`simple`/`english`/…) |
 | `MEMGRES_LEXICAL_MATCH` | `any` | lexical query words OR-ed (`any`) or AND-ed (`all`); per-call `match` overrides |
-| `MEMGRES_SNIPPET` | `true` | attach a best-match snippet + line to each hit (`MEMGRES_SNIPPET_*` tune size/semantic; `full_body` per call) |
+| `MEMGRES_SNIPPET` | `true` | extract a best-match slice per hit (`MEMGRES_SNIPPET_*` tune size/semantic); `false` returns whole bodies |
+| `MEMGRES_FULL_BODY` | `false` | force the whole body on every hit (off = auto: short whole, long sliced); `full_body` per call overrides |
+| `MEMGRES_FULL_BODY_MAX_CHARS` | `500` | a body this short is returned whole (`kind="full"`) instead of sliced |
 | `MEMGRES_LIST_PREVIEW_CHARS` | `120` | first-line preview length returned by `memory_list` |
 | `MEMGRES_VECTOR_BACKEND` | `pgvector` | `pgvector` (same DB) or `qdrant` (set `QDRANT_URL`, `QDRANT_API_KEY`, `MEMGRES_QDRANT_COLLECTION`) |
 | `MEMGRES_EMBED_PROVIDER` | `none` | `none` / `local` / `openai` / `jina` / `openai-compatible` (LM Studio, Ollama, vLLM, TEI…) |

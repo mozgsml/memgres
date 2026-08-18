@@ -61,7 +61,7 @@ def _seed(monkeypatch):
 def test_any_returns_rows_matching_either_word(monkeypatch):
     s, conn = _seed(monkeypatch)
     hits = s.recall(None, "alpha omega", mode="lexical", match="any")
-    bodies = " ".join(h.body for h in hits)
+    bodies = " ".join(h.snippet for h in hits)   # short bodies → snippet==body
     assert len(hits) == 2 and "alpha" in bodies and "omega" in bodies
     conn.close()
 
