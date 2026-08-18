@@ -36,6 +36,16 @@ def _vec_literal(vec: Sequence[float]) -> str:
     return "[" + ",".join(repr(float(x)) for x in vec) + "]"
 
 
+# The memory columns every ranked hit needs, in Hit-field order. One definition so
+# lexical/pgvector/qdrant all SELECT the same set and adding a field is one edit.
+HIT_COLUMNS = "id, body, tags, path::text"
+
+
+def row_to_hit(row, score: float) -> "Hit":
+    """Build a Hit from a (HIT_COLUMNS) row plus a separately-supplied score."""
+    return Hit(str(row[0]), row[1], list(row[2]), row[3], float(score))
+
+
 def build_filters(ns: str, tags: Optional[Sequence[str]], path_prefix: Optional[str]):
     """Return (sql_fragment, params) for the shared WHERE tail."""
     sql = ["namespace = %s", "(expires_at IS NULL OR expires_at > now())"]

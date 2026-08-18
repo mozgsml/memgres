@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Sequence, Tuple
 
-from .base import Hit, _vec_literal, build_filters
+from .base import HIT_COLUMNS, Hit, _vec_literal, build_filters, row_to_hit
 
 
 def _parse_vec(text: str) -> List[float]:
@@ -38,7 +38,7 @@ class PgvectorBackend:
         qv = _vec_literal(query_vec)
         where, params = build_filters(ns, tags, path_prefix)
         sql = (
-            "SELECT id, body, tags, path::text, "
+            f"SELECT {HIT_COLUMNS}, "
             "1 - (embedding <=> %s::vector) AS score "
             f"FROM memory WHERE {where} AND embedding IS NOT NULL "
             "ORDER BY embedding <=> %s::vector ASC LIMIT %s"
@@ -46,8 +46,7 @@ class PgvectorBackend:
         args = [qv] + params + [qv, k]
         with conn.cursor() as cur:
             cur.execute(sql, args)
-            return [Hit(str(r[0]), r[1], list(r[2]), r[3], float(r[4]))
-                    for r in cur.fetchall()]
+            return [row_to_hit(r, r[4]) for r in cur.fetchall()]
 
     # ─── segment vectors (memory_segment table) ───────────────────────────────
     def upsert_segments(self, conn, memory_id: str, ns: str, src_hash: str,

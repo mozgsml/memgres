@@ -18,7 +18,7 @@ from typing import List, Optional, Sequence
 
 from .diffing import content_hash
 from .segments import segment
-from .vector.base import Hit, build_filters
+from .vector.base import HIT_COLUMNS, Hit, build_filters, row_to_hit
 
 RRF_K = 60  # standard RRF damping constant
 
@@ -39,7 +39,7 @@ def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
         qtext = " or ".join(query.split())  # empty query -> "" -> no matches
     where, params = build_filters(ns, tags, path_prefix)
     sql = (
-        "SELECT id, body, tags, path::text, "
+        f"SELECT {HIT_COLUMNS}, "
         f"ts_rank(fts, {tsq}) AS score "
         f"FROM memory WHERE {where} "
         f"AND fts @@ {tsq} "
@@ -48,8 +48,7 @@ def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
     args = [cfg.fts_language, qtext] + params + [cfg.fts_language, qtext, k]
     with conn.cursor() as cur:
         cur.execute(sql, args)
-        return [Hit(str(r[0]), r[1], list(r[2]), r[3], float(r[4]))
-                for r in cur.fetchall()]
+        return [row_to_hit(r, r[4]) for r in cur.fetchall()]
 
 
 def _rrf(lists: Sequence[List[Hit]], k: int) -> List[Hit]:

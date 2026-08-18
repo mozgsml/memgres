@@ -117,10 +117,7 @@ def create_app(cfg: Optional[Config] = None):
         return tok
 
     def _mem(m) -> dict:
-        return {"id": m.id, "content_hash": m.content_hash, "body": m.body,
-                "tags": m.tags, "path": m.path, "seq": m.seq,
-                "created_at": m.created_at, "updated_at": m.updated_at,
-                "expires_at": m.expires_at}
+        return m.to_dict()          # FastAPI JSON-encodes the raw datetimes
 
     def _store(conn):
         return Store(cfg, embedder=embedder, conn=conn)

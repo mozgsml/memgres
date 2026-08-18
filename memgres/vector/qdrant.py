@@ -30,7 +30,7 @@ import os
 import uuid
 from typing import List, Optional, Sequence, Tuple
 
-from .base import Hit, build_filters
+from .base import HIT_COLUMNS, Hit, build_filters, row_to_hit
 
 
 class QdrantBackend:
@@ -153,12 +153,11 @@ class QdrantBackend:
             return []
         score = {pid: s for pid, s in pairs}
         where, params = build_filters(ns, tags, path_prefix)  # ns, expiry, tags, subtree
-        sql = (f"SELECT id, body, tags, path::text FROM memory "
+        sql = (f"SELECT {HIT_COLUMNS} FROM memory "
                f"WHERE {where} AND id = ANY(%s)")
         with conn.cursor() as cur:
             cur.execute(sql, params + [list(score.keys())])
-            hits = [Hit(str(r[0]), r[1], list(r[2]), r[3], score[str(r[0])])
-                    for r in cur.fetchall()]
+            hits = [row_to_hit(r, score[str(r[0])]) for r in cur.fetchall()]
         hits.sort(key=lambda h: h.score, reverse=True)   # Qdrant order, minus PG-filtered
         return hits[:k]
 

@@ -50,10 +50,7 @@ def _mcp(name: str):
 
 
 def _mem(m) -> dict:
-    return {"id": m.id, "content_hash": m.content_hash, "body": m.body,
-            "tags": m.tags, "path": m.path, "seq": m.seq,
-            "created_at": str(m.created_at), "updated_at": str(m.updated_at),
-            "expires_at": str(m.expires_at) if m.expires_at else None}
+    return m.to_dict(stringify_dates=True)      # MCP layer needs plain strings
 
 
 def build_server(cfg: Optional[Config] = None):

@@ -65,6 +65,17 @@ class Memory:
     updated_at: object
     expires_at: object
 
+    def to_dict(self, *, stringify_dates: bool = False) -> dict:
+        """Serialize for an API layer. ``stringify_dates`` str()-coerces the
+        timestamps (the MCP layer needs plain strings; FastAPI JSON-encodes
+        datetimes itself, so the HTTP layer passes them through raw)."""
+        def d(v):
+            return (str(v) if v is not None else None) if stringify_dates else v
+        return {"id": self.id, "content_hash": self.content_hash, "body": self.body,
+                "tags": self.tags, "path": self.path, "seq": self.seq,
+                "created_at": d(self.created_at), "updated_at": d(self.updated_at),
+                "expires_at": d(self.expires_at)}
+
 
 def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
               diff: Optional[str], hash_after: Optional[str],
