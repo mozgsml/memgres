@@ -33,6 +33,7 @@ def server_info(cfg: Config, embed_dim: Optional[int] = None) -> dict:
             "max_write_bytes": cfg.max_write_bytes,
             "max_source_bytes": cfg.max_source_bytes,
             "max_reason_bytes": cfg.max_reason_bytes,
+            "max_title_bytes": cfg.max_title_bytes,
         },
         "embed": {
             "provider": cfg.embed_provider,

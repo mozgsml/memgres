@@ -46,7 +46,7 @@ class PgvectorBackend:
         args = [qv] + params + [qv, k]
         with conn.cursor() as cur:
             cur.execute(sql, args)
-            return [row_to_hit(r, r[4]) for r in cur.fetchall()]
+            return [row_to_hit(r, r[-1]) for r in cur.fetchall()]  # score = trailing col
 
     # ─── segment vectors (memory_segment table) ───────────────────────────────
     def upsert_segments(self, conn, memory_id: str, ns: str, src_hash: str,

@@ -48,7 +48,35 @@ def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
     args = [cfg.fts_language, qtext] + params + [cfg.fts_language, qtext, k]
     with conn.cursor() as cur:
         cur.execute(sql, args)
-        return [row_to_hit(r, r[4]) for r in cur.fetchall()]
+        return [row_to_hit(r, r[-1]) for r in cur.fetchall()]   # score = trailing col
+
+
+def find(conn, cfg, ns: str, query: str, *, tags: Optional[Sequence[str]] = None,
+         path_prefix: Optional[str] = None, k: int = 10,
+         match: Optional[str] = None) -> List[dict]:
+    """Locate memories whose TITLE matches — a light "where is it" search over the
+    curated title only (``title_fts``), never the body. Same tag/subtree/namespace
+    filters as recall (so it's multi-tenant safe by construction), but returns
+    light rows ``{id, path, title, tags, score}`` — no body, no snippet, no vectors.
+    Fast to scan before a heavier body recall, and works without an embedder."""
+    match = match or cfg.lexical_match
+    if match == "all":
+        tsq = "plainto_tsquery(%s::regconfig, %s)"
+        qtext = query
+    else:
+        tsq = "websearch_to_tsquery(%s::regconfig, %s)"
+        qtext = " or ".join(query.split())
+    where, params = build_filters(ns, tags, path_prefix)
+    sql = (
+        f"SELECT id, path::text, title, tags, ts_rank(title_fts, {tsq}) AS score "
+        f"FROM memory WHERE {where} AND title_fts @@ {tsq} "
+        "ORDER BY score DESC LIMIT %s"
+    )
+    args = [cfg.fts_language, qtext] + params + [cfg.fts_language, qtext, k]
+    with conn.cursor() as cur:
+        cur.execute(sql, args)
+        return [{"id": str(r[0]), "path": r[1], "title": r[2],
+                 "tags": list(r[3]), "score": float(r[4])} for r in cur.fetchall()]
 
 
 def _rrf(lists: Sequence[List[Hit]], k: int) -> List[Hit]:

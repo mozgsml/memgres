@@ -8,6 +8,16 @@ patch = fixes).
 ## [Unreleased]
 
 ### Added
+- **Curated `title` + `memory_find`** — a memory can carry a short, human-curated
+  `title` (set whole, distinct from the body's first-line preview), returned on
+  `get`/`list`/recall hits. `memory_find` (MCP) / `GET /find` locate memories by
+  their **title + tags** only — light rows `{id, path, title, tags, score}`, never
+  the body, no vectors — a cheap "where is it?" scan before a heavier recall (works
+  without an embedder). Title changes are audited in the hash-chained history
+  (`title_before`/`title_after`, op `retitle`) and folded into the chain **only
+  when the title actually changes**, the same domain-separated way as author — so
+  every pre-title row keeps its exact digest and still verifies. New
+  `MEMGRES_MAX_TITLE_BYTES` (default 256), reported in `server_info`.
 - **Substring edit (`replace`)** — edit a memory by sending `replace_old` →
   `replace_new` instead of hand-building a unified diff: the server finds
   `replace_old` in the current body and rewrites just it. `replace_old` must be

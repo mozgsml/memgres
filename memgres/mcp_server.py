@@ -141,6 +141,7 @@ def build_server(cfg: Optional[Config] = None):
                      replace_old: Optional[str] = None,
                      replace_new: Optional[str] = None, replace_all: bool = False,
                      path: Optional[str] = None, tags: Optional[List[str]] = None,
+                     title: Optional[str] = None,
                      source: Optional[str] = None, reason: Optional[str] = None,
                      ttl_days: Optional[int] = None,
                      space: Optional[str] = None, space_id: Optional[str] = None,
@@ -151,7 +152,8 @@ def build_server(cfg: Optional[Config] = None):
         it — no diff to hand-build, and a body larger than the write cap stays
         editable since only old+new are sent; `replace_old` must be unique unless
         `replace_all=true`); or a unified `diff` with the `base_hash` it was cut
-        from. `path`/`tags` set the tree position and labels; `source`/`reason`
+        from. `path`/`tags` set the tree position and labels; `title` is a short
+        curated caption (set whole, searchable via `memory_find`); `source`/`reason`
         record provenance. `space` picks one of your namespaces by name (`space_id`
         for a shared one); omit both to use your default."""
         replace = None
@@ -161,7 +163,7 @@ def build_server(cfg: Optional[Config] = None):
             return _mem(_store(conn).write(
                 _token(ctx, token), id=id or None, body=body, diff=diff,
                 base_hash=base_hash, replace=replace, replace_all=replace_all,
-                path=path, tags=tags, source=source,
+                path=path, tags=tags, title=title, source=source,
                 reason=reason, ttl_days=ttl_days, space=space, space_id=space_id))
 
     @mcp.tool()
@@ -198,7 +200,7 @@ def build_server(cfg: Optional[Config] = None):
                     path_prefix=path_prefix, mode=mode, match=match,
                     snippet=snippet, full_body=full_body,
                     space=space, space_id=space_id):
-                d = {"id": h.id, "tags": h.tags, "path": h.path,
+                d = {"id": h.id, "title": h.title, "tags": h.tags, "path": h.path,
                      "score": h.score, "snippet": h.snippet, "line": h.line}
                 if h.body is not None:
                     d["body"] = h.body
@@ -221,6 +223,21 @@ def build_server(cfg: Optional[Config] = None):
             return _store(conn).list(
                 _token(ctx, token), path_prefix=path_prefix, tags=tags,
                 limit=limit, offset=offset, space=space, space_id=space_id)
+
+    @mcp.tool()
+    def memory_find(query: str, k: int = 10, tags: Optional[List[str]] = None,
+                    path_prefix: Optional[str] = None,
+                    match: Optional[Literal["any", "all"]] = None,
+                    space: Optional[str] = None, space_id: Optional[str] = None,
+                    token: Optional[str] = None, ctx: Context = None) -> List[dict]:
+        """LOCATE by curated `title` (+ tags) — a light "where is it" search over
+        titles only, NEVER the body. Returns {id, path, title, tags, score} (no
+        body/snippet), so it's cheap to scan before a heavier `memory_recall`.
+        Works even without an embedder. Narrow by `tags`/`path_prefix`."""
+        with pool.connection() as conn:
+            return _store(conn).find(_token(ctx, token), query, k=k, tags=tags,
+                                     path_prefix=path_prefix, match=match,
+                                     space=space, space_id=space_id)
 
     @mcp.tool()
     def memory_server_info(ctx: Context = None) -> dict:

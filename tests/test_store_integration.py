@@ -263,6 +263,70 @@ def test_replace_requires_id(store):
         store.write(replace=("a", "b"))
 
 
+def test_title_set_and_returned(store):
+    m = store.write(body="b\n", title="My Note")
+    assert m.title == "My Note"
+    assert store.get(None, m.id).title == "My Note"
+    row = [r for r in store.list(None) if r["id"] == m.id][0]
+    assert row["title"] == "My Note"
+
+
+def test_title_change_audited_and_verifies(store):
+    m = store.write(body="b\n", title="First")
+    m2 = store.write(id=m.id, title="Second")          # title-only change
+    assert m2.title == "Second" and m2.seq == 2
+    h = store.history(None, m.id)
+    assert h[1]["op"] == "retitle"
+    assert h[1]["title_before"] == "First" and h[1]["title_after"] == "Second"
+    # the create row recorded the initial title (before None -> after "First")
+    assert h[0]["title_after"] == "First"
+    assert store.verify_history(None, m.id) is True
+
+
+def test_title_untouched_leaves_history_and_verify_intact(store):
+    # a body edit that doesn't touch the title records NULL title cols and the
+    # chain verifies — the no-title path must not perturb the hash.
+    m = store.write(body="one\n")                       # no title
+    store.write(id=m.id, body="two\n", reason="edit")   # body change, no title
+    h = store.history(None, m.id)
+    assert all(r["title_before"] is None and r["title_after"] is None for r in h)
+    assert store.verify_history(None, m.id) is True
+
+
+def test_title_clear_is_audited(store):
+    m = store.write(body="b\n", title="Some Title")
+    m2 = store.write(id=m.id, title="")                 # clear it
+    assert m2.title == ""
+    h = store.history(None, m.id)
+    assert h[1]["op"] == "retitle"
+    assert h[1]["title_before"] == "Some Title" and h[1]["title_after"] == ""
+    assert store.verify_history(None, m.id) is True
+
+
+def test_title_size_cap(store):
+    store.cfg = store.cfg.__class__(**{**store.cfg.__dict__, "max_title_bytes": 8})
+    with pytest.raises(TooLarge):
+        store.write(body="b\n", title="way too long a title")
+
+
+def test_find_matches_title_not_body(store):
+    # `store` has no embedder — find must work lexically, over the TITLE only.
+    a = store.write(body="the body mentions apples\n", title="Fruit Notes")
+    b = store.write(body="something about fruit here\n", title="Vegetable Notes")
+    hits = store.find(None, "fruit")
+    ids = [h["id"] for h in hits]
+    assert a.id in ids                 # 'fruit' is in a's TITLE
+    assert b.id not in ids             # b has 'fruit' only in its BODY → not matched
+    assert set(hits[0]) == {"id", "path", "title", "tags", "score"}   # light rows
+
+
+def test_find_respects_tag_filter(store):
+    store.write(body="x\n", title="alpha report", tags=["keep"])
+    store.write(body="y\n", title="alpha summary", tags=["drop"])
+    hits = store.find(None, "alpha", tags=["keep"])
+    assert len(hits) == 1 and hits[0]["title"] == "alpha report"
+
+
 def test_replace_and_retag(store):
     m = store.write(body="body\n", tags=["old"])
     m2 = store.write(id=m.id, body="new body\n", tags=["new"], reason="replace")

@@ -77,6 +77,7 @@ def create_app(cfg: Optional[Config] = None):
         body: str
         path: Optional[str] = None
         tags: Optional[List[str]] = None
+        title: Optional[str] = None
         source: Optional[str] = None
         reason: Optional[str] = None
         ttl_days: Optional[int] = None
@@ -92,6 +93,7 @@ def create_app(cfg: Optional[Config] = None):
         replace_all: bool = False
         path: Optional[str] = None
         tags: Optional[List[str]] = None
+        title: Optional[str] = None
         source: Optional[str] = None
         reason: Optional[str] = None
         ttl_days: Optional[int] = None
@@ -153,7 +155,7 @@ def create_app(cfg: Optional[Config] = None):
     def create(req: CreateBody, tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
             m = _guard(lambda: _store(conn).write(
-                tok, body=req.body, path=req.path, tags=req.tags,
+                tok, body=req.body, path=req.path, tags=req.tags, title=req.title,
                 source=req.source, reason=req.reason, ttl_days=req.ttl_days,
                 space=req.space, space_id=req.space_id))
             return _mem(m)
@@ -174,7 +176,8 @@ def create_app(cfg: Optional[Config] = None):
             m = _guard(lambda: _store(conn).write(
                 tok, id=mid, body=req.body, diff=req.diff, base_hash=req.base_hash,
                 replace=replace, replace_all=req.replace_all,
-                path=req.path, tags=req.tags, source=req.source, reason=req.reason,
+                path=req.path, tags=req.tags, title=req.title,
+                source=req.source, reason=req.reason,
                 ttl_days=req.ttl_days, space=req.space, space_id=req.space_id))
             return _mem(m)
 
@@ -265,12 +268,25 @@ def create_app(cfg: Optional[Config] = None):
                 space=space, space_id=space_id))
             out = []
             for h in hits:
-                d = {"id": h.id, "tags": h.tags, "path": h.path,
+                d = {"id": h.id, "title": h.title, "tags": h.tags, "path": h.path,
                      "score": h.score, "snippet": h.snippet, "line": h.line}
                 if h.body is not None:
                     d["body"] = h.body
                 out.append(d)
             return out
+
+    @app.get("/find")
+    def find(q: str, k: int = 10,
+             tags: Optional[str] = Query(None, description="comma-separated"),
+             path_prefix: Optional[str] = None, match: Optional[str] = None,
+             space: Optional[str] = None, space_id: Optional[str] = None,
+             tok: Optional[str] = Depends(token)):
+        """Locate by curated title (+ tags) — light rows, never the body."""
+        taglist = [t for t in (tags.split(",") if tags else []) if t]
+        with pool.connection() as conn:
+            return _guard(lambda: _store(conn).find(
+                tok, q, k=k, tags=taglist or None, path_prefix=path_prefix,
+                match=match, space=space, space_id=space_id))
 
     # ─── spaces: what this token can reach ──────────────────────────────────
     from . import identity

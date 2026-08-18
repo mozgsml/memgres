@@ -47,6 +47,7 @@ class Config:
     max_write_bytes: int         # one write/diff payload ceiling (<= max_body)
     max_source_bytes: int        # provenance `source` field ceiling (per write)
     max_reason_bytes: int        # provenance `reason` field ceiling (per write)
+    max_title_bytes: int         # curated `title` field ceiling (per write)
     # retention
     retention_days: int          # 0 = forever; >0 = expire N days after last touch
     renew_on_read: bool          # a read pushes the expiry clock forward
@@ -95,6 +96,8 @@ class Config:
             raise ValueError("MEMGRES_MAX_SOURCE_BYTES must be >= 1")
         if self.max_reason_bytes < 1:
             raise ValueError("MEMGRES_MAX_REASON_BYTES must be >= 1")
+        if self.max_title_bytes < 1:
+            raise ValueError("MEMGRES_MAX_TITLE_BYTES must be >= 1")
         if self.embed_max_seq < 0:
             raise ValueError("MEMGRES_EMBED_MAX_SEQ must be >= 0")
         if self.list_preview_chars < 0:
@@ -132,6 +135,7 @@ def load() -> Config:
         max_write_bytes=_int("MEMGRES_MAX_WRITE_BYTES", 16_384),      # 16 KB
         max_source_bytes=_int("MEMGRES_MAX_SOURCE_BYTES", 2_048),     # 2 KB
         max_reason_bytes=_int("MEMGRES_MAX_REASON_BYTES", 1_024),     # 1 KB
+        max_title_bytes=_int("MEMGRES_MAX_TITLE_BYTES", 256),         # 256 B
         retention_days=_int("MEMGRES_RETENTION_DAYS", 0),
         renew_on_read=_bool("MEMGRES_RENEW_ON_READ", True),
         token=_str("MEMGRES_TOKEN", ""),

@@ -23,10 +23,11 @@ class Hit:
     tags: List[str]
     path: Optional[str]
     score: float
+    title: str = ""               # curated caption (from HIT_COLUMNS)
     # filled in by search.attach_snippets after ranking: the most relevant slice
     # of the body plus its 1-based line (line is None for the ts_headline path,
-    # which has no offset). Trailing defaults keep Hit(id, body, tags, path,
-    # score) call sites in the backends working unchanged.
+    # which has no offset). Trailing defaults keep row_to_hit the single
+    # construction point.
     snippet: Optional[str] = None
     line: Optional[int] = None
 
@@ -36,14 +37,16 @@ def _vec_literal(vec: Sequence[float]) -> str:
     return "[" + ",".join(repr(float(x)) for x in vec) + "]"
 
 
-# The memory columns every ranked hit needs, in Hit-field order. One definition so
-# lexical/pgvector/qdrant all SELECT the same set and adding a field is one edit.
-HIT_COLUMNS = "id, body, tags, path::text"
+# The memory columns every ranked hit needs, in row_to_hit read-order. One
+# definition so lexical/pgvector/qdrant all SELECT the same set and adding a field
+# is one edit. Backends that also rank in SQL append their score column AFTER
+# these, so the score is row[len(HIT_COLUMNS)].
+HIT_COLUMNS = "id, body, tags, path::text, title"
 
 
 def row_to_hit(row, score: float) -> "Hit":
     """Build a Hit from a (HIT_COLUMNS) row plus a separately-supplied score."""
-    return Hit(str(row[0]), row[1], list(row[2]), row[3], float(score))
+    return Hit(str(row[0]), row[1], list(row[2]), row[3], float(score), title=row[4])
 
 
 def build_filters(ns: str, tags: Optional[Sequence[str]], path_prefix: Optional[str]):
