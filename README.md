@@ -186,6 +186,9 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_EMBED_PROVIDER` | `none` | `none` / `local` / `openai` / `jina` / `openai-compatible` (LM Studio, Ollama, vLLM, TEI…) |
 | `MEMGRES_EMBED_MODEL` / `_DIM` / `_API_KEY` / `_API_BASE` | — | model id · dimension (HTTP providers require it, `local` infers) · token · server URL |
 | `MEMGRES_EMBED_MAX_SEQ` | `0` | override the local model's max input length in tokens (`0` = the model's default) |
+| `MEMGRES_EMBED_ASYNC` | `false` | defer chunk-embedding to the background worker instead of embedding inline on the write. The server turns this on automatically when it runs a worker; leave it off for embedded/library use (writes embed synchronously, so semantic recall is correct immediately) |
+| `MEMGRES_EMBED_WORKER` | `true` | the HTTP/MCP server runs a background embed worker |
+| `MEMGRES_EMBED_WORKER_INTERVAL` / `_BATCH` | `1.0` / `16` | worker idle poll seconds · memories embedded per drain batch |
 
 ## HTTP API
 

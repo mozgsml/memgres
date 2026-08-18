@@ -124,24 +124,38 @@ were computed by the old model and don't live in the new space. Point at a fresh
 vector store (a new pgvector column via a clean schema, or a fresh
 `MEMGRES_QDRANT_COLLECTION`) and re-embed the bodies. Don't mix models in one store.
 
-### 2. Context window — guard against silent truncation
+### 2. Context window — chunking covers the whole body
 
 Every embedding model has a maximum input length; text beyond it is truncated
-**before** it's encoded. If a model's window is short (many models default to ~512
-tokens) and your memories are long, only the beginning is embedded and the tail is
-invisible to semantic search — with no error. This is the single most common cause of
-"semantic recall quietly gets worse."
+**before** it's encoded. memgres defends against this by indexing a memory as
+overlapping **chunks** (sized by `MEMGRES_SNIPPET_SEG_CHARS`, default 400 chars)
+rather than one vector of the whole body: each chunk is embedded and ranked
+independently, and recall keeps the best-matching chunk per memory. So the tail of
+a long memory is searchable, and a match deep in a document isn't drowned out by a
+single averaged vector — the failure mode ("only the beginning is embedded, the
+rest is invisible, with no error") no longer applies to whole memories.
 
-- Prefer a model whose window comfortably exceeds your typical memory length
-  (long-context embedding models exist for exactly this).
-- With `local`, sentence-transformers uses the model's configured `max_seq_length`.
-  Confirm it's the value you expect for that model, not a small default.
-- Keep individual memories reasonably sized. `MEMGRES_MAX_WRITE_BYTES` caps a single
-  write; large documents are better stored as several memories (a subtree) than one
-  body longer than the window.
+- A single **chunk** must still fit the model's window. Keep `SNIPPET_SEG_CHARS`
+  comfortably under the window (in characters ≈ tokens × 4). The default (400
+  chars) is safe for any real model.
+- With `local`, sentence-transformers uses the model's configured `max_seq_length`;
+  `MEMGRES_EMBED_MAX_SEQ` overrides it if the default is a small surprise.
 
 Whenever you change the indexing path, **verify actual recall quality on real
 queries** — not just "it ran without error." Silent degradation doesn't raise.
+
+### 2b. Embedding runs off the write path (server)
+
+On a server, a write flags the memory and returns immediately; a background worker
+segments, embeds, and indexes it (`MEMGRES_EMBED_WORKER`, on by default). So a
+write is fast no matter how large the body or how slow the model — semantic recall
+for that memory becomes available a moment later, once the worker drains it
+(`MEMGRES_EMBED_WORKER_INTERVAL`). Lexical recall is immediate either way.
+
+Embedded/library use (a `Store` with no server loop) keeps embedding **inline** by
+default (`MEMGRES_EMBED_ASYNC=false`), so a write is semantically searchable the
+instant it commits — no worker to run. Turn `MEMGRES_EMBED_ASYNC=true` on only if
+you drive draining yourself.
 
 ### 3. Documents vs queries
 

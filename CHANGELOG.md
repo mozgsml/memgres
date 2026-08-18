@@ -8,6 +8,23 @@ patch = fixes).
 ## [Unreleased]
 
 ### Changed
+- **Chunks are the semantic index; embedding moved off the write path.** A memory
+  is now indexed as its overlapping chunks, not one whole-body vector. Recall
+  ranks over the chunk vectors and keeps the **best chunk per memory** (one hit
+  per memory, whose winning chunk is also its snippet), so a match in the tail of
+  a long body is found (a single vector couldn't represent 60 KB) and one long
+  document can't crowd distinct memories out of the top-k (an iterative-exclude
+  loop, round-capped and logged, dedups by memory). A write no longer embeds
+  inline on the server: it flags the row and a background worker segments, embeds,
+  and indexes it — so a write returns fast regardless of body size. New settings
+  `MEMGRES_EMBED_ASYNC` (defer to the worker; the server turns this on by running
+  one), `MEMGRES_EMBED_WORKER` / `_WORKER_INTERVAL` / `_BATCH`. Embedded/library
+  use (no worker) stays synchronous by default, so semantic recall is correct the
+  instant a write commits. **Upgrade note (schema v6):** the old `memory.embedding`
+  column is dropped and every existing row is flagged once for re-chunking — the
+  worker rebuilds the index from the bodies on first run; bodies and history are
+  untouched, no manual reindex. A qdrant deployment can drop its old
+  `{collection}` doc-vector collection (chunks live in `{collection}_segments`).
 - **Recall returns one body view per hit — never both a slice and the whole
   body.** Each hit now carries `snippet` plus `kind` (`"snippet"` | `"full"`) and
   `lines` (`[start, end]`, 1-based inclusive), replacing the old separate `body`

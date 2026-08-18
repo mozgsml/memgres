@@ -1,0 +1,197 @@
+"""Chunk-based ranking: dedup, tail coverage, and the anti-flooding loop.
+
+Chunks are the semantic index, so recall must (a) return ONE hit per memory even
+when many of its chunks match, (b) find a match in the TAIL of a long body that a
+single whole-body vector would drown out, and (c) not let one many-chunk document
+crowd distinct memories out of the top-k (the iterative-exclude loop). Both
+backends. Sync mode (embed inline) so a write is immediately searchable.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import pytest  # noqa: E402
+
+psycopg = pytest.importorskip("psycopg")
+
+from memgres.config import load  # noqa: E402
+from memgres.embeddings import Embedder  # noqa: E402
+from memgres.schema import migrate  # noqa: E402
+from memgres.store import Store  # noqa: E402
+
+DSN = os.environ.get("MEMGRES_TEST_DSN",
+                     "postgresql://memgres:memgres@localhost:55432/memgres")
+QURL = os.environ.get("MEMGRES_TEST_QDRANT", "http://localhost:56333")
+COLL = "memgres_chunkidx_test"
+
+
+class _Keyword(Embedder):
+    dim = 3
+
+    def _vec(self, t):
+        t = t.lower()
+        v = [float(t.count("apple")), float(t.count("banana")), float(t.count("cherry"))]
+        n = sum(x * x for x in v) ** 0.5 or 1.0
+        return [x / n for x in v]
+
+    def embed_documents(self, texts):
+        return [self._vec(t) for t in texts]
+
+    def embed_query(self, t):
+        return self._vec(t)
+
+
+def _pg_reachable():
+    try:
+        psycopg.connect(DSN, connect_timeout=2).close()
+        return True
+    except Exception:
+        return False
+
+
+def _qdrant_reachable():
+    if not _pg_reachable():
+        return False
+    try:
+        import urllib.request
+        urllib.request.urlopen(f"{QURL}/collections", timeout=2)
+        return True
+    except Exception:
+        return False
+
+
+def _fresh_pg():
+    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+
+
+def _base_env(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith("MEMGRES_") or k == "QDRANT_URL":
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
+    monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
+    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "openai")   # shape only; stub injected
+    monkeypatch.setenv("MEMGRES_EMBED_MODEL", "stub")
+    monkeypatch.setenv("MEMGRES_EMBED_DIM", "3")
+    monkeypatch.setenv("MEMGRES_EMBED_API_KEY", "x")
+    # small chunks so a body splits into many, exercising grouping/tail/flooding
+    monkeypatch.setenv("MEMGRES_SNIPPET_SEG_CHARS", "30")
+    monkeypatch.setenv("MEMGRES_SNIPPET_SEG_OVERLAP", "0")
+
+
+@pytest.fixture
+def pg_store(monkeypatch):
+    if not _pg_reachable():
+        pytest.skip("no test Postgres")
+    _fresh_pg()
+    _base_env(monkeypatch)
+    conn = psycopg.connect(DSN)
+    migrate(conn, load())
+    s = Store(load(), embedder=_Keyword(), conn=conn)
+    yield s
+    conn.close()
+
+
+@pytest.fixture
+def qdrant_store(monkeypatch):
+    if not _qdrant_reachable():
+        pytest.skip("no test Postgres or Qdrant")
+    pytest.importorskip("qdrant_client")
+    _fresh_pg()
+    from qdrant_client import QdrantClient
+    qc = QdrantClient(url=QURL)
+    for coll in (COLL, f"{COLL}_segments"):
+        if qc.collection_exists(coll):
+            qc.delete_collection(coll)
+    _base_env(monkeypatch)
+    monkeypatch.setenv("MEMGRES_VECTOR_BACKEND", "qdrant")
+    monkeypatch.setenv("QDRANT_URL", QURL)
+    monkeypatch.setenv("MEMGRES_QDRANT_COLLECTION", COLL)
+    conn = psycopg.connect(DSN)
+    migrate(conn, load())
+    s = Store(load(), embedder=_Keyword(), conn=conn)
+    yield s
+    conn.close()
+
+
+# ─── one hit per memory even when many of its chunks match ───────────────────
+def _dedup_one_hit(store):
+    # a body of nothing but 'apple', split into several chunks
+    m = store.write(body="apple. " * 20)
+    hits = store.recall(None, "apple", mode="semantic", k=10)
+    assert len(hits) == 1 and hits[0].id == m.id     # not one-per-chunk
+
+
+def test_pg_dedup_one_hit(pg_store):
+    _dedup_one_hit(pg_store)
+
+
+def test_qdrant_dedup_one_hit(qdrant_store):
+    _dedup_one_hit(qdrant_store)
+
+
+# ─── a match in the TAIL of a long body is found (whole-body vector can't) ────
+def _tail_coverage(store):
+    # 40 banana sentences would dominate a single doc vector; the lone apple
+    # sentence is at the very end. Chunk ranking still finds it at ~1.0.
+    m = store.write(body=("banana. " * 40) + "apple sits right at the very end.")
+    hits = store.recall(None, "apple", mode="semantic", k=5)
+    ids = [h.id for h in hits]
+    assert m.id in ids
+    top = next(h for h in hits if h.id == m.id)
+    assert top.score > 0.9        # matched the pure-apple tail chunk, not a blend
+
+
+def test_pg_tail_coverage(pg_store):
+    _tail_coverage(pg_store)
+
+
+def test_qdrant_tail_coverage(qdrant_store):
+    _tail_coverage(qdrant_store)
+
+
+# ─── one many-chunk doc must not crowd distinct memories out of top-k ─────────
+def _flood_does_not_starve(store):
+    # a huge all-apple document (many chunks) + three small apple notes.
+    store.write(body="apple. " * 120, source="flood")
+    smalls = [store.write(body=f"apple note number {i}.\n").id for i in range(3)]
+    hits = store.recall(None, "apple", mode="semantic", k=3)
+    ids = [h.id for h in hits]
+    # k=3 distinct memories, and the flood didn't swallow every slot: at least two
+    # of the small notes surface (iterative-exclude past the many-chunk doc).
+    assert len(ids) == 3 and len(set(ids)) == 3
+    assert len(set(ids) & set(smalls)) >= 2
+
+
+def test_pg_flood_does_not_starve(pg_store):
+    _flood_does_not_starve(pg_store)
+
+
+def test_qdrant_flood_does_not_starve(qdrant_store):
+    _flood_does_not_starve(qdrant_store)
+
+
+# ─── filters (tags/subtree) still apply on top of grouped chunk ranking ───────
+def _filters_apply(store):
+    a = store.write(body="apple in tech.\n", path="tech.note", tags=["tech"])
+    store.write(body="apple in food.\n", path="food.note", tags=["food"])
+    tech = store.recall(None, "apple", mode="semantic", tags=["tech"])
+    assert [h.id for h in tech] == [a.id]
+    sub = store.recall(None, "apple", mode="semantic", path_prefix="food")
+    assert all(h.path.startswith("food") for h in sub)
+
+
+def test_pg_filters_apply(pg_store):
+    _filters_apply(pg_store)
+
+
+def test_qdrant_filters_apply(qdrant_store):
+    _filters_apply(qdrant_store)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
