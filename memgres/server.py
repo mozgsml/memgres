@@ -118,7 +118,7 @@ def create_app(cfg: Optional[Config] = None):
         tok = x_memgres_token
         if not tok and authorization and authorization.lower().startswith("bearer "):
             tok = authorization[7:]
-        tok = tok or cfg.token          # env default (single-tenant deployments)
+        tok = tok or cfg.default_token          # env default (single-tenant deployments)
         if cfg.key_mode != "single" and not tok:
             raise HTTPException(401, "token required")
         return tok

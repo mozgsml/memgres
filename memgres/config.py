@@ -57,7 +57,7 @@ class Config:
     retention_days: int          # 0 = forever; >0 = expire N days after last touch
     renew_on_read: bool          # a read pushes the expiry clock forward
     # multi-tenant isolation
-    token: str                   # default token used when a call passes none
+    default_token: str           # default token used when a call passes none
                                  # (set in MCP/env for a single-tenant deployment)
     # identity / tenancy (see docs/TENANCY.md)
     key_mode: str                # single | open | managed  (how tokens/users are minted)
@@ -162,7 +162,7 @@ def load() -> Config:
         max_title_bytes=_int("MEMGRES_MAX_TITLE_BYTES", 256),         # 256 B
         retention_days=_int("MEMGRES_RETENTION_DAYS", 0),
         renew_on_read=_bool("MEMGRES_RENEW_ON_READ", True),
-        token=_str("MEMGRES_TOKEN", ""),
+        default_token=_str("MEMGRES_TOKEN", ""),
         key_mode=_str("MEMGRES_KEY_MODE", "single"),
         admin_token=_str("MEMGRES_ADMIN_TOKEN", ""),
         tree_enabled=_bool("MEMGRES_TREE", True),

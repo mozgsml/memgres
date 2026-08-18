@@ -106,7 +106,7 @@ def build_server(cfg: Optional[Config] = None):
     elif _arg in ("0", "false", "off", "no"):
         expose_token = False
     else:
-        expose_token = cfg.key_mode != "single" and not cfg.token
+        expose_token = cfg.key_mode != "single" and not cfg.default_token
 
     def _store(conn):
         return Store(cfg, embedder=embedder, conn=conn)
@@ -139,7 +139,7 @@ def build_server(cfg: Optional[Config] = None):
                     return xt.strip()
             except Exception:
                 pass
-        return cfg.token or arg or None
+        return cfg.default_token or arg or None
 
     def _uid(conn, token: Optional[str]) -> str:
         """Resolve a token to its user id (for read-level identity tools)."""

@@ -145,7 +145,7 @@ class Store:
         token is required and the returned id-string is a namespace uuid."""
         if not self._identity_on:
             return "", None
-        token = token or self.cfg.token or None
+        token = token or self.cfg.default_token or None
         with self._conn.transaction():
             principal = identity.resolve(self._conn, self.cfg, token)
             nsid, perm = identity.resolve_space(

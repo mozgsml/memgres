@@ -34,32 +34,22 @@ class SchemaMismatch(RuntimeError):
     """The DB was built with settings incompatible with the current config."""
 
 
-def _sql(name: str) -> str:
-    return (MIGRATIONS_DIR / name).read_text(encoding="utf-8")
-
-
 def migrate(conn, cfg: Config) -> None:
     """Bring the database at `conn` to the schema `cfg` describes.
 
     `conn` is a psycopg connection. Runs in one transaction; raises
     :class:`SchemaMismatch` (and rolls back) on an incompatible existing stamp.
+
+    The numbered ``NNNN_*.sql`` files in ``migrations/`` are applied in filename
+    order — each is idempotent (``IF NOT EXISTS`` / guarded data steps), so a
+    re-run is a no-op and adding a migration is just dropping a new file. The
+    config-dependent pieces (tree, vector index, model/FTS stamp) run after, in
+    Python, because their DDL depends on the live config (dimension, dictionary).
     """
     with conn.transaction():
         with conn.cursor() as cur:
-            cur.execute(_sql("0001_core.sql"))
-            # identity tables (always applied, idempotent; empty in single mode)
-            cur.execute(_sql("0002_identity.sql"))
-            # author columns on history (always applied, idempotent; NULL in
-            # single mode). Folded into the hash chain only when present, so
-            # pre-upgrade chains stay verifiable — see store._row_hash.
-            cur.execute(_sql("0003_history_author.sql"))
-            # curated title + title FTS + audited title changes (idempotent;
-            # title defaults to '' and is folded into the chain only when it
-            # actually changes — see store._row_hash).
-            cur.execute(_sql("0004_title.sql"))
-            # chunks become the semantic index: add embed_pending, drop the old
-            # whole-body doc vector, flag existing rows for re-chunking (once).
-            cur.execute(_sql("0005_chunk_index.sql"))
+            for path in sorted(MIGRATIONS_DIR.glob("[0-9]*.sql")):
+                cur.execute(path.read_text(encoding="utf-8"))
             _apply_tree(cur, cfg)
             _apply_vector(cur, cfg)
             _stamp(cur, cfg)
@@ -169,3 +159,9 @@ def _stamp(cur, cfg: Config) -> None:
             "embed_dim=%s, updated_at=now() WHERE only_row",
             (cfg.embed_provider, cfg.embed_model, cfg.embed_dim),
         )
+
+    # Keep the recorded layout version current, so the meta row (and any drift
+    # check built on it) reflects the migrations actually applied, not just the
+    # version first stamped.
+    cur.execute("UPDATE memgres_meta SET schema_version=%s WHERE only_row "
+                "AND schema_version <> %s", (SCHEMA_VERSION, SCHEMA_VERSION))
