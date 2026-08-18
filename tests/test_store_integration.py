@@ -16,7 +16,10 @@ psycopg = pytest.importorskip("psycopg")
 from memgres.config import load  # noqa: E402
 from memgres.diffing import make_diff, content_hash, DiffConflict  # noqa: E402
 from memgres.schema import migrate  # noqa: E402
-from memgres.store import Store, Conflict, NotFound, TooLarge, NoParent  # noqa: E402
+from memgres.store import (  # noqa: E402
+    Store, Conflict, NotFound, TooLarge, NoParent,
+    ReplaceNotFound, AmbiguousReplace,
+)  # noqa: E402
 
 DSN = os.environ.get("MEMGRES_TEST_DSN",
                      "postgresql://memgres:memgres@localhost:55432/memgres")
@@ -197,6 +200,67 @@ def test_deleted_author_leaves_verifiable_stamp(monkeypatch):
     assert h[0]["author_name"] is None            # user row gone → no name
     assert s.verify_history(tok_admin, m.id, space_id=nsid) is True
     conn.close()
+
+
+def test_replace_substring_unique(store):
+    # content-addressed edit: send old→new, server finds & rewrites just that,
+    # records it as a normal diff in history.
+    m = store.write(body="alpha\nbeta\ngamma\n")
+    m2 = store.write(id=m.id, replace=("beta", "BETA changed"), reason="edit")
+    assert m2.body == "alpha\nBETA changed\ngamma\n" and m2.seq == 2
+    ops = [r["op"] for r in store.history(None, m.id)]
+    assert ops == ["create", "diff"]          # lowers to the canonical diff path
+    assert store.verify_history(None, m.id) is True
+
+
+def test_replace_not_found_leaves_record_untouched(store):
+    m = store.write(body="alpha\nbeta\n")
+    with pytest.raises(ReplaceNotFound):
+        store.write(id=m.id, replace=("zzz", "x"))
+    again = store.get(None, m.id)
+    assert again.body == "alpha\nbeta\n" and again.seq == 1
+
+
+def test_replace_ambiguous_requires_all_or_context(store):
+    m = store.write(body="x x x\n")
+    with pytest.raises(AmbiguousReplace):
+        store.write(id=m.id, replace=("x", "y"))          # 3 matches, no all
+    assert store.get(None, m.id).seq == 1                  # untouched
+    m2 = store.write(id=m.id, replace=("x", "y"), replace_all=True)
+    assert m2.body == "y y y\n" and m2.seq == 2
+
+
+def test_replace_first_only_by_default(store):
+    m = store.write(body="a-a-a\n")
+    # unique per occurrence? "a" appears 3× → ambiguous; use a unique old instead
+    m2 = store.write(id=m.id, replace=("a-a-a", "Z"))
+    assert m2.body == "Z\n"
+
+
+def test_replace_noop_is_rejected(store):
+    from memgres.diffing import DiffConflict
+    m = store.write(body="alpha\nbeta\n")
+    with pytest.raises(DiffConflict):
+        store.write(id=m.id, replace=("beta", "beta"))    # old == new
+    assert store.get(None, m.id).seq == 1
+
+
+def test_replace_edits_body_larger_than_write_cap(store):
+    # the point of replace: old+new cross the wire, not the whole body — so a body
+    # bigger than MAX_WRITE_BYTES stays editable (whole-body rewrite could not).
+    m = store.write(body="head\n" + ("filler line\n" * 40) + "TARGET\n")
+    store.cfg = store.cfg.__class__(**{**store.cfg.__dict__, "max_write_bytes": 20})
+    # a whole-body rewrite of this body would exceed the cap
+    with pytest.raises(TooLarge):
+        store.write(id=m.id, body=m.body + "x\n")
+    # but a small replace succeeds — only old+new are size-checked
+    m2 = store.write(id=m.id, replace=("TARGET", "DONE"))
+    assert m2.body.endswith("DONE\n") and m2.seq == 2
+
+
+def test_replace_requires_id(store):
+    with pytest.raises(ValueError, match="id"):
+        store.write(replace=("a", "b"))
 
 
 def test_replace_and_retag(store):

@@ -8,6 +8,16 @@ patch = fixes).
 ## [Unreleased]
 
 ### Added
+- **Substring edit (`replace`)** — edit a memory by sending `replace_old` →
+  `replace_new` instead of hand-building a unified diff: the server finds
+  `replace_old` in the current body and rewrites just it. `replace_old` must be
+  unique unless `replace_all=true` (else a clear error asks for more context);
+  a missing `replace_old` or a no-op (old == new) is rejected, never a silent
+  write. Because only `old`+`new` cross the wire (size-capped), a body larger
+  than `MEMGRES_MAX_WRITE_BYTES` stays editable — which a whole-body rewrite
+  can't do. It lowers to the existing diff+OCC path, so history stays a single
+  replayable, line-attributable chain (`base_hash` optional here; supplied adds
+  strict OCC). On the `memory_write` MCP tool and `PATCH /memories/{id}`.
 - **`server_info` now reports `version` and `schema_version`** — a client can tell
   which memgres it's talking to (and which DB layout) without guessing. The
   version is read from code (`memgres.__version__`), so an editable/dev checkout

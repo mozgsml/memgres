@@ -141,21 +141,30 @@ def build_server(cfg: Optional[Config] = None):
     @mcp.tool()
     def memory_write(body: Optional[str] = None, id: Optional[str] = None,
                      diff: Optional[str] = None, base_hash: Optional[str] = None,
+                     replace_old: Optional[str] = None,
+                     replace_new: Optional[str] = None, replace_all: bool = False,
                      path: Optional[str] = None, tags: Optional[List[str]] = None,
                      source: Optional[str] = None, reason: Optional[str] = None,
                      ttl_days: Optional[int] = None,
                      space: Optional[str] = None, space_id: Optional[str] = None,
                      token: Optional[str] = None, ctx: Context = None) -> dict:
         """Create or edit a memory. Omit `id` to create (needs `body`). To edit,
-        pass `id` plus either a whole new `body` or a unified `diff` with the
-        `base_hash` it was cut from (stale base -> conflict). `path`/`tags` set
-        the tree position and labels; `source`/`reason` record provenance.
-        `space` picks one of your namespaces by name (`space_id` for a shared
-        one); omit both to use your default."""
+        pass `id` plus ONE of: a whole new `body`; a substring edit
+        `replace_old`→`replace_new` (server finds `replace_old` and rewrites just
+        it — no diff to hand-build, and a body larger than the write cap stays
+        editable since only old+new are sent; `replace_old` must be unique unless
+        `replace_all=true`); or a unified `diff` with the `base_hash` it was cut
+        from. `path`/`tags` set the tree position and labels; `source`/`reason`
+        record provenance. `space` picks one of your namespaces by name (`space_id`
+        for a shared one); omit both to use your default."""
+        replace = None
+        if replace_old is not None or replace_new is not None:
+            replace = (replace_old or "", replace_new or "")
         with pool.connection() as conn:
             return _mem(_store(conn).write(
                 _token(ctx, token), id=id or None, body=body, diff=diff,
-                base_hash=base_hash, path=path, tags=tags, source=source,
+                base_hash=base_hash, replace=replace, replace_all=replace_all,
+                path=path, tags=tags, source=source,
                 reason=reason, ttl_days=ttl_days, space=space, space_id=space_id))
 
     @mcp.tool()

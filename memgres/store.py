@@ -45,6 +45,14 @@ class NoParent(ValueError):
     """MEMGRES_REQUIRE_PARENT is on and the node's parent path doesn't exist."""
 
 
+class ReplaceNotFound(ValueError):
+    """A substring `replace`'s `old` text does not occur in the current body."""
+
+
+class AmbiguousReplace(ValueError):
+    """A `replace`'s `old` occurs more than once and `replace_all` wasn't set."""
+
+
 @dataclass
 class Memory:
     id: str
@@ -157,7 +165,10 @@ class Store:
               base_hash: Optional[str] = None, path: Optional[str] = None,
               tags: Optional[Sequence[str]] = None, source: Optional[str] = None,
               reason: Optional[str] = None, ttl_days: Optional[int] = None,
+              replace: Optional[Sequence[str]] = None, replace_all: bool = False,
               space: Optional[str] = None, space_id: Optional[str] = None) -> Memory:
+        if replace is not None and id is None:
+            raise ValueError("replace edits an existing memory — pass its id")
         with self._conn.transaction():
             # authorize inside the tx so a lazily-created user/namespace commits
             # atomically with the write (or rolls back together on failure).
@@ -168,7 +179,8 @@ class Store:
                 return self._create(ns, author, body, path, tags, source, reason,
                                     ttl_days)
             return self._update(ns, author, id, body, diff, base_hash, path, tags,
-                                source, reason, ttl_days)
+                                source, reason, ttl_days,
+                                replace=replace, replace_all=replace_all)
 
     def _check_write_size(self, payload: Optional[str]):
         if payload is not None and byte_len(payload) > self.cfg.max_write_bytes:
@@ -229,16 +241,18 @@ class Store:
             raise NotFound(id)
         return row  # body, content_hash, tags, path, seq
 
-    def _resolve_new_body(self, cur_body, cur_hash, *, body, diff, base_hash):
+    def _resolve_new_body(self, cur_body, cur_hash, *, body, diff, base_hash,
+                          replace=None, replace_all=False):
         """Decide the new body text + the body-op from whichever edit form was
-        given — a unified ``diff``, a whole ``body``, or neither (metadata-only).
-        Returns ``(new_body, op)`` with ``op`` in ``{"diff", "replace", None}``.
+        given — a unified ``diff``, a substring ``replace`` (old, new), a whole
+        ``body``, or none (metadata-only). Returns ``(new_body, op)`` with ``op``
+        in ``{"diff", "replace", None}``.
 
         This is the ONLY place that turns an edit form into ``new_body``: OCC
         (``base_hash``) and the incoming-payload size limit are enforced here, and
         everything downstream is a single path that recomputes the canonical diff
-        from ``cur_body → new_body``. New edit forms (e.g. substring replace) get
-        one branch here, never a parallel history path."""
+        from ``cur_body → new_body`` — so every form is line-attributable history
+        with no parallel path."""
         if diff is not None:
             if base_hash is None:
                 raise ValueError("a diff must carry base_hash (the body it was cut from)")
@@ -252,6 +266,31 @@ class Store:
             if new_body == cur_body:
                 raise DiffConflict("diff applied but changed nothing — empty or no-op diff")
             return new_body, "diff"
+        if replace is not None:
+            # Content-addressed edit (Edit-tool ergonomics): the server finds `old`
+            # and rewrites it, so the client never hand-builds a unified diff and
+            # never ships the whole body — a >MAX_WRITE_BYTES body stays editable
+            # because only old+new cross the wire. base_hash is optional here: a
+            # unique `old` match against the FOR-UPDATE-locked body already guards
+            # drift; when supplied it adds strict OCC.
+            old, new = replace
+            if not old:
+                raise ValueError("replace `old` must be a non-empty string")
+            if base_hash is not None and base_hash != cur_hash:
+                raise Conflict(f"stale replace: base {base_hash[:12]} != current {cur_hash[:12]}")
+            count = cur_body.count(old)
+            if count == 0:
+                raise ReplaceNotFound(f"replace text not found in body: {old[:60]!r}")
+            if count > 1 and not replace_all:
+                raise AmbiguousReplace(
+                    f"replace text occurs {count}× — pass replace_all, or add "
+                    f"surrounding context to make it unique: {old[:60]!r}")
+            self._check_write_size(old + new)   # cap old+new, NOT the whole body
+            new_body = (cur_body.replace(old, new) if replace_all
+                        else cur_body.replace(old, new, 1))
+            if new_body == cur_body:
+                raise DiffConflict("replace changed nothing (old == new)")
+            return new_body, "diff"             # lowers to the canonical diff path
         if body is not None:
             if base_hash is not None and base_hash != cur_hash:
                 raise Conflict(f"stale replace: base {base_hash[:12]} != current {cur_hash[:12]}")
@@ -260,12 +299,13 @@ class Store:
         return cur_body, None             # metadata-only
 
     def _update(self, ns, author, id, body, diff, base_hash, path, tags,
-                source, reason, ttl_days) -> Memory:
+                source, reason, ttl_days, *, replace=None, replace_all=False) -> Memory:
         cur = self._conn.cursor()
         cur_body, cur_hash, cur_tags, cur_path, seq = self._load(cur, ns, id)
 
         new_body, op = self._resolve_new_body(
-            cur_body, cur_hash, body=body, diff=diff, base_hash=base_hash)
+            cur_body, cur_hash, body=body, diff=diff, base_hash=base_hash,
+            replace=replace, replace_all=replace_all)
 
         new_hash = content_hash(new_body)
         new_path = path if path is not None else cur_path

@@ -87,6 +87,9 @@ def create_app(cfg: Optional[Config] = None):
         body: Optional[str] = None
         diff: Optional[str] = None
         base_hash: Optional[str] = None
+        replace_old: Optional[str] = None
+        replace_new: Optional[str] = None
+        replace_all: bool = False
         path: Optional[str] = None
         tags: Optional[List[str]] = None
         source: Optional[str] = None
@@ -168,8 +171,12 @@ def create_app(cfg: Optional[Config] = None):
     @app.patch("/memories/{mid}")
     def edit(mid: str, req: EditBody, tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
+            replace = None
+            if req.replace_old is not None or req.replace_new is not None:
+                replace = (req.replace_old or "", req.replace_new or "")
             m = _guard(lambda: _store(conn).write(
                 tok, id=mid, body=req.body, diff=req.diff, base_hash=req.base_hash,
+                replace=replace, replace_all=req.replace_all,
                 path=req.path, tags=req.tags, source=req.source, reason=req.reason,
                 ttl_days=req.ttl_days, space=req.space, space_id=req.space_id))
             return _mem(m)
