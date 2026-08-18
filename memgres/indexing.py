@@ -1,0 +1,94 @@
+"""Chunk embedding: turn a memory body into chunk vectors, sync or via worker.
+
+One place builds the chunk index for a memory (`index_memory`), reached two ways:
+
+  * **synchronously**, inline in the write path (embedded/library mode, or a
+    server with the worker turned off) — the default, so semantic recall never
+    silently lags behind a write;
+  * **asynchronously**, by the background embed worker draining `embed_pending`
+    rows (the server's default: writes return fast, embedding runs off the
+    request path).
+
+Idempotent and crash-safe: `index_memory` skips a row whose chunks already match
+the body's content_hash, and clears `embed_pending` only when the body it
+embedded is still current — a concurrent edit bumps the hash and re-flags the
+row, so it's picked up again rather than lost. `drain` commits per row, so a
+crash mid-batch leaves the unfinished rows flagged for the next pass.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+from .diffing import content_hash
+from .segments import segment
+
+_log = logging.getLogger("memgres.indexing")
+
+
+def index_memory(conn, cfg, embedder, backend, memory_id: str, body: str,
+                 ns: str, src_hash: Optional[str] = None) -> bool:
+    """Build and store the chunk vectors for one memory, then clear its pending
+    flag. Returns True if it (re)embedded, False if the chunks were already
+    current (or there's nothing to embed). Does NOT manage the transaction — the
+    caller owns commit/rollback (the write path folds this into its own tx; the
+    worker commits per row)."""
+    src = src_hash or content_hash(body)
+    if backend is None or embedder is None:
+        _clear_pending(conn, memory_id, src)   # no vectors; don't leave it pending
+        return False
+    if backend.chunk_src_hash(conn, memory_id, ns) == src:
+        _clear_pending(conn, memory_id, src)   # already current for this body
+        return False
+    spans = segment(body, cfg.snippet_seg_chars, cfg.snippet_seg_overlap)
+    if spans:
+        vecs = embedder.embed_documents([body[s:e] for (s, e) in spans])
+        chunks = [(i, s, e, v) for i, ((s, e), v) in enumerate(zip(spans, vecs))]
+        backend.index_chunks(conn, memory_id, ns, src, chunks)
+    else:
+        backend.delete_chunks(conn, memory_id, ns)   # empty body → no chunks
+    _clear_pending(conn, memory_id, src)
+    return True
+
+
+def _clear_pending(conn, memory_id: str, src: str) -> None:
+    """Clear ``embed_pending`` only if the body is still the one we embedded
+    (guarded by content_hash). A concurrent edit changed the hash and re-set the
+    flag, so leaving it set hands the row to the next pass."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE memory SET embed_pending=false "
+            "WHERE id=%s AND content_hash=%s AND embed_pending",
+            (memory_id, src))
+
+
+def drain(conn, cfg, embedder, backend, limit: Optional[int] = None) -> int:
+    """Embed pending memories oldest-first, in batches, until none remain or a
+    batch makes no progress. Returns the count processed. Commits per row so
+    partial work survives a crash. Callable from the worker thread or
+    synchronously from a test/CLI (one connection, sequential)."""
+    batch = limit or cfg.embed_batch
+    total = 0
+    while True:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, body, namespace, content_hash FROM memory "
+                "WHERE embed_pending ORDER BY updated_at LIMIT %s", (batch,))
+            rows = cur.fetchall()
+        if not rows:
+            break
+        progressed = 0
+        for mid, body, ns, chash in rows:
+            try:
+                index_memory(conn, cfg, embedder, backend, str(mid),
+                             body or "", ns, chash)
+                conn.commit()
+                progressed += 1
+                total += 1
+            except Exception:
+                conn.rollback()
+                _log.exception("embed worker failed on memory %s; left pending", mid)
+        if progressed == 0:      # whole batch failed → don't spin on it
+            break
+    return total

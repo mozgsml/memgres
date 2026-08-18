@@ -177,10 +177,17 @@ class Store:
             raise NoParent(f"parent of '{path}' does not exist "
                            f"(MEMGRES_REQUIRE_PARENT is on)")
 
-    def _raw_vec(self, body: str) -> "Optional[list]":
-        if not self.embedder:
-            return None
-        return self.embedder.embed_documents([body])[0]
+    def _index_now(self, memory_id: str, body: str, ns: str, src_hash: str) -> None:
+        """Build this memory's chunk vectors inline, within the write transaction,
+        UNLESS the deployment defers to the background worker (``embed_async``).
+        In sync mode this keeps semantic recall correct the instant a write
+        commits (library/embedded, tests); in async mode the row stays
+        ``embed_pending`` for the worker and this is a no-op."""
+        if self.cfg.embed_async or self._vectors is None:
+            return
+        from .indexing import index_memory
+        index_memory(self._conn, self.cfg, self.embedder, self._vectors,
+                     memory_id, body, ns, src_hash)
 
     # ─── write: create, replace, diff, move, retag (one entrypoint) ─────────
     def write(self, token: Optional[str] = None, *, id: Optional[str] = None,
@@ -246,21 +253,21 @@ class Store:
         title = title or ""
         cur = self._conn.cursor()
         self._check_parent(cur, ns, path)
+        pending = self._vectors is not None   # chunks need (async or inline) embedding
         cur.execute(
             f"""INSERT INTO memory (namespace, body, content_hash, tags, path, fts,
-                    title, title_fts, seq, expires_at)
+                    title, title_fts, seq, embed_pending, expires_at)
                 VALUES (%s, %s, %s, %s, %s::ltree,
                         to_tsvector(%s::regconfig, %s),
                         %s, to_tsvector(%s::regconfig, %s),
-                        1, {self._expiry_sql(ttl_days)})
+                        1, %s, {self._expiry_sql(ttl_days)})
                 RETURNING id, created_at, updated_at, expires_at""",
             [ns, body, chash, tags, path, self.cfg.fts_language, body,
-             title, self.cfg.fts_language, title],
+             title, self.cfg.fts_language, title, pending],
         )
         mid, created, updated, expires = cur.fetchone()
-        if self._vectors is not None:
-            # pgvector: a second UPDATE in this same tx; qdrant: point upsert.
-            self._vectors.upsert_doc(self._conn, str(mid), self._raw_vec(body), ns)
+        if pending:
+            self._index_now(str(mid), body, ns, chash)   # inline unless async
         # store create as a diff-from-empty so the whole history is a self-contained
         # chain (empty → current), replayable forward for reconstruct/annotate. A
         # non-empty title at creation is audited (title_before None → title_after).
@@ -386,16 +393,19 @@ class Store:
             f"""UPDATE memory SET body=%s, content_hash=%s, tags=%s, path=%s::ltree,
                     fts=to_tsvector(%s::regconfig, %s),
                     title=%s, title_fts=to_tsvector(%s::regconfig, %s),
-                    seq=seq+1, updated_at=now(), expires_at={self._expiry_sql(ttl_days)}
+                    seq=seq+1, updated_at=now(),
+                    embed_pending=(embed_pending OR %s),
+                    expires_at={self._expiry_sql(ttl_days)}
                 WHERE id=%s
                 RETURNING seq, created_at, updated_at, expires_at""",
             [new_body, new_hash, new_tags, new_path,
              self.cfg.fts_language, new_body,
-             new_title, self.cfg.fts_language, new_title, id])
+             new_title, self.cfg.fts_language, new_title,
+             (body_changed and self._vectors is not None), id])
         new_seq, created, updated, expires = cur.fetchone()
         if body_changed and self._vectors is not None:
-            # pgvector: a second UPDATE in this same tx; qdrant: point upsert.
-            self._vectors.upsert_doc(self._conn, str(id), self._raw_vec(new_body), ns)
+            # only a body change re-chunks; path/tag/title edits leave vectors be.
+            self._index_now(str(id), new_body, ns, new_hash)   # inline unless async
         # store the canonical diff (recomputed) even for a whole-body replace, so
         # every body change is line-attributable and the chain stays replayable.
         stored_diff = make_diff(cur_body, new_body) if body_changed else None
@@ -601,11 +611,9 @@ class Store:
             cur.execute("DELETE FROM memory WHERE id=%s AND namespace=%s", (id, ns))
             deleted = cur.rowcount > 0
         if deleted and self._vectors is not None:
-            # drop the out-of-band vector too (no-op for the in-row pgvector backend)
-            self._vectors.delete_doc(self._conn, id, ns)
-            # and the durable segment cache (pgvector: FK-cascaded already; qdrant:
-            # a sibling collection, so this is the actual cleanup there)
-            self._vectors.delete_segments(self._conn, id)
+            # drop this memory's chunk vectors (pgvector: FK-cascaded already;
+            # qdrant: an out-of-band collection, so this is the real cleanup there)
+            self._vectors.delete_chunks(self._conn, id, ns)
         return deleted
 
     def purge_expired(self) -> int:

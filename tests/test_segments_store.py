@@ -1,7 +1,9 @@
-"""Segment-storage round-trips against live backends (pgvector + qdrant).
+"""Chunk-store round-trips against live backends (pgvector + qdrant).
 
-Storage only: upsert / get / stale-invalidate / replace / delete, plus the
-`forget` cascade and per-namespace isolation. No recall/snippet flow here.
+Storage contract only: index_chunks / chunk_src_hash / replace-all / delete, plus
+the `forget` cascade and per-namespace isolation. Ranking/snippet behaviour lives
+in test_snippets and test_search_integration; here we assert what the backend
+stores and scopes. Chunks are the semantic index now (no lazy read-cache).
 """
 
 import os
@@ -118,53 +120,57 @@ def _ns(store, token=None):
     return store._authorize(token, need="read")[0]
 
 
-def _approx(a, b, eps=1e-5):
-    return len(a) == len(b) and all(abs(x - y) < eps for x, y in zip(a, b))
+def _chunk_spans(store, memory_id):
+    """Backend-agnostic read-back of a memory's stored chunk spans as a set of
+    (seq, start, end), for asserting replace-all / index_chunks fidelity."""
+    if store.cfg.vector_backend == "qdrant":
+        from qdrant_client.models import (FieldCondition, Filter, MatchValue)
+        pts, _ = store._vectors.client.scroll(
+            store._vectors.chunks,
+            scroll_filter=Filter(must=[FieldCondition(
+                key="memory_id", match=MatchValue(value=str(memory_id)))]),
+            with_payload=True, limit=1000)
+        return {(int(p.payload["seq"]), int(p.payload["seg_start"]),
+                 int(p.payload["seg_end"])) for p in pts}
+    with store._conn.cursor() as cur:
+        cur.execute("SELECT seq, seg_start, seg_end FROM memory_segment "
+                    "WHERE memory_id=%s", (memory_id,))
+        return {(r[0], r[1], r[2]) for r in cur.fetchall()}
 
 
-def _seg_set(rows):
-    """Compare (seq, start, end) sets ignoring vector float noise."""
-    return {(r[0], r[1], r[2]) for r in rows}
+# Already-normalized unit vectors: qdrant normalizes under cosine, so both
+# backends round-trip the spans exactly.
+CHUNKS = [(0, 0, 5, [1.0, 0.0, 0.0]),
+          (1, 3, 11, [0.0, 1.0, 0.0]),
+          (2, 9, 14, [0.0, 0.0, 1.0])]
 
 
-# Unit vectors: qdrant normalizes stored vectors under cosine distance, so
-# using already-normalized vectors lets both backends round-trip them exactly.
-SEGS = [(0, 0, 5, [1.0, 0.0, 0.0]),
-        (1, 3, 11, [0.0, 1.0, 0.0]),
-        (2, 9, 14, [0.0, 0.0, 1.0])]
-
-
-def _roundtrip(store):
+def _index_contract(store):
     v = store._vectors
     conn = store._conn
     ns = _ns(store)
-    m = store.write(body="apple banana cherry body\n")
+    m = store.write(body="apple banana cherry body\n")   # writes chunks inline
     h = m.content_hash
 
-    # round-trip
-    v.upsert_segments(conn, m.id, ns, h, SEGS)
-    got = v.get_segments(conn, m.id, ns, h)
-    assert got is not None
-    assert _seg_set(got) == _seg_set(SEGS)
-    by_seq = {r[0]: r for r in got}
-    for seq, s, e, vec in SEGS:
-        assert by_seq[seq][1] == s and by_seq[seq][2] == e
-        assert _approx(by_seq[seq][3], vec)
+    # a plain write already indexed the body's chunks under its content_hash
+    assert v.chunk_src_hash(conn, m.id, ns) == h
+    # wrong namespace never reads another tenant's chunks (defense-in-depth)
+    assert v.chunk_src_hash(conn, m.id, "no-such-ns") is None
 
-    # stale invalidation: a different src_hash → None (caller recomputes)
-    assert v.get_segments(conn, m.id, ns, "deadbeefdeadbeef") is None
-    # wrong namespace → None even with the right memory_id + src_hash (defense-in-depth)
-    assert v.get_segments(conn, m.id, "no-such-ns", h) is None
+    # index_chunks replaces the whole set (explicit call, fixed spans)
+    v.index_chunks(conn, m.id, ns, "hash-two", CHUNKS)
+    assert _chunk_spans(store, m.id) == {(0, 0, 5), (1, 3, 11), (2, 9, 14)}
+    assert v.chunk_src_hash(conn, m.id, ns) == "hash-two"
 
-    # re-upsert replaces (old seqs gone)
-    v.upsert_segments(conn, m.id, ns, h, [(0, 0, 4, [5.0, 0.0, 0.0])])
-    got2 = v.get_segments(conn, m.id, ns, h)
-    assert _seg_set(got2) == {(0, 0, 4)}
+    # re-index with fewer chunks → old seqs gone (replace-all, not merge)
+    v.index_chunks(conn, m.id, ns, "hash-three", [(0, 0, 4, [1.0, 0.0, 0.0])])
+    assert _chunk_spans(store, m.id) == {(0, 0, 4)}
+    assert v.chunk_src_hash(conn, m.id, ns) == "hash-three"
 
-    # explicit delete
-    v.delete_segments(conn, m.id)
-    assert v.get_segments(conn, m.id, ns, h) is None
-    return m
+    # explicit delete drops them all
+    v.delete_chunks(conn, m.id, ns)
+    assert v.chunk_src_hash(conn, m.id, ns) is None
+    assert _chunk_spans(store, m.id) == set()
 
 
 def _forget_cascade(store):
@@ -172,83 +178,77 @@ def _forget_cascade(store):
     conn = store._conn
     ns = _ns(store)
     m = store.write(body="apple pie to forget\n")
-    v.upsert_segments(conn, m.id, ns, m.content_hash, SEGS)
-    assert v.get_segments(conn, m.id, ns, m.content_hash) is not None
+    assert v.chunk_src_hash(conn, m.id, ns) is not None
     store.forget(None, m.id)
-    assert v.get_segments(conn, m.id, ns, m.content_hash) is None
+    assert v.chunk_src_hash(conn, m.id, ns) is None
+    assert _chunk_spans(store, m.id) == set()
 
 
 # ─── pgvector ────────────────────────────────────────────────────────────────
-def test_pg_roundtrip(pg_store):
-    _roundtrip(pg_store)
+def test_pg_index_contract(pg_store):
+    _index_contract(pg_store)
 
 
 def test_pg_forget_cascade(pg_store):
     _forget_cascade(pg_store)
 
 
-def test_pg_segments_carry_namespace(pg_store):
-    # Two namespaces (open mode would need tokens); here confirm the column is
-    # stamped with the writing namespace and a foreign memory_id never leaks in.
+def test_pg_chunks_carry_namespace(pg_store):
     v = pg_store._vectors
     conn = pg_store._conn
     ns = _ns(pg_store)
     a = pg_store.write(body="apple a\n")
     b = pg_store.write(body="banana b\n")
-    v.upsert_segments(conn, a.id, ns, a.content_hash, [(0, 0, 3, [1.0, 0.0, 0.0])])
-    v.upsert_segments(conn, b.id, ns, b.content_hash, [(0, 0, 3, [0.0, 1.0, 0.0])])
     with conn.cursor() as cur:
-        cur.execute("SELECT namespace FROM memory_segment WHERE memory_id=%s", (a.id,))
+        cur.execute("SELECT DISTINCT namespace FROM memory_segment WHERE memory_id=%s",
+                    (a.id,))
         assert {r[0] for r in cur.fetchall()} == {ns}
-    # querying b's id never returns a's segments (memory_id isolation)
-    assert _seg_set(v.get_segments(conn, b.id, ns, b.content_hash)) == {(0, 0, 3)}
+    # a foreign namespace never reads a's chunks
+    assert v.chunk_src_hash(conn, a.id, "elsewhere") is None
+    assert v.chunk_src_hash(conn, b.id, ns) == b.content_hash
 
 
 # ─── qdrant ──────────────────────────────────────────────────────────────────
-def test_qdrant_roundtrip(qdrant_store):
-    _roundtrip(qdrant_store)
+def test_qdrant_index_contract(qdrant_store):
+    _index_contract(qdrant_store)
 
 
 def test_qdrant_forget_cascade(qdrant_store):
     _forget_cascade(qdrant_store)
 
 
-def test_qdrant_segments_collection_and_index(qdrant_store):
+def test_qdrant_chunk_collection_and_indexes(qdrant_store):
     from qdrant_client import QdrantClient
     qc = QdrantClient(url=QURL)
-    seg_coll = f"{COLL}_segments"
-    assert qc.collection_exists(seg_coll)
-    schema = qc.get_collection(seg_coll).payload_schema or {}
-    assert "memory_id" in schema
+    chunks_coll = f"{COLL}_segments"
+    assert qc.collection_exists(chunks_coll)
+    schema = qc.get_collection(chunks_coll).payload_schema or {}
+    assert "memory_id" in schema and "namespace" in schema
 
 
-def test_qdrant_segments_carry_namespace(qdrant_store):
+def test_qdrant_chunks_carry_namespace(qdrant_store):
     v = qdrant_store._vectors
     conn = qdrant_store._conn
     ns = _ns(qdrant_store)
     a = qdrant_store.write(body="apple a\n")
     b = qdrant_store.write(body="banana b\n")
-    v.upsert_segments(conn, a.id, ns, a.content_hash, [(0, 0, 3, [1.0, 0.0, 0.0])])
-    v.upsert_segments(conn, b.id, ns, b.content_hash, [(0, 0, 3, [0.0, 1.0, 0.0])])
-    # namespace lives in each segment point's payload
+    # namespace lives in each chunk point's payload
     from qdrant_client import QdrantClient
     from qdrant_client.models import FieldCondition, Filter, MatchValue
     qc = QdrantClient(url=QURL)
     pts, _ = qc.scroll(
         f"{COLL}_segments",
         scroll_filter=Filter(must=[FieldCondition(key="memory_id",
-                                                  match=MatchValue(value=a.id))]),
+                                                  match=MatchValue(value=str(a.id)))]),
         with_payload=True, limit=100)
     assert pts and all(p.payload["namespace"] == ns for p in pts)
-    # b's id never yields a's segments
-    assert _seg_set(v.get_segments(conn, b.id, ns, b.content_hash)) == {(0, 0, 3)}
+    assert v.chunk_src_hash(conn, a.id, "elsewhere") is None
 
 
 def test_qdrant_two_namespaces_isolated(qdrant_store, monkeypatch):
-    """Open mode: two tokens → two namespaces. A segment set written under ns A
-    is keyed to A's memory and never surfaces for a memory in ns B."""
+    """Open mode: two tokens → two namespaces. A memory's chunks are keyed to its
+    namespace and never surface under the other's."""
     from memgres.identity import new_token
-    # rebuild the store in open mode on the same fresh PG + qdrant collections
     monkeypatch.setenv("MEMGRES_KEY_MODE", "open")
     cfg = load()
     conn = qdrant_store._conn
@@ -261,16 +261,14 @@ def test_qdrant_two_namespaces_isolated(qdrant_store, monkeypatch):
     ns_b = s._authorize(tok_b, need="read")[0]
     assert ns_a != ns_b
     v = s._vectors
-    v.upsert_segments(conn, a.id, ns_a, a.content_hash, [(0, 0, 3, [1.0, 0.0, 0.0])])
-    v.upsert_segments(conn, b.id, ns_b, b.content_hash, [(0, 0, 3, [0.0, 1.0, 0.0])])
-    assert _seg_set(v.get_segments(conn, a.id, ns_a, a.content_hash)) == {(0, 0, 3)}
-    assert _seg_set(v.get_segments(conn, b.id, ns_b, b.content_hash)) == {(0, 0, 3)}
-    # A's segments are invisible under B's namespace even with A's memory_id
-    assert v.get_segments(conn, a.id, ns_b, a.content_hash) is None
-    # forget A drops A's segments; B's remain
+    assert v.chunk_src_hash(conn, a.id, ns_a) == a.content_hash
+    assert v.chunk_src_hash(conn, b.id, ns_b) == b.content_hash
+    # A's chunks are invisible under B's namespace even with A's memory_id
+    assert v.chunk_src_hash(conn, a.id, ns_b) is None
+    # forget A drops A's chunks; B's remain
     s.forget(tok_a, a.id)
-    assert v.get_segments(conn, a.id, ns_a, a.content_hash) is None
-    assert v.get_segments(conn, b.id, ns_b, b.content_hash) is not None
+    assert v.chunk_src_hash(conn, a.id, ns_a) is None
+    assert v.chunk_src_hash(conn, b.id, ns_b) is not None
 
 
 if __name__ == "__main__":

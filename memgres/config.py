@@ -35,6 +35,11 @@ def _bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    return float(raw) if raw not in (None, "") else default
+
+
 def _str(name: str, default: str) -> str:
     raw = os.environ.get(name)
     return raw if raw not in (None, "") else default
@@ -76,8 +81,18 @@ class Config:
     snippet_semantic: bool       # semantic/hybrid hits use the best-matching
                                  # segment (needs the model); off = ts_headline,
                                  # avoiding per-query model calls on a paid API
-    snippet_seg_chars: int       # segment size for the best-segment snippet cache
-    snippet_seg_overlap: int     # chars shared between consecutive segments
+    snippet_seg_chars: int       # chunk size for the chunk index (ranking+snippet)
+    snippet_seg_overlap: int     # chars shared between consecutive chunks
+    # embedding pipeline (chunks are the semantic index; see docs/EMBEDDINGS.md)
+    embed_async: bool            # write defers chunk-embedding to a background
+                                 # worker (fast writes) instead of embedding
+                                 # inline. Off (default) = safe everywhere: the
+                                 # write embeds inline so semantic recall works
+                                 # with no worker (library/embedded). The server
+                                 # turns this on because it runs a worker.
+    embed_worker: bool           # the server starts a background embed worker
+    embed_worker_interval: float # seconds the idle worker sleeps between drains
+    embed_batch: int             # memories embedded per drain batch
     # listing / browse
     list_preview_chars: int      # first-line preview length for memory_list (0 = none)
     # embeddings
@@ -111,6 +126,10 @@ class Config:
             raise ValueError("MEMGRES_SNIPPET_SEG_OVERLAP must be >= 0")
         if self.full_body_max_chars < 0:
             raise ValueError("MEMGRES_FULL_BODY_MAX_CHARS must be >= 0")
+        if self.embed_worker_interval <= 0:
+            raise ValueError("MEMGRES_EMBED_WORKER_INTERVAL must be > 0")
+        if self.embed_batch < 1:
+            raise ValueError("MEMGRES_EMBED_BATCH must be >= 1")
         if self.max_write_bytes > self.max_body_bytes:
             raise ValueError(
                 "MEMGRES_MAX_WRITE_BYTES must be <= MEMGRES_MAX_BODY_BYTES"
@@ -158,6 +177,10 @@ def load() -> Config:
         snippet_semantic=_bool("MEMGRES_SNIPPET_SEMANTIC", True),
         snippet_seg_chars=_int("MEMGRES_SNIPPET_SEG_CHARS", 400),
         snippet_seg_overlap=_int("MEMGRES_SNIPPET_SEG_OVERLAP", 80),
+        embed_async=_bool("MEMGRES_EMBED_ASYNC", False),
+        embed_worker=_bool("MEMGRES_EMBED_WORKER", True),
+        embed_worker_interval=_float("MEMGRES_EMBED_WORKER_INTERVAL", 1.0),
+        embed_batch=_int("MEMGRES_EMBED_BATCH", 16),
         list_preview_chars=_int("MEMGRES_LIST_PREVIEW_CHARS", 120),
         embed_provider=_str("MEMGRES_EMBED_PROVIDER", "none"),
         embed_model=_str("MEMGRES_EMBED_MODEL", ""),

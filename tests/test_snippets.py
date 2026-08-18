@@ -165,11 +165,10 @@ def test_qdrant_semantic_best_segment(qdrant_store):
 # ─── cache populate + reuse ──────────────────────────────────────────────────
 def _cache_populate_reuse(store):
     m = store.write(body=BODY)
+    # the write built the chunk index under the body's content_hash
+    assert store._vectors.chunk_src_hash(store._conn, m.id, _ns(store)) == content_hash(BODY)
     first = _find(store.recall(None, QUERY, mode="semantic"), m.id).snippet
-    # segments were computed + stored under the body's content_hash
-    segs = store._vectors.get_segments(store._conn, m.id, _ns(store), content_hash(BODY))
-    assert segs is not None and len(segs) >= 2
-    # a second recall reuses them and returns the same snippet
+    # a second recall returns the same snippet (chunks unchanged)
     second = _find(store.recall(None, QUERY, mode="semantic"), m.id).snippet
     assert first == second and "apples" in second
 
@@ -190,9 +189,9 @@ def _invalidate_on_edit(store):
     m2 = store.write(id=m.id, body=BODY2)             # new body, new hash
     new_hash = m2.content_hash
     h = _find(store.recall(None, QUERY, mode="semantic"), m.id)
-    # stale segments recomputed: old hash gone, new hash present
-    assert store._vectors.get_segments(store._conn, m.id, _ns(store), old_hash) is None
-    assert store._vectors.get_segments(store._conn, m.id, _ns(store), new_hash) is not None
+    # chunks rebuilt for the new body: the stored src_hash is the new body's
+    cur = store._vectors.chunk_src_hash(store._conn, m.id, _ns(store))
+    assert cur == new_hash and cur != old_hash
     # snippet now reflects the edited body
     assert "apples" in h.snippet and "orchard" in h.snippet
     assert "Bananas" not in h.snippet
@@ -272,23 +271,25 @@ def test_qdrant_short_body_full(qdrant_store):
     _short_body_full(qdrant_store)
 
 
-# ─── MEMGRES_SNIPPET_SEMANTIC=false → ts_headline, no segments created ────────
-def _semantic_disabled_no_segments(store):
+# ─── MEMGRES_SNIPPET_SEMANTIC=false → snippet via ts_headline (chunks still exist)
+def _semantic_disabled_uses_headline(store):
     m = store.write(body=BODY)
     h = _find(store.recall(None, QUERY, mode="semantic"), m.id)
-    # fell back to ts_headline: a snippet, but no segment cache for this id
-    assert h.snippet is not None
-    assert store._vectors.get_segments(store._conn, m.id, _ns(store), content_hash(BODY)) is None
+    # chunks still exist (they're the ranking index) but the SNIPPET came from
+    # ts_headline, not a chunk slice: no offset, so lines is None.
+    assert h.snippet is not None and "apples" in h.snippet
+    assert h.kind == "snippet" and h.lines is None
+    assert store._vectors.chunk_src_hash(store._conn, m.id, _ns(store)) is not None
 
 
-def test_pg_semantic_disabled_no_segments(monkeypatch, pg_store):
+def test_pg_semantic_disabled_uses_headline(monkeypatch, pg_store):
     monkeypatch.setenv("MEMGRES_SNIPPET_SEMANTIC", "false")
     # rebuild the store's cfg with the flag off
     pg_store.cfg = load()
-    _semantic_disabled_no_segments(pg_store)
+    _semantic_disabled_uses_headline(pg_store)
 
 
-def test_qdrant_semantic_disabled_no_segments(monkeypatch, qdrant_store):
+def test_qdrant_semantic_disabled_uses_headline(monkeypatch, qdrant_store):
     monkeypatch.setenv("MEMGRES_SNIPPET_SEMANTIC", "false")
     qdrant_store.cfg = load()
-    _semantic_disabled_no_segments(qdrant_store)
+    _semantic_disabled_uses_headline(qdrant_store)

@@ -77,6 +77,7 @@ def _clear_all(monkeypatch):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
+    monkeypatch.setenv("MEMGRES_EMBED_WORKER", "false")  # instructions-only
 
 
 @pytest.mark.skipif(not _reachable(), reason="no test Postgres")

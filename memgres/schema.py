@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .config import Config
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are
 # shipped inside the package (see pyproject) and this still resolves.
@@ -57,6 +57,9 @@ def migrate(conn, cfg: Config) -> None:
             # title defaults to '' and is folded into the chain only when it
             # actually changes — see store._row_hash).
             cur.execute(_sql("0004_title.sql"))
+            # chunks become the semantic index: add embed_pending, drop the old
+            # whole-body doc vector, flag existing rows for re-chunking (once).
+            cur.execute(_sql("0005_chunk_index.sql"))
             _apply_tree(cur, cfg)
             _apply_vector(cur, cfg)
             _stamp(cur, cfg)
@@ -89,18 +92,11 @@ def _apply_vector(cur, cfg: Config) -> None:
         # config.validate() already guards this; belt and suspenders.
         raise SchemaMismatch("pgvector semantic search needs MEMGRES_EMBED_DIM > 0")
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    cur.execute(
-        f"ALTER TABLE memory ADD COLUMN IF NOT EXISTS embedding vector({cfg.embed_dim})"
-    )
-    cur.execute(
-        "CREATE INDEX IF NOT EXISTS memory_embedding_hnsw ON memory "
-        "USING hnsw (embedding vector_cosine_ops)"
-    )
-    # Per-memory segment vectors: a durable cache the (future) snippet flow fills
-    # lazily, keyed by the memory's content_hash (`src_hash`) so a body edit — a
-    # new hash — invalidates the cache and `forget` cascades them away. Offsets,
-    # not text: the snippet is sliced from the live body. A memory has few
-    # segments, ranked by a plain scan, so no HNSW here.
+    # Chunk vectors ARE the semantic index (no whole-body doc vector). Each row is
+    # one chunk of one memory: its offset span, its vector, the memory's
+    # content_hash (`src_hash`) so a body edit — a new hash — replaces the set, and
+    # its namespace so ranking never crosses tenants. `forget` cascades them away.
+    # Offsets, not text: the snippet is sliced from the live body.
     cur.execute(
         f"""CREATE TABLE IF NOT EXISTS memory_segment (
                 memory_id uuid NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
@@ -116,6 +112,17 @@ def _apply_vector(cur, cfg: Config) -> None:
     cur.execute(
         "CREATE INDEX IF NOT EXISTS memory_segment_mid "
         "ON memory_segment (memory_id)"
+    )
+    # HNSW over the chunk vectors — this is the global ANN ranking index now, not a
+    # per-memory scan, so it needs one. Plus a btree on namespace for the tenant
+    # filter that rides along every recall.
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS memory_segment_hnsw ON memory_segment "
+        "USING hnsw (embedding vector_cosine_ops)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS memory_segment_ns "
+        "ON memory_segment (namespace)"
     )
 
 

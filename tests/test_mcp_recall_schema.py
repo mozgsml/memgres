@@ -41,6 +41,7 @@ def _clear_env(monkeypatch):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
+    monkeypatch.setenv("MEMGRES_EMBED_WORKER", "false")  # schema-only; no embedding
 
 
 def _recall_mode_enum(mcp):
