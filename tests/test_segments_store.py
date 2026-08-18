@@ -231,7 +231,7 @@ def test_qdrant_chunks_carry_namespace(qdrant_store):
     conn = qdrant_store._conn
     ns = _ns(qdrant_store)
     a = qdrant_store.write(body="apple a\n")
-    b = qdrant_store.write(body="banana b\n")
+    qdrant_store.write(body="banana b\n")          # a second memory, for realism
     # namespace lives in each chunk point's payload
     from qdrant_client import QdrantClient
     from qdrant_client.models import FieldCondition, Filter, MatchValue
