@@ -52,6 +52,13 @@ patch = fixes).
   (`inline`|`async`) replaces the derived async flag; `inline` stays the safe
   library/all-in-one default. New `memgres-worker` entrypoint,
   `deploy/docker-compose.yml`, and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+- **`docs/AGENT_MEMORY_GUIDE.md`** — a playbook for using memgres as an agent's
+  long-term org memory: an example `MEMGRES_INSTRUCTION` (the ≤2 KB startup rulebook)
+  plus the full reasoning mapped to memgres features — two-layer raw/distilled split,
+  atomic write discipline, ADR-shaped decisions with rationale, source+date trust,
+  conflict resolution ("memory says X, someone says Y"), and hygiene. Notes the tool
+  gaps (dedup-at-write, freshness fields, first-class links) that instruction covers
+  for now.
 - **`docs/CHOOSING.md`** — a decision guide for picking a run mode, with the
   explicit recommendation that **more than one user should run the shared Docker
   server, not a per-machine install** (one pool, one worker, central tokens, one
