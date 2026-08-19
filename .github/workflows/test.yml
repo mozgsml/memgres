@@ -27,8 +27,8 @@ jobs:
       MEMGRES_TEST_DSN: postgresql://memgres:memgres@localhost:5432/memgres
       MEMGRES_TEST_QDRANT: http://localhost:6333
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install (no heavy local-embeddings extra)
