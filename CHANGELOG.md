@@ -5,7 +5,7 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
-## [Unreleased]
+## [0.4.0] — 2026-08-19
 
 ### Changed
 - **Chunks are the semantic index; embedding moved off the write path.** A memory
