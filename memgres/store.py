@@ -53,6 +53,26 @@ class AmbiguousReplace(ValueError):
     """A `replace`'s `old` occurs more than once and `replace_all` wasn't set."""
 
 
+def build_replace(replace_old: Optional[str], replace_new: Optional[str]):
+    """Assemble the substring-replace ``(old, new)`` tuple from the two optional
+    request fields — the one place both the HTTP and MCP layers turn them into the
+    ``replace`` argument, so the rule lives once.
+
+    It distinguishes *not provided* (``None``) from an explicit empty string. Both
+    omitted → ``None`` (no replace). Exactly one provided → ``ValueError``: a lone
+    ``replace_old`` must not be coerced to ``(old, "")`` and **silently delete**
+    the matched text (the regression this guards), and a lone ``replace_new`` has
+    no anchor. Both provided → ``(old, new)``; ``new`` may be ``""`` to delete on
+    purpose, which is now the *only* way to get a deletion.
+    """
+    if replace_old is None and replace_new is None:
+        return None
+    if replace_old is None or replace_new is None:
+        raise ValueError("replace needs both replace_old and replace_new "
+                         "(pass replace_new='' to delete the matched text)")
+    return (replace_old, replace_new)
+
+
 @dataclass
 class Memory:
     id: str

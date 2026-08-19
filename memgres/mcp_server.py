@@ -36,7 +36,7 @@ from . import identity
 from .config import Config, load
 from .embeddings import get_embedder
 from .schema import migrate
-from .store import Store
+from .store import Store, build_replace
 
 
 # The MCP `initialize` response carries a server-side `instructions` string; a
@@ -180,9 +180,7 @@ def build_server(cfg: Optional[Config] = None):
         curated caption (set whole, searchable via `memory_find`); `source`/`reason`
         record provenance. `space` picks one of your namespaces by name (`space_id`
         for a shared one); omit both to use your default."""
-        replace = None
-        if replace_old is not None or replace_new is not None:
-            replace = (replace_old or "", replace_new or "")
+        replace = build_replace(replace_old, replace_new)
         with pool.connection() as conn:
             return _mem(_store(conn).write(
                 _token(ctx, token), id=id or None, body=body, diff=diff,

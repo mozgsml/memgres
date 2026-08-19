@@ -109,6 +109,25 @@ def test_replace_edit_over_http(client):
     assert ok.status_code == 200 and ok.json()["body"] == "z z\n"
 
 
+def test_replace_missing_new_errors_not_silent_delete(client):
+    # Regression (meta.memgres.replace_new_dropped): a lone replace_old with
+    # replace_new omitted must be REJECTED, not coerced to ("old", "") and
+    # silently delete the matched text on a 200.
+    r = client.post("/memories", json={"body": "keep\nanchor\ntail\n"})
+    mid, h0 = r.json()["id"], r.json()["content_hash"]
+    r = client.patch(f"/memories/{mid}", json={"replace_old": "anchor"})
+    assert r.status_code == 422
+    got = client.get(f"/memories/{mid}").json()          # body untouched, no seq bump
+    assert got["body"] == "keep\nanchor\ntail\n" and got["content_hash"] == h0
+    # a lone replace_new is likewise rejected
+    assert client.patch(f"/memories/{mid}",
+                        json={"replace_new": "x"}).status_code == 422
+    # an EXPLICIT empty replace_new is a deliberate deletion (still allowed)
+    r = client.patch(f"/memories/{mid}",
+                     json={"replace_old": "anchor\n", "replace_new": ""})
+    assert r.status_code == 200 and r.json()["body"] == "keep\ntail\n"
+
+
 def test_recall_tag_and_subtree_filters(client):
     client.post("/memories", json={"body": "apple pie recipe\n", "tags": ["food"],
                                    "path": "recipes.apple"})

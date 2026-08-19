@@ -31,7 +31,7 @@ from .diffing import DiffConflict
 from .embeddings import get_embedder
 from .identity import SpaceNotFound
 from .schema import migrate
-from .store import Conflict, NoParent, NotFound, Store, TooLarge
+from .store import Conflict, NoParent, NotFound, Store, TooLarge, build_replace
 
 
 def _parse_lines(spec: Optional[str]) -> Optional[List[int]]:
@@ -174,12 +174,12 @@ def create_app(cfg: Optional[Config] = None):
     @app.patch("/memories/{mid}")
     def edit(mid: str, req: EditBody, tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
-            replace = None
-            if req.replace_old is not None or req.replace_new is not None:
-                replace = (req.replace_old or "", req.replace_new or "")
+            # build_replace runs inside _guard so a lone replace_old/new surfaces
+            # as its ValueError -> 422, not a silent delete or an uncaught 500.
             m = _guard(lambda: _store(conn).write(
                 tok, id=mid, body=req.body, diff=req.diff, base_hash=req.base_hash,
-                replace=replace, replace_all=req.replace_all,
+                replace=build_replace(req.replace_old, req.replace_new),
+                replace_all=req.replace_all,
                 path=req.path, tags=req.tags, title=req.title,
                 source=req.source, reason=req.reason,
                 ttl_days=req.ttl_days, space=req.space, space_id=req.space_id))
