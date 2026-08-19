@@ -16,11 +16,10 @@ patch = fixes).
   document can't crowd distinct memories out of the top-k (an iterative-exclude
   loop, round-capped and logged, dedups by memory). A write no longer embeds
   inline on the server: it flags the row and a background worker segments, embeds,
-  and indexes it — so a write returns fast regardless of body size. New settings
-  `MEMGRES_EMBED_ASYNC` (defer to the worker; the server turns this on by running
-  one), `MEMGRES_EMBED_WORKER` / `_WORKER_INTERVAL` / `_BATCH`. Embedded/library
-  use (no worker) stays synchronous by default, so semantic recall is correct the
-  instant a write commits. **Upgrade note (schema v6):** the old `memory.embedding`
+  and indexes it — so a write returns fast regardless of body size. Dispatch is
+  chosen by `MEMGRES_EMBED_DISPATCH` (`inline`|`async`) with the worker settings
+  below (see *Added → Split deployment*). Embedded/library use (no worker) stays
+  `inline` by default, so semantic recall is correct the instant a write commits. **Upgrade note (schema v6):** the old `memory.embedding`
   column is dropped and every existing row is flagged once for re-chunking — the
   worker rebuilds the index from the bodies on first run; bodies and history are
   untouched, no manual reindex. A qdrant deployment can drop its old
@@ -53,6 +52,10 @@ patch = fixes).
   (`inline`|`async`) replaces the derived async flag; `inline` stays the safe
   library/all-in-one default. New `memgres-worker` entrypoint,
   `deploy/docker-compose.yml`, and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+- **`docs/CHOOSING.md`** — a decision guide for picking a run mode, with the
+  explicit recommendation that **more than one user should run the shared Docker
+  server, not a per-machine install** (one pool, one worker, central tokens, one
+  thing to upgrade and back up). Linked from the README and `docs/DEPLOYMENT.md`.
 - **`memgres-reembed`** — switch the embedding model/dimension on an existing
   store: re-stamps the model, wipes and recreates the chunk index at the new
   dimension, flags every memory, and rebuilds — bodies and history untouched.

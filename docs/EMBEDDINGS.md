@@ -128,14 +128,15 @@ vector store (a new pgvector column via a clean schema, or a fresh
 
 Every embedding model has a maximum input length; text beyond it is truncated
 **before** it's encoded. memgres defends against this by indexing a memory as
-overlapping **chunks** (sized by `MEMGRES_SNIPPET_SEG_CHARS`, default 400 chars)
-rather than one vector of the whole body: each chunk is embedded and ranked
+overlapping **chunks** (sized by `MEMGRES_CHUNK_CHARS`, default 400 chars, with
+`MEMGRES_CHUNK_OVERLAP`, default 80; the legacy names `MEMGRES_SNIPPET_SEG_CHARS`
+/ `_OVERLAP` still work) rather than one vector of the whole body: each chunk is embedded and ranked
 independently, and recall keeps the best-matching chunk per memory. So the tail of
 a long memory is searchable, and a match deep in a document isn't drowned out by a
 single averaged vector — the failure mode ("only the beginning is embedded, the
 rest is invisible, with no error") no longer applies to whole memories.
 
-- A single **chunk** must still fit the model's window. Keep `SNIPPET_SEG_CHARS`
+- A single **chunk** must still fit the model's window. Keep `MEMGRES_CHUNK_CHARS`
   comfortably under the window (in characters ≈ tokens × 4). The default (400
   chars) is safe for any real model.
 - With `local`, sentence-transformers uses the model's configured `max_seq_length`;

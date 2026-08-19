@@ -3,6 +3,10 @@
 memgres is one Python package with a few entrypoints. How you run them decides
 the topology — from a single embedded process to a horizontally-scaled service.
 
+> Not sure which topology you want? Start with [CHOOSING.md](CHOOSING.md) — a short
+> decision guide (single user → embedded/all-in-one; **many users → the Docker
+> server, shared, not per-machine**; enterprise → split). This page is the *how*.
+
 ## Topologies
 
 ### 1. Embedded / library (no server)

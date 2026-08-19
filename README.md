@@ -148,7 +148,9 @@ Or pull the container image (public, no login):
 docker pull ghcr.io/mozgsml/memgres:latest
 ```
 
-### Three ways to run it
+### Ways to run it
+
+Not sure which fits? Start with the decision guide: [docs/CHOOSING.md](docs/CHOOSING.md). In short — **more than one user → run the Docker server (shared), not a per-machine install.**
 
 1. **`docker compose up`** — `pgvector` + service, nothing to configure. For a dedicated vector service instead, `docker compose --profile qdrant up` and set `MEMGRES_VECTOR_BACKEND=qdrant` (Qdrant ranks vectors; Postgres still holds bodies and does tag/subtree/TTL filtering).
 2. **Your own Postgres** — install the `[server]` extra (above), point `MEMGRES_DATABASE_URL` at it, run `memgres-server` (migrates on startup).
