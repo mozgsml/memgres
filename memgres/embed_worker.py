@@ -37,6 +37,20 @@ class EmbedWorker:
     def _conn_ok(self):
         if self._conn is None or getattr(self._conn, "closed", False):
             self._conn = self._connect()
+            # Bound how long a single embed transaction may sit between statements
+            # (i.e. while the embed call runs): if it hangs, Postgres kills the tx
+            # and releases the SKIP-LOCKED row lock, so the row is retried and
+            # never stuck. Autocommit so this SET isn't itself inside a tx.
+            if self.cfg.embed_tx_timeout_ms > 0:
+                try:
+                    prev = self._conn.autocommit
+                    self._conn.autocommit = True
+                    with self._conn.cursor() as cur:
+                        cur.execute("SET idle_in_transaction_session_timeout = %s",
+                                    (self.cfg.embed_tx_timeout_ms,))
+                    self._conn.autocommit = prev
+                except Exception:
+                    _log.exception("could not set idle_in_transaction timeout")
         return self._conn
 
     def drain_once(self) -> int:
@@ -72,6 +86,13 @@ class EmbedWorker:
         self._thread.start()
         return self
 
+    def serve(self) -> None:
+        """Run the drain loop in the CURRENT thread, blocking until ``stop()``.
+        Used by the standalone ``memgres-worker`` process (a signal handler calls
+        ``stop()``); the in-process server path uses ``start()`` instead."""
+        self._run()
+        self._reset_conn()
+
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
@@ -93,15 +114,20 @@ def maybe_start_worker(cfg, embedder, backend,
 
 def wire_server(cfg, embedder):
     """Server-side setup shared by the HTTP and MCP entrypoints: build the vector
-    backend ONCE, start the embed worker if warranted, and return
-    ``(worker, cfg, backend)`` where ``cfg.embed_async`` is set to match — True
-    **iff** a worker is running. The caller injects ``backend`` into every
-    per-request ``Store`` so a qdrant client isn't rebuilt each call.
+    backend ONCE, start the in-process embed worker if warranted, and return
+    ``(worker, cfg, backend)`` with ``cfg.embed_dispatch`` set to what actually
+    holds. The caller injects ``backend`` into every per-request ``Store`` so a
+    qdrant client isn't rebuilt each call.
 
-    Tying async to the worker's existence is the safety rail: with a worker,
-    writes defer to it (fast); without one, writes stay synchronous (embed
-    inline), so a deployment never ends up flagging rows that nothing will ever
-    embed (a silent semantic gap)."""
+    Dispatch resolution:
+      * an in-process worker started (``embed_worker`` on, embedder present) →
+        writes defer to it → ``async``. The all-in-one server default: fast writes
+        with a local drainer, never a flag nothing embeds.
+      * no in-process worker → keep the operator's ``embed_dispatch``. That is how
+        a SPLIT deployment works: an API container sets ``async`` + ``embed_worker
+        =off`` and a separate ``memgres-worker`` drains. Left at the default
+        (``inline``), a workerless server just embeds inline — safe, never a
+        silent gap."""
     import psycopg
     from dataclasses import replace
 
@@ -111,4 +137,5 @@ def wire_server(cfg, embedder):
     worker = maybe_start_worker(
         cfg, embedder, backend,
         connect=lambda: psycopg.connect(cfg.database_url or ""))
-    return worker, replace(cfg, embed_async=worker is not None), backend
+    dispatch = "async" if worker is not None else cfg.embed_dispatch
+    return worker, replace(cfg, embed_dispatch=dispatch), backend

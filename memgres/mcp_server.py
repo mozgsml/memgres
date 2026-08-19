@@ -87,8 +87,8 @@ def build_server(cfg: Optional[Config] = None):
                           max_size=cfg.pool_size, open=True)
     with pool.connection() as conn:
         migrate(conn, cfg)
-    # Start the background embed worker (if warranted) and flip cfg.embed_async to
-    # match, so writes defer to it. Kept alive by its own daemon thread.
+    # Start the in-process embed worker (if warranted) and set cfg.embed_dispatch
+    # to match, so writes defer to it. Kept alive by its own daemon thread.
     from .embed_worker import wire_server
     _worker, cfg, backend = wire_server(cfg, embedder)
     mcp = _mcp("memgres", instructions=_instruction_text())

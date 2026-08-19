@@ -64,8 +64,11 @@ def store(monkeypatch):
         cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
     from qdrant_client import QdrantClient
     qc = QdrantClient(url=QURL)
-    if qc.collection_exists(COLL):
-        qc.delete_collection(COLL)
+    # reset BOTH the (legacy) doc collection and the chunk collection, else chunk
+    # points from earlier tests linger and pollute grouped search
+    for c in (COLL, f"{COLL}_segments"):
+        if qc.collection_exists(c):
+            qc.delete_collection(c)
 
     for k in list(os.environ):
         if k.startswith("MEMGRES_") or k == "QDRANT_URL":

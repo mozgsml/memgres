@@ -61,7 +61,7 @@ def create_app(cfg: Optional[Config] = None):
     cfg = cfg or load()
     embedder = get_embedder(cfg)
     # Migrate up front (before the worker or any request touches the schema),
-    # then start the embed worker and flip cfg.embed_async to match — so the route
+    # then start the embed worker and set cfg.embed_dispatch — so the route
     # closures below capture the finalized cfg.
     with psycopg.connect(cfg.database_url or "") as _mc:
         migrate(_mc, cfg)               # idempotent; stamps embed model/dim

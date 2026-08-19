@@ -186,11 +186,11 @@ class Store:
 
     def _index_now(self, memory_id: str, body: str, ns: str, src_hash: str) -> None:
         """Build this memory's chunk vectors inline, within the write transaction,
-        UNLESS the deployment defers to the background worker (``embed_async``).
-        In sync mode this keeps semantic recall correct the instant a write
-        commits (library/embedded, tests); in async mode the row stays
-        ``embed_pending`` for the worker and this is a no-op."""
-        if self.cfg.embed_async or self._vectors is None:
+        UNLESS the deployment defers to a worker (``embed_dispatch == "async"``).
+        Inline keeps semantic recall correct the instant a write commits
+        (library/embedded, tests); async leaves the row ``embed_pending`` for a
+        worker (in-process or a separate memgres-worker) and this is a no-op."""
+        if self.cfg.embed_dispatch == "async" or self._vectors is None:
             return
         from .indexing import index_memory
         index_memory(self._conn, self.cfg, self.embedder, self._vectors,

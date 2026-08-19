@@ -97,8 +97,8 @@ def async_pg(monkeypatch):
     conn = psycopg.connect(DSN)
     migrate(conn, load())
     emb = _CountingKeyword()
-    s = Store(replace(load(), embed_async=True), embedder=emb, conn=conn)
-    assert s.cfg.embed_async is True     # runtime-only flag (no env knob)
+    s = Store(replace(load(), embed_dispatch="async"), embedder=emb, conn=conn)
+    assert s.cfg.embed_dispatch == "async"     # defer embedding to an explicit drain
     yield s, emb
     conn.close()
 
@@ -121,7 +121,7 @@ def async_qdrant(monkeypatch):
     conn = psycopg.connect(DSN)
     migrate(conn, load())
     emb = _CountingKeyword()
-    s = Store(replace(load(), embed_async=True), embedder=emb, conn=conn)
+    s = Store(replace(load(), embed_dispatch="async"), embedder=emb, conn=conn)
     yield s, emb
     conn.close()
 
@@ -236,10 +236,10 @@ def test_qdrant_worker_backfill(async_qdrant):
     _worker_backfill(*async_qdrant)
 
 
-# ─── sync mode (embed_async off) embeds inline, no drain needed ──────────────
+# ─── sync mode (embed_dispatch=inline) embeds inline, no drain needed ──────────────
 def test_pg_sync_mode_inline(async_pg):
     store, emb = async_pg
-    sync_cfg = replace(store.cfg, embed_async=False)
+    sync_cfg = replace(store.cfg, embed_dispatch="inline")
     s2 = Store(sync_cfg, embedder=emb, conn=store._conn)
     m = s2.write(body="cherry pie\n")
     assert _pending(s2, m.id) is False                  # embedded inline already

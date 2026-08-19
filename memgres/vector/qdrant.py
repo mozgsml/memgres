@@ -57,6 +57,23 @@ class QdrantBackend:
         self.client = QdrantClient(url=url, api_key=api_key, **extra)
         self._ensure()
 
+    @staticmethod
+    def drop_chunks_collection() -> None:
+        """Delete the chunk collection outright (used by re-embed before rebuilding
+        at a new model dimension). Built WITHOUT ``_ensure`` so it doesn't trip the
+        dim check on the old collection it's about to remove."""
+        from qdrant_client import QdrantClient
+
+        base = os.environ.get("MEMGRES_QDRANT_COLLECTION", "memgres")
+        url = os.environ.get("QDRANT_URL", "http://localhost:6333")
+        api_key = os.environ.get("QDRANT_API_KEY") or None
+        ca_cert = os.environ.get("MEMGRES_QDRANT_CA") or None
+        extra = {"verify": ca_cert} if ca_cert else {}
+        client = QdrantClient(url=url, api_key=api_key, **extra)
+        coll = f"{base}_segments"
+        if client.collection_exists(coll):
+            client.delete_collection(coll)
+
     def _ensure(self) -> None:
         """The chunk collection (cosine, model dim) with keyword payload indexes on
         `memory_id` (for grouping + per-memory replace) and `namespace` (for the
