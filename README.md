@@ -5,7 +5,7 @@
 
 **Versioned document memory for AI agents — one Postgres, lexical *or* semantic recall, diff-based history, GDPR-erasable.**
 
-> Status: v0.2.0 — on [PyPI](https://pypi.org/project/memgres/) (`pip install memgres`) and [GHCR](https://ghcr.io/mozgsml/memgres). Core library, search (pgvector/Qdrant), multi-tenant identity (users / namespaces / scoped tokens), HTTP API and MCP server, all tested in CI against live Postgres + Qdrant.
+> Status: released on [PyPI](https://pypi.org/project/memgres/) (`pip install memgres`) and [GHCR](https://ghcr.io/mozgsml/memgres) — see the [releases](https://github.com/mozgsml/memgres/releases) page for the current version. Core library, search (pgvector/Qdrant), multi-tenant identity (users / namespaces / scoped tokens), HTTP API and MCP server, all tested in CI against live Postgres + Qdrant.
 
 memgres is a lightweight, drop-in memory layer — a Python library plus an optional HTTP/MCP service — backed by a single PostgreSQL database. You store **documents** (bodies of text an agent owns and edits), not facts an LLM guessed at. Every change is an authored diff with provenance, kept in a tamper-evident history that you can still delete when the law says you must.
 
