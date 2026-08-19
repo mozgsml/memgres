@@ -40,14 +40,18 @@ patch = fixes).
   empty `StartSel`/`StopSel`, so the returned text has no `<b>…</b>` markup that
   could mislead a model reading it.
 
-### Added
-- **Startup version guard** — on connect, memgres refuses to run when the database
-  is stamped at a **higher** schema version than the client understands (a newer
-  memgres already migrated the shared store), failing with an actionable "update
-  this client" message instead of silently misreading the newer schema. Because
-  the Postgres/Qdrant state is shared across machines, this is what stops an
-  un-upgraded machine from breaking after another upgrades. A fresh or
-  same/older-version database migrates forward as usual.
+- **Compatibility floor + startup version guard.** The meta row now carries
+  `min_reader_version` alongside `schema_version` — the low end of the range of
+  client `SCHEMA_VERSION`s allowed to operate against the data (the high end is
+  open: a newer client migrates forward). It is raised only by a
+  backward-incompatible migration (tracked by `SCHEMA_BREAKING_VERSION` in code),
+  so an older client keeps working against a newer-but-additive schema. On
+  connect, a client whose `SCHEMA_VERSION` is below the database's floor refuses
+  to run with an actionable "update this client" message instead of silently
+  misreading it — which is exactly what a stale machine would otherwise hit after
+  another machine upgrades the shared store past a breaking change. A fresh or
+  in-range database migrates forward as usual, and the stamp is monotonic
+  (operating with an older client never downgrades a newer database's versions).
 - **Server-side MCP `instructions`** — set `MEMGRES_INSTRUCTION` and the text is
   emitted in the MCP `initialize` response, so a client that honors it (e.g.
   Claude Code) loads it once at connect to guide how the model uses the memory

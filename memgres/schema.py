@@ -17,7 +17,22 @@ from pathlib import Path
 
 from .config import Config
 
-SCHEMA_VERSION = 6
+# The version this build migrates the database TO (the latest migration it carries).
+SCHEMA_VERSION = 7
+
+# The compatibility FLOOR: the schema version of the most recent backward-
+# INCOMPATIBLE migration — one that changed the shape/semantics old code relied on
+# (a dropped column, a changed ranking model), so a client older than this can no
+# longer read the data correctly. A client operating on a database records this
+# into `memgres_meta.min_reader_version`; any client whose SCHEMA_VERSION is below a
+# database's stored floor refuses to run (see `_guard_client_version`).
+#
+# BUMP THIS to a new migration's version ONLY when that migration breaks old
+# readers. An additive migration (new column/table/index that old code ignores)
+# must leave it as-is, so older clients keep working against the newer schema.
+#   v6 (0005): dropped the whole-body doc vector, moved ranking to chunks → BREAKING.
+#   v7 (0006): added min_reader_version column → additive, floor stays 6.
+SCHEMA_BREAKING_VERSION = 6
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are
 # shipped inside the package (see pyproject) and this still resolves.
@@ -56,33 +71,50 @@ def migrate(conn, cfg: Config) -> None:
             _stamp(cur, cfg)
 
 
+def _column_exists(cur, table: str, column: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s",
+        (table, column))
+    return cur.fetchone() is not None
+
+
 def _guard_client_version(cur) -> None:
-    """Refuse to run an OUTDATED client against a NEWER database — checked FIRST,
-    before any migration touches the schema.
+    """Refuse to run a client OLDER than the database's compatibility floor —
+    checked FIRST, before any migration touches the schema.
 
-    Migrations are forward-only: this build carries migrations up to
-    ``SCHEMA_VERSION``. If the database is stamped at a HIGHER version, a newer
-    memgres already migrated it into a shape this one doesn't understand (dropped
-    columns, new tables, changed semantics) — proceeding would misread or corrupt
-    it. Since state is shared across machines, this is exactly what happens when
-    one machine upgrades and another still runs the old client: the old one stops
-    with a clear ask to update, instead of silently breaking.
+    The database's operable range is ``[min_reader_version, ∞)`` in terms of client
+    ``SCHEMA_VERSION``: a client at or above the stored floor may operate (and, if
+    newer, migrates the shared store forward), but a client BELOW it cannot — a
+    backward-incompatible migration changed the data into a shape this build can't
+    read. Since state is shared across machines, this is what a stale machine hits
+    after another upgrades past a breaking change: it stops with a clear ask to
+    update, instead of silently misreading the newer schema.
 
-    A fresh database (no ``memgres_meta`` yet) or one at/below this version passes
-    through — the normal forward migrate then brings it up and re-stamps."""
+    A newer-but-ADDITIVE database (higher ``schema_version`` but a floor this client
+    still satisfies) passes through and operates normally — that's the point of a
+    range rather than exact-match. A fresh database (no ``memgres_meta`` yet), or a
+    pre-floor one (no ``min_reader_version`` column → floor 1), imposes no bar."""
     cur.execute("SELECT to_regclass('memgres_meta')")
     if cur.fetchone()[0] is None:
         return                       # brand-new database — nothing to compare
-    cur.execute("SELECT schema_version FROM memgres_meta WHERE only_row")
+    if not _column_exists(cur, "memgres_meta", "min_reader_version"):
+        return                       # pre-v7 database — no floor recorded yet (== 1)
+    cur.execute("SELECT min_reader_version, schema_version "
+                "FROM memgres_meta WHERE only_row")
     row = cur.fetchone()
-    stored = row[0] if row else None
-    if stored is not None and stored > SCHEMA_VERSION:
+    if row is None:
+        return
+    floor, stored = row
+    if floor is not None and floor > SCHEMA_VERSION:
         raise SchemaMismatch(
-            f"this memgres speaks schema v{SCHEMA_VERSION}, but the database is at "
-            f"v{stored} — it was migrated by a NEWER memgres. Update this client "
-            f"(in its venv: pip install -U 'memgres[local,qdrant,mcp]', or pull the "
-            f"repo for an editable install) and restart it. Refusing to run an "
-            f"outdated client against a newer schema."
+            f"this memgres speaks schema v{SCHEMA_VERSION}, but the database "
+            f"(at v{stored}) requires a client of at least v{floor} — it was "
+            f"migrated past a backward-incompatible change by a newer memgres. "
+            f"Update this client (in its venv: pip install -U "
+            f"'memgres[local,qdrant,mcp]', or pull the repo for an editable "
+            f"install) and restart it. Refusing to run below the database's "
+            f"compatibility floor."
         )
 
 
@@ -157,10 +189,11 @@ def _stamp(cur, cfg: Config) -> None:
     if row is None:
         cur.execute(
             "INSERT INTO memgres_meta "
-            "(only_row, schema_version, embed_provider, embed_model, embed_dim, "
-            " fts_language, tree_enabled) VALUES (true, %s, %s, %s, %s, %s, %s)",
-            (SCHEMA_VERSION, cfg.embed_provider, cfg.embed_model, cfg.embed_dim,
-             cfg.fts_language, cfg.tree_enabled),
+            "(only_row, schema_version, min_reader_version, embed_provider, "
+            " embed_model, embed_dim, fts_language, tree_enabled) "
+            "VALUES (true, %s, %s, %s, %s, %s, %s, %s)",
+            (SCHEMA_VERSION, SCHEMA_BREAKING_VERSION, cfg.embed_provider,
+             cfg.embed_model, cfg.embed_dim, cfg.fts_language, cfg.tree_enabled),
         )
         return
 
@@ -191,8 +224,13 @@ def _stamp(cur, cfg: Config) -> None:
             (cfg.embed_provider, cfg.embed_model, cfg.embed_dim),
         )
 
-    # Keep the recorded layout version current, so the meta row (and any drift
-    # check built on it) reflects the migrations actually applied, not just the
-    # version first stamped.
-    cur.execute("UPDATE memgres_meta SET schema_version=%s WHERE only_row "
-                "AND schema_version <> %s", (SCHEMA_VERSION, SCHEMA_VERSION))
+    # Advance the recorded versions to what this migrate() applied — with GREATEST
+    # so an older client operating on a newer-but-additive database never DROPS the
+    # stamp: schema_version tracks the newest schema present, min_reader_version the
+    # highest breaking floor any client has imposed. Both are monotonic.
+    cur.execute(
+        "UPDATE memgres_meta SET "
+        "schema_version = GREATEST(schema_version, %s), "
+        "min_reader_version = GREATEST(min_reader_version, %s) "
+        "WHERE only_row",
+        (SCHEMA_VERSION, SCHEMA_BREAKING_VERSION))

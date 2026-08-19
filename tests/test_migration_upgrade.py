@@ -114,29 +114,56 @@ def test_fresh_install_flags_nothing(conn):
     assert _flagged_bodies(conn) == []
 
 
-def test_outdated_client_refuses_newer_database(conn):
-    # A full schema at the current version, then the stored version is bumped past
-    # this build (as if a NEWER memgres had migrated the shared DB). migrate() must
-    # refuse with an actionable "update this client" error, not proceed.
+def _fresh_full_schema(conn):
+    """Build a full memgres schema in the isolated test schema (tree + embed off →
+    no ltree/vector extensions needed) and return the cfg used."""
     from dataclasses import replace
 
     from memgres.config import load
-    from memgres.schema import SCHEMA_VERSION, SchemaMismatch, migrate
+    from memgres.schema import migrate
 
     with conn.cursor() as cur:
         cur.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
         cur.execute(f"CREATE SCHEMA {SCHEMA}")
         cur.execute(f"SET search_path TO {SCHEMA}")
     conn.autocommit = False
-    # tree + embed off → no ltree/vector extensions needed in the isolated schema;
-    # the version guard is independent of them.
     cfg = replace(load(), tree_enabled=False, embed_provider="none")
-    migrate(conn, cfg)                 # builds the full schema, stamps SCHEMA_VERSION
+    migrate(conn, cfg)
+    return cfg
+
+
+def test_client_below_floor_refuses(conn):
+    # The database's compatibility floor is raised past this build (as if a newer
+    # memgres migrated the shared DB past a breaking change). migrate() must refuse
+    # with an actionable "update this client" error, not proceed.
+    from memgres.schema import SCHEMA_VERSION, SchemaMismatch, migrate
+
+    cfg = _fresh_full_schema(conn)
     with conn.cursor() as cur:
-        cur.execute("UPDATE memgres_meta SET schema_version=%s WHERE only_row",
+        cur.execute("UPDATE memgres_meta SET min_reader_version=%s WHERE only_row",
                     (SCHEMA_VERSION + 1,))
     conn.commit()
     with pytest.raises(SchemaMismatch, match="Update this client"):
         migrate(conn, cfg)
     conn.rollback()
-    conn.autocommit = True             # let the fixture teardown drop the schema
+    conn.autocommit = True
+
+
+def test_additive_newer_db_is_allowed_and_not_downgraded(conn):
+    # A database at a HIGHER schema_version but whose floor this client still
+    # satisfies (additive changes) must operate — and the newer stamp must NOT be
+    # dropped back to this build's version (GREATEST keeps it).
+    from memgres.schema import SCHEMA_VERSION, migrate
+
+    cfg = _fresh_full_schema(conn)
+    ahead = SCHEMA_VERSION + 5
+    with conn.cursor() as cur:
+        cur.execute("UPDATE memgres_meta SET schema_version=%s WHERE only_row",
+                    (ahead,))                        # newer, but floor stays <= us
+    conn.commit()
+    migrate(conn, cfg)                               # no refusal
+    with conn.cursor() as cur:
+        cur.execute("SELECT schema_version FROM memgres_meta WHERE only_row")
+        assert cur.fetchone()[0] == ahead            # not downgraded
+    conn.rollback()
+    conn.autocommit = True
