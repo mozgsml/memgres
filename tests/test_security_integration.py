@@ -114,8 +114,8 @@ def test_cannot_recall_across_tenants(env):
     s.write(attacker_tok, body="attacker own note\n", space="n")
     # attacker's recall never sees the victim's row
     hits = s.recall(attacker_tok, "secret data", space="n")
-    assert all("victim" not in h.body for h in hits)
-    assert [h.body for h in hits] == [] or all("attacker" in h.body for h in hits)
+    assert all("victim" not in h.snippet for h in hits)
+    assert hits == [] or all("attacker" in h.snippet for h in hits)
 
 
 def test_cannot_forget_or_move_victim_memory(env):
@@ -151,7 +151,7 @@ def test_name_collision_does_not_cross_tenants(env):
     with pytest.raises(DENIED):
         s.get(bob_tok, amem.id, space="notes")
     # recall in bob's 'notes' never returns alice's row
-    assert all("alice" not in h.body for h in s.recall(bob_tok, "notes", space="notes"))
+    assert all("alice" not in h.snippet for h in s.recall(bob_tok, "notes", space="notes"))
 
 
 # ─── permission ceilings ─────────────────────────────────────────────────────

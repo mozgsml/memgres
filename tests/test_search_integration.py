@@ -71,11 +71,11 @@ def test_lexical_recall_and_tag_filter(monkeypatch):
     s.write(body="quick database indexing tips\n", tags=["tech"])
 
     hits = s.recall(None, "quick", mode="lexical")
-    bodies = [h.body for h in hits]
+    bodies = [h.snippet for h in hits]   # short bodies → snippet==body
     assert any("fox" in b for b in bodies) and any("database" in b for b in bodies)
 
     tech = s.recall(None, "quick", mode="lexical", tags=["tech"])
-    assert len(tech) == 1 and "database" in tech[0].body
+    assert len(tech) == 1 and "database" in tech[0].snippet
     conn.close()
 
 
@@ -92,7 +92,7 @@ def test_semantic_recall_and_subtree(monkeypatch):
     s.write(body="cherry orchard notes\n", path="misc.cherry", tags=["t"])
 
     top = s.recall(None, "apple apple", mode="semantic", k=1)
-    assert len(top) == 1 and "apple" in top[0].body        # nearest by vector
+    assert len(top) == 1 and "apple" in top[0].snippet     # nearest by vector
 
     # subtree scope: only food.fruit, cherry (in misc) excluded even if queried
     sub = s.recall(None, "cherry", mode="semantic", path_prefix="food.fruit")

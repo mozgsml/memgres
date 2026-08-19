@@ -63,7 +63,8 @@ def test_lists_subtree_ordered_by_path(store):
     # the ops row is NOT in the decisions subtree
     assert all(r["path"].startswith("decisions") for r in rows)
     # shape of each row
-    assert set(rows[0]) == {"id", "path", "tags", "preview", "created_at", "updated_at"}
+    assert set(rows[0]) == {"id", "path", "tags", "title", "preview",
+                            "created_at", "updated_at"}
 
 
 def test_preview_is_first_line_truncated(store):

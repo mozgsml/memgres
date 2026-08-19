@@ -5,9 +5,107 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
-## [Unreleased]
+## [0.4.0] — 2026-08-19
+
+### Changed
+- **Chunks are the semantic index; embedding moved off the write path.** A memory
+  is now indexed as its overlapping chunks, not one whole-body vector. Recall
+  ranks over the chunk vectors and keeps the **best chunk per memory** (one hit
+  per memory, whose winning chunk is also its snippet), so a match in the tail of
+  a long body is found (a single vector couldn't represent 60 KB) and one long
+  document can't crowd distinct memories out of the top-k (an iterative-exclude
+  loop, round-capped and logged, dedups by memory). A write no longer embeds
+  inline on the server: it flags the row and a background worker segments, embeds,
+  and indexes it — so a write returns fast regardless of body size. Dispatch is
+  chosen by `MEMGRES_EMBED_DISPATCH` (`inline`|`async`) with the worker settings
+  below (see *Added → Split deployment*). Embedded/library use (no worker) stays
+  `inline` by default, so semantic recall is correct the instant a write commits. **Upgrade note (schema v6):** the old `memory.embedding`
+  column is dropped and every existing row is flagged once for re-chunking — the
+  worker rebuilds the index from the bodies on first run; bodies and history are
+  untouched, no manual reindex. A qdrant deployment can drop its old
+  `{collection}` doc-vector collection (chunks live in `{collection}_segments`).
+- **Recall returns one body view per hit — never both a slice and the whole
+  body.** Each hit now carries `snippet` plus `kind` (`"snippet"` | `"full"`) and
+  `lines` (`[start, end]`, 1-based inclusive), replacing the old separate `body`
+  field and scalar `line`. A hit gets a **slice** (`kind="snippet"`) when its body
+  is long; semantic/hybrid pick the best-matching segment with an exact `lines`
+  range, lexical uses `ts_headline`. A body short enough that a slice would just
+  repeat it comes back **whole** (`kind="full"`, `lines=[1,N]`) — the threshold is
+  the new `MEMGRES_FULL_BODY_MAX_CHARS` (default 500). `MEMGRES_FULL_BODY` now
+  **defaults to `false`** (was `true`): pass `full_body=true` (per call or via env)
+  to force whole bodies, `snippet=false` to skip slicing. This trims recall
+  responses so an agent isn't handed a slice *and* a wall of text for every hit.
+- **Lexical/fallback snippets are now clean prose** — `ts_headline` runs with
+  empty `StartSel`/`StopSel`, so the returned text has no `<b>…</b>` markup that
+  could mislead a model reading it.
 
 ### Added
+- **Split (enterprise) deployment topology.** For many clients, run a stateless
+  API tier that only *flags* writes (`MEMGRES_EMBED_DISPATCH=async` +
+  `MEMGRES_EMBED_WORKER=off`) plus a scalable `memgres-worker` tier that embeds.
+  Draining is **claim-based** (`FOR UPDATE SKIP LOCKED`), so worker replicas never
+  embed a memory twice or block each other, and a crash mid-embed leaves the row
+  flagged for retry — never stuck (the claim lock releases when the connection
+  dies). A row that keeps failing to embed is retried with back-off and, after
+  `MEMGRES_EMBED_MAX_ATTEMPTS`, dead-lettered (out of rotation, logged) so one
+  poison body can't wedge the queue behind it. `MEMGRES_EMBED_DISPATCH`
+  (`inline`|`async`) replaces the derived async flag; `inline` stays the safe
+  library/all-in-one default. New `memgres-worker` entrypoint,
+  `deploy/docker-compose.yml`, and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+- **`docs/AGENT_MEMORY_GUIDE.md`** — a playbook for using memgres as an agent's
+  long-term org memory: an example `MEMGRES_INSTRUCTION` (the ≤2 KB startup rulebook)
+  plus the full reasoning mapped to memgres features — two-layer raw/distilled split,
+  atomic write discipline, ADR-shaped decisions with rationale, source+date trust,
+  conflict resolution ("memory says X, someone says Y"), and hygiene. Notes the tool
+  gaps (dedup-at-write, freshness fields, first-class links) that instruction covers
+  for now.
+- **`docs/CHOOSING.md`** — a decision guide for picking a run mode, with the
+  explicit recommendation that **more than one user should run the shared Docker
+  server, not a per-machine install** (one pool, one worker, central tokens, one
+  thing to upgrade and back up). Linked from the README and `docs/DEPLOYMENT.md`.
+- **`memgres-reembed`** — switch the embedding model/dimension on an existing
+  store: re-stamps the model, wipes and recreates the chunk index at the new
+  dimension, flags every memory, and rebuilds — bodies and history untouched.
+  (Normal startup still refuses a silent model change.)
+- **`MEMGRES_CHUNK_CHARS` / `_OVERLAP`** — clearer names for the chunk index size
+  and overlap (the legacy `MEMGRES_SNIPPET_SEG_*` still work).
+- **Compatibility floor + startup version guard.** The meta row now carries
+  `min_reader_version` alongside `schema_version` — the low end of the range of
+  client `SCHEMA_VERSION`s allowed to operate against the data (the high end is
+  open: a newer client migrates forward). It is raised only by a
+  backward-incompatible migration (tracked by `SCHEMA_BREAKING_VERSION` in code),
+  so an older client keeps working against a newer-but-additive schema. On
+  connect, a client whose `SCHEMA_VERSION` is below the database's floor refuses
+  to run with an actionable "update this client" message instead of silently
+  misreading it — which is exactly what a stale machine would otherwise hit after
+  another machine upgrades the shared store past a breaking change. A fresh or
+  in-range database migrates forward as usual, and the stamp is monotonic
+  (operating with an older client never downgrades a newer database's versions).
+- **Server-side MCP `instructions`** — set `MEMGRES_INSTRUCTION` and the text is
+  emitted in the MCP `initialize` response, so a client that honors it (e.g.
+  Claude Code) loads it once at connect to guide how the model uses the memory
+  (without inflating every tool response). Optional — unset, the field is omitted
+  entirely — and byte-capped (2 KB, on a UTF-8 boundary) to stay small.
+- **Curated `title` + `memory_find`** — a memory can carry a short, human-curated
+  `title` (set whole, distinct from the body's first-line preview), returned on
+  `get`/`list`/recall hits. `memory_find` (MCP) / `GET /find` locate memories by
+  their **title + tags** only — light rows `{id, path, title, tags, score}`, never
+  the body, no vectors — a cheap "where is it?" scan before a heavier recall (works
+  without an embedder). Title changes are audited in the hash-chained history
+  (`title_before`/`title_after`, op `retitle`) and folded into the chain **only
+  when the title actually changes**, the same domain-separated way as author — so
+  every pre-title row keeps its exact digest and still verifies. New
+  `MEMGRES_MAX_TITLE_BYTES` (default 256), reported in `server_info`.
+- **Substring edit (`replace`)** — edit a memory by sending `replace_old` →
+  `replace_new` instead of hand-building a unified diff: the server finds
+  `replace_old` in the current body and rewrites just it. `replace_old` must be
+  unique unless `replace_all=true` (else a clear error asks for more context);
+  a missing `replace_old` or a no-op (old == new) is rejected, never a silent
+  write. Because only `old`+`new` cross the wire (size-capped), a body larger
+  than `MEMGRES_MAX_WRITE_BYTES` stays editable — which a whole-body rewrite
+  can't do. It lowers to the existing diff+OCC path, so history stays a single
+  replayable, line-attributable chain (`base_hash` optional here; supplied adds
+  strict OCC). On the `memory_write` MCP tool and `PATCH /memories/{id}`.
 - **`server_info` now reports `version` and `schema_version`** — a client can tell
   which memgres it's talking to (and which DB layout) without guessing. The
   version is read from code (`memgres.__version__`), so an editable/dev checkout
@@ -23,6 +121,19 @@ patch = fixes).
   author reads back as its bare id). The author is folded into the tamper-evident
   hash chain, so stripping or swapping authorship is detectable by
   `verify_history`.
+
+### Security
+- **`replace_all` can no longer amplify a write into an out-of-memory.** A
+  substring `replace_all` multiplies `new` by every occurrence of `old`; the
+  result is now bounded against `MEMGRES_MAX_BODY_BYTES` **before** the string is
+  materialized (projected from the occurrence count), instead of only after —
+  closing a path where one authenticated write could allocate gigabytes.
+- **History hash fold is injective over its fields.** Each dimension folded into
+  the tamper-evident chain (author, title) now reduces every field to its own
+  fixed-width hash before joining, so a `\x1f` inside a client-supplied field
+  (e.g. a crafted title) can't shift a field boundary to collide two logically
+  different rows. (Impact was already negligible — the chain is unkeyed — but the
+  claimed property now actually holds.)
 
 ### Notes
 - Backward compatible: user-less writes (single mode, and the global-admin env

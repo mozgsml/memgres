@@ -23,16 +23,20 @@ That's it — no API token is stored anywhere; PyPI trusts the GitHub workflow v
 ## Cut a release
 
 ```bash
-# bump version in pyproject.toml first (e.g. 0.1.0)
-git tag v0.1.0
-git push origin v0.1.0
+# 1. Bump the version in the ONLY place it's defined: memgres/_version.py
+#    (pyproject.toml reads it dynamically via [tool.setuptools.dynamic];
+#     nothing else carries the number — don't edit pyproject.toml).
+# 2. Move CHANGELOG's [Unreleased] block under a new "## [X.Y.Z] — <date>" heading.
+# 3. Tag with the SAME version and push:
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 The tag triggers:
-- `ci.yml` → tests, then builds and pushes the image (`:0.1.0`, `:0.1`, `:latest`).
+- `ci.yml` → tests, then builds and pushes the image (`:X.Y.Z`, `:X.Y`, `:latest`).
 - `release.yml` → builds sdist+wheel and publishes to PyPI via Trusted Publishing.
 
-After it lands: `pip install memgres` and `docker pull ghcr.io/mozgsml/memgres:0.1.0`.
+After it lands: `pip install memgres` and `docker pull ghcr.io/mozgsml/memgres:X.Y.Z`.
 
 ## Alternative: API token instead of Trusted Publishing
 

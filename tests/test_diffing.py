@@ -108,6 +108,48 @@ def test_row_hash_folds_author_when_present():
     assert other_tok != with_author
 
 
+def test_row_hash_unchanged_without_title():
+    # A row that didn't touch the title (title_before/after both None) hashes
+    # exactly as it would without the title feature — so pre-title chains verify.
+    from memgres.store import _row_hash
+
+    base = _row_hash(None, "m", 1, "create", "d", "h", None, ["t"], "s", "r")
+    assert _row_hash(None, "m", 1, "create", "d", "h", None, ["t"], "s", "r",
+                     None, None, None, None) == base
+    # a title change folds in and changes the hash
+    with_title = _row_hash(None, "m", 1, "retitle", None, "h", None, None, None, None,
+                           None, None, "", "New Title")
+    plain = _row_hash(None, "m", 1, "retitle", None, "h", None, None, None, None)
+    assert with_title != plain
+
+
+def test_title_and_author_fold_independently():
+    # title then author, both present: order is fixed, and dropping either changes
+    # the digest — so tampering with either is detectable.
+    from memgres.store import _row_hash
+
+    both = _row_hash(None, "m", 2, "diff", "d", "h", None, None, None, None,
+                     "user-x", "tok-y", "old", "new")
+    no_author = _row_hash(None, "m", 2, "diff", "d", "h", None, None, None, None,
+                          None, None, "old", "new")
+    no_title = _row_hash(None, "m", 2, "diff", "d", "h", None, None, None, None,
+                         "user-x", "tok-y", None, None)
+    assert both != no_author and both != no_title and no_author != no_title
+
+
+def test_title_fold_is_injective_over_its_two_fields():
+    # Security review #3: the two title fields are folded through per-field hashes,
+    # not a raw \x1f-join, so a \x1f inside one title can't shift the field boundary
+    # and collide two logically different retitles.
+    from memgres.store import _row_hash
+
+    a = _row_hash(None, "m", 1, "retitle", None, "h", None, None, None, None,
+                  None, None, "a\x1fb", "c")
+    b = _row_hash(None, "m", 1, "retitle", None, "h", None, None, None, None,
+                  None, None, "a", "b\x1fc")
+    assert a != b
+
+
 def test_author_cannot_be_forged_via_delimiter_in_reason():
     # Regression (security review #1): author is folded through a domain-separated
     # outer hash, NOT appended as more \x1f-joined fields. So an authored row must

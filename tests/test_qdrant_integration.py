@@ -64,8 +64,11 @@ def store(monkeypatch):
         cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
     from qdrant_client import QdrantClient
     qc = QdrantClient(url=QURL)
-    if qc.collection_exists(COLL):
-        qc.delete_collection(COLL)
+    # reset BOTH the (legacy) doc collection and the chunk collection, else chunk
+    # points from earlier tests linger and pollute grouped search
+    for c in (COLL, f"{COLL}_segments"):
+        if qc.collection_exists(c):
+            qc.delete_collection(c)
 
     for k in list(os.environ):
         if k.startswith("MEMGRES_") or k == "QDRANT_URL":
@@ -97,11 +100,11 @@ def test_no_pgvector_column_when_qdrant(store):
 
 
 def test_namespace_payload_index_created(store):
-    # tenant-scoped ANN search filters on `namespace`; a keyword payload index
-    # keeps that filter fast as the collection grows (isolation holds either way)
+    # tenant-scoped ANN search filters on `namespace`; a keyword payload index on
+    # the chunk collection keeps that filter fast (isolation holds either way)
     from qdrant_client import QdrantClient
     qc = QdrantClient(url=QURL)
-    schema = qc.get_collection(COLL).payload_schema or {}
+    schema = qc.get_collection(f"{COLL}_segments").payload_schema or {}
     assert "namespace" in schema
     assert str(schema["namespace"].data_type).lower().endswith("keyword")
 
@@ -112,7 +115,7 @@ def test_semantic_recall_via_qdrant(store):
     store.write(body="cherry orchard notes\n", path="misc.cherry", tags=["tree"])
 
     top = store.recall(None, "apple apple", mode="semantic", k=1)
-    assert len(top) == 1 and "apple" in top[0].body
+    assert len(top) == 1 and "apple" in top[0].snippet
 
     # tag filter (enforced in PG after Qdrant ranks)
     fruit = store.recall(None, "cherry", mode="semantic", tags=["fruit"])
@@ -132,12 +135,14 @@ def test_forget_removes_qdrant_point(store):
 
 def test_edit_reembeds(store):
     m = store.write(body="apple apple apple\n")                   # strongly 'apple'
-    # rewrite to cherry; the stored vector must move (re-embedded on the edit)
+    # rewrite to cherry; the stored chunks must move (re-embedded on the edit)
     store.write(id=m.id, body="cherry cherry cherry\n", base_hash=m.content_hash)
     cherry = store.recall(None, "cherry", mode="semantic", k=1)
-    assert cherry[0].id == m.id and cherry[0].score > 0.9        # now a cherry vector
+    assert cherry[0].id == m.id and cherry[0].score > 0.9        # now a cherry chunk
+    # no longer apple-like: the orthogonal chunk either drops out (qdrant excludes
+    # a 0-similarity group) or comes back at ~0 (pgvector keeps it) — never strong.
     apple = store.recall(None, "apple", mode="semantic", k=1)
-    assert apple[0].score < 0.1                                  # no longer apple-like
+    assert apple == [] or apple[0].score < 0.1
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from typing import List, Optional
 
 import psycopg
 
+from . import identity
 from .config import Config, load
 from .diffing import DiffConflict
 from .embeddings import get_embedder
@@ -59,14 +60,19 @@ def create_app(cfg: Optional[Config] = None):
 
     cfg = cfg or load()
     embedder = get_embedder(cfg)
+    # Migrate up front (before the worker or any request touches the schema),
+    # then start the embed worker and set cfg.embed_dispatch — so the route
+    # closures below capture the finalized cfg.
+    with psycopg.connect(cfg.database_url or "") as _mc:
+        migrate(_mc, cfg)               # idempotent; stamps embed model/dim
+    from .embed_worker import wire_server
+    _worker, cfg, backend = wire_server(cfg, embedder)
     pool = ConnectionPool(cfg.database_url or "", min_size=1,
                           max_size=cfg.pool_size, open=False)
 
     @asynccontextmanager
     async def lifespan(app):
         pool.open()
-        with pool.connection() as conn:
-            migrate(conn, cfg)          # idempotent; stamps embed model/dim
         yield
         pool.close()
 
@@ -77,6 +83,7 @@ def create_app(cfg: Optional[Config] = None):
         body: str
         path: Optional[str] = None
         tags: Optional[List[str]] = None
+        title: Optional[str] = None
         source: Optional[str] = None
         reason: Optional[str] = None
         ttl_days: Optional[int] = None
@@ -87,8 +94,12 @@ def create_app(cfg: Optional[Config] = None):
         body: Optional[str] = None
         diff: Optional[str] = None
         base_hash: Optional[str] = None
+        replace_old: Optional[str] = None
+        replace_new: Optional[str] = None
+        replace_all: bool = False
         path: Optional[str] = None
         tags: Optional[List[str]] = None
+        title: Optional[str] = None
         source: Optional[str] = None
         reason: Optional[str] = None
         ttl_days: Optional[int] = None
@@ -105,22 +116,17 @@ def create_app(cfg: Optional[Config] = None):
     # ─── auth: extract the namespace token ──────────────────────────────────
     def token(authorization: Optional[str] = Header(None),
               x_memgres_token: Optional[str] = Header(None)) -> Optional[str]:
-        tok = x_memgres_token
-        if not tok and authorization and authorization.lower().startswith("bearer "):
-            tok = authorization[7:]
-        tok = tok or cfg.token          # env default (single-tenant deployments)
+        tok = identity.bearer_token(authorization, x_memgres_token)
+        tok = tok or cfg.default_token          # env default (single-tenant deployments)
         if cfg.key_mode != "single" and not tok:
             raise HTTPException(401, "token required")
         return tok
 
     def _mem(m) -> dict:
-        return {"id": m.id, "content_hash": m.content_hash, "body": m.body,
-                "tags": m.tags, "path": m.path, "seq": m.seq,
-                "created_at": m.created_at, "updated_at": m.updated_at,
-                "expires_at": m.expires_at}
+        return m.to_dict()          # FastAPI JSON-encodes the raw datetimes
 
     def _store(conn):
-        return Store(cfg, embedder=embedder, conn=conn)
+        return Store(cfg, embedder=embedder, conn=conn, backend=backend)
 
     def _guard(fn):
         """Run a store call, mapping store exceptions to HTTP codes."""
@@ -153,7 +159,7 @@ def create_app(cfg: Optional[Config] = None):
     def create(req: CreateBody, tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
             m = _guard(lambda: _store(conn).write(
-                tok, body=req.body, path=req.path, tags=req.tags,
+                tok, body=req.body, path=req.path, tags=req.tags, title=req.title,
                 source=req.source, reason=req.reason, ttl_days=req.ttl_days,
                 space=req.space, space_id=req.space_id))
             return _mem(m)
@@ -168,9 +174,14 @@ def create_app(cfg: Optional[Config] = None):
     @app.patch("/memories/{mid}")
     def edit(mid: str, req: EditBody, tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
+            replace = None
+            if req.replace_old is not None or req.replace_new is not None:
+                replace = (req.replace_old or "", req.replace_new or "")
             m = _guard(lambda: _store(conn).write(
                 tok, id=mid, body=req.body, diff=req.diff, base_hash=req.base_hash,
-                path=req.path, tags=req.tags, source=req.source, reason=req.reason,
+                replace=replace, replace_all=req.replace_all,
+                path=req.path, tags=req.tags, title=req.title,
+                source=req.source, reason=req.reason,
                 ttl_days=req.ttl_days, space=req.space, space_id=req.space_id))
             return _mem(m)
 
@@ -259,18 +270,22 @@ def create_app(cfg: Optional[Config] = None):
                 tok, q, k=k, tags=taglist or None, path_prefix=path_prefix,
                 mode=mode, snippet=snippet, full_body=full_body,
                 space=space, space_id=space_id))
-            out = []
-            for h in hits:
-                d = {"id": h.id, "tags": h.tags, "path": h.path,
-                     "score": h.score, "snippet": h.snippet, "line": h.line}
-                if h.body is not None:
-                    d["body"] = h.body
-                out.append(d)
-            return out
+            return [h.to_recall_dict() for h in hits]
+
+    @app.get("/find")
+    def find(q: str, k: int = 10,
+             tags: Optional[str] = Query(None, description="comma-separated"),
+             path_prefix: Optional[str] = None, match: Optional[str] = None,
+             space: Optional[str] = None, space_id: Optional[str] = None,
+             tok: Optional[str] = Depends(token)):
+        """Locate by curated title (+ tags) — light rows, never the body."""
+        taglist = [t for t in (tags.split(",") if tags else []) if t]
+        with pool.connection() as conn:
+            return _guard(lambda: _store(conn).find(
+                tok, q, k=k, tags=taglist or None, path_prefix=path_prefix,
+                match=match, space=space, space_id=space_id))
 
     # ─── spaces: what this token can reach ──────────────────────────────────
-    from . import identity
-
     def _me(conn, tok) -> str:
         """The caller's user id, or 401 if the token has no owning user."""
         p = identity.resolve(conn, cfg, tok)
@@ -357,9 +372,7 @@ def create_app(cfg: Optional[Config] = None):
 
     def admin(authorization: Optional[str] = Header(None),
               x_memgres_token: Optional[str] = Header(None)):
-        tok = x_memgres_token
-        if not tok and authorization and authorization.lower().startswith("bearer "):
-            tok = authorization[7:]
+        tok = identity.bearer_token(authorization, x_memgres_token)
         # constant-time compare; empty admin_token disables admin entirely
         if not cfg.admin_token or not tok or \
                 not _hmac.compare_digest(tok, cfg.admin_token):

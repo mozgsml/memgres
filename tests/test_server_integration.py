@@ -77,7 +77,7 @@ def test_crud_flow(client):
 
     # recall (lexical, auto)
     hits = client.get("/recall", params={"q": "there"}).json()
-    assert any("there" in h["body"] for h in hits)
+    assert any("there" in h["snippet"] for h in hits)   # short body → snippet==body
 
     # move
     r = client.post(f"/memories/{mid}/move", json={"path": "moved.here"})
@@ -88,6 +88,27 @@ def test_crud_flow(client):
     assert client.get(f"/memories/{mid}").status_code == 404
 
 
+def test_replace_edit_over_http(client):
+    r = client.post("/memories", json={"body": "alpha\nbeta\ngamma\n"})
+    mid = r.json()["id"]
+    # substring replace: server finds & rewrites
+    r = client.patch(f"/memories/{mid}",
+                     json={"replace_old": "beta", "replace_new": "BETA"})
+    assert r.status_code == 200 and r.json()["body"] == "alpha\nBETA\ngamma\n"
+    # not found -> 422
+    r = client.patch(f"/memories/{mid}",
+                     json={"replace_old": "zzz", "replace_new": "x"})
+    assert r.status_code == 422
+    # ambiguous -> 422; with replace_all -> ok (on a dedicated record)
+    r2 = client.post("/memories", json={"body": "dup dup\n"})
+    mid2 = r2.json()["id"]
+    amb = client.patch(f"/memories/{mid2}", json={"replace_old": "dup", "replace_new": "z"})
+    assert amb.status_code == 422
+    ok = client.patch(f"/memories/{mid2}",
+                      json={"replace_old": "dup", "replace_new": "z", "replace_all": True})
+    assert ok.status_code == 200 and ok.json()["body"] == "z z\n"
+
+
 def test_recall_tag_and_subtree_filters(client):
     client.post("/memories", json={"body": "apple pie recipe\n", "tags": ["food"],
                                    "path": "recipes.apple"})
@@ -95,10 +116,10 @@ def test_recall_tag_and_subtree_filters(client):
                                    "path": "markets.apple"})
     # tag filter
     hits = client.get("/recall", params={"q": "apple", "tags": "finance"}).json()
-    assert len(hits) == 1 and "ticker" in hits[0]["body"]
+    assert len(hits) == 1 and "ticker" in hits[0]["snippet"]
     # subtree filter
     hits = client.get("/recall", params={"q": "apple", "path_prefix": "recipes"}).json()
-    assert len(hits) == 1 and "recipe" in hits[0]["body"]
+    assert len(hits) == 1 and "recipe" in hits[0]["snippet"]
 
 
 def test_list_memories_route(client):

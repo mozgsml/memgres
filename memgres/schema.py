@@ -17,7 +17,23 @@ from pathlib import Path
 
 from .config import Config
 
-SCHEMA_VERSION = 4
+# The version this build migrates the database TO (the latest migration it carries).
+SCHEMA_VERSION = 8
+
+# The compatibility FLOOR: the schema version of the most recent backward-
+# INCOMPATIBLE migration — one that changed the shape/semantics old code relied on
+# (a dropped column, a changed ranking model), so a client older than this can no
+# longer read the data correctly. A client operating on a database records this
+# into `memgres_meta.min_reader_version`; any client whose SCHEMA_VERSION is below a
+# database's stored floor refuses to run (see `_guard_client_version`).
+#
+# BUMP THIS to a new migration's version ONLY when that migration breaks old
+# readers. An additive migration (new column/table/index that old code ignores)
+# must leave it as-is, so older clients keep working against the newer schema.
+#   v6 (0005): dropped the whole-body doc vector, moved ranking to chunks → BREAKING.
+#   v7 (0006): added min_reader_version column → additive, floor stays 6.
+#   v8 (0007): added embed_attempts/embed_failed_at → additive, floor stays 6.
+SCHEMA_BREAKING_VERSION = 6
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are
 # shipped inside the package (see pyproject) and this still resolves.
@@ -34,28 +50,73 @@ class SchemaMismatch(RuntimeError):
     """The DB was built with settings incompatible with the current config."""
 
 
-def _sql(name: str) -> str:
-    return (MIGRATIONS_DIR / name).read_text(encoding="utf-8")
-
-
 def migrate(conn, cfg: Config) -> None:
     """Bring the database at `conn` to the schema `cfg` describes.
 
     `conn` is a psycopg connection. Runs in one transaction; raises
     :class:`SchemaMismatch` (and rolls back) on an incompatible existing stamp.
+
+    The numbered ``NNNN_*.sql`` files in ``migrations/`` are applied in filename
+    order — each is idempotent (``IF NOT EXISTS`` / guarded data steps), so a
+    re-run is a no-op and adding a migration is just dropping a new file. The
+    config-dependent pieces (tree, vector index, model/FTS stamp) run after, in
+    Python, because their DDL depends on the live config (dimension, dictionary).
     """
     with conn.transaction():
         with conn.cursor() as cur:
-            cur.execute(_sql("0001_core.sql"))
-            # identity tables (always applied, idempotent; empty in single mode)
-            cur.execute(_sql("0002_identity.sql"))
-            # author columns on history (always applied, idempotent; NULL in
-            # single mode). Folded into the hash chain only when present, so
-            # pre-upgrade chains stay verifiable — see store._row_hash.
-            cur.execute(_sql("0003_history_author.sql"))
+            _guard_client_version(cur)
+            for path in sorted(MIGRATIONS_DIR.glob("[0-9]*.sql")):
+                cur.execute(path.read_text(encoding="utf-8"))
             _apply_tree(cur, cfg)
             _apply_vector(cur, cfg)
             _stamp(cur, cfg)
+
+
+def _column_exists(cur, table: str, column: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s",
+        (table, column))
+    return cur.fetchone() is not None
+
+
+def _guard_client_version(cur) -> None:
+    """Refuse to run a client OLDER than the database's compatibility floor —
+    checked FIRST, before any migration touches the schema.
+
+    The database's operable range is ``[min_reader_version, ∞)`` in terms of client
+    ``SCHEMA_VERSION``: a client at or above the stored floor may operate (and, if
+    newer, migrates the shared store forward), but a client BELOW it cannot — a
+    backward-incompatible migration changed the data into a shape this build can't
+    read. Since state is shared across machines, this is what a stale machine hits
+    after another upgrades past a breaking change: it stops with a clear ask to
+    update, instead of silently misreading the newer schema.
+
+    A newer-but-ADDITIVE database (higher ``schema_version`` but a floor this client
+    still satisfies) passes through and operates normally — that's the point of a
+    range rather than exact-match. A fresh database (no ``memgres_meta`` yet), or a
+    pre-floor one (no ``min_reader_version`` column → floor 1), imposes no bar."""
+    cur.execute("SELECT to_regclass('memgres_meta')")
+    if cur.fetchone()[0] is None:
+        return                       # brand-new database — nothing to compare
+    if not _column_exists(cur, "memgres_meta", "min_reader_version"):
+        return                       # pre-v7 database — no floor recorded yet (== 1)
+    cur.execute("SELECT min_reader_version, schema_version "
+                "FROM memgres_meta WHERE only_row")
+    row = cur.fetchone()
+    if row is None:
+        return
+    floor, stored = row
+    if floor is not None and floor > SCHEMA_VERSION:
+        raise SchemaMismatch(
+            f"this memgres speaks schema v{SCHEMA_VERSION}, but the database "
+            f"(at v{stored}) requires a client of at least v{floor} — it was "
+            f"migrated past a backward-incompatible change by a newer memgres. "
+            f"Update this client (in its venv: pip install -U "
+            f"'memgres[local,qdrant,mcp]', or pull the repo for an editable "
+            f"install) and restart it. Refusing to run below the database's "
+            f"compatibility floor."
+        )
 
 
 def _apply_tree(cur, cfg: Config) -> None:
@@ -85,18 +146,11 @@ def _apply_vector(cur, cfg: Config) -> None:
         # config.validate() already guards this; belt and suspenders.
         raise SchemaMismatch("pgvector semantic search needs MEMGRES_EMBED_DIM > 0")
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    cur.execute(
-        f"ALTER TABLE memory ADD COLUMN IF NOT EXISTS embedding vector({cfg.embed_dim})"
-    )
-    cur.execute(
-        "CREATE INDEX IF NOT EXISTS memory_embedding_hnsw ON memory "
-        "USING hnsw (embedding vector_cosine_ops)"
-    )
-    # Per-memory segment vectors: a durable cache the (future) snippet flow fills
-    # lazily, keyed by the memory's content_hash (`src_hash`) so a body edit — a
-    # new hash — invalidates the cache and `forget` cascades them away. Offsets,
-    # not text: the snippet is sliced from the live body. A memory has few
-    # segments, ranked by a plain scan, so no HNSW here.
+    # Chunk vectors ARE the semantic index (no whole-body doc vector). Each row is
+    # one chunk of one memory: its offset span, its vector, the memory's
+    # content_hash (`src_hash`) so a body edit — a new hash — replaces the set, and
+    # its namespace so ranking never crosses tenants. `forget` cascades them away.
+    # Offsets, not text: the snippet is sliced from the live body.
     cur.execute(
         f"""CREATE TABLE IF NOT EXISTS memory_segment (
                 memory_id uuid NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
@@ -113,6 +167,17 @@ def _apply_vector(cur, cfg: Config) -> None:
         "CREATE INDEX IF NOT EXISTS memory_segment_mid "
         "ON memory_segment (memory_id)"
     )
+    # HNSW over the chunk vectors — this is the global ANN ranking index now, not a
+    # per-memory scan, so it needs one. Plus a btree on namespace for the tenant
+    # filter that rides along every recall.
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS memory_segment_hnsw ON memory_segment "
+        "USING hnsw (embedding vector_cosine_ops)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS memory_segment_ns "
+        "ON memory_segment (namespace)"
+    )
 
 
 def _stamp(cur, cfg: Config) -> None:
@@ -125,10 +190,11 @@ def _stamp(cur, cfg: Config) -> None:
     if row is None:
         cur.execute(
             "INSERT INTO memgres_meta "
-            "(only_row, schema_version, embed_provider, embed_model, embed_dim, "
-            " fts_language, tree_enabled) VALUES (true, %s, %s, %s, %s, %s, %s)",
-            (SCHEMA_VERSION, cfg.embed_provider, cfg.embed_model, cfg.embed_dim,
-             cfg.fts_language, cfg.tree_enabled),
+            "(only_row, schema_version, min_reader_version, embed_provider, "
+            " embed_model, embed_dim, fts_language, tree_enabled) "
+            "VALUES (true, %s, %s, %s, %s, %s, %s, %s)",
+            (SCHEMA_VERSION, SCHEMA_BREAKING_VERSION, cfg.embed_provider,
+             cfg.embed_model, cfg.embed_dim, cfg.fts_language, cfg.tree_enabled),
         )
         return
 
@@ -158,3 +224,14 @@ def _stamp(cur, cfg: Config) -> None:
             "embed_dim=%s, updated_at=now() WHERE only_row",
             (cfg.embed_provider, cfg.embed_model, cfg.embed_dim),
         )
+
+    # Advance the recorded versions to what this migrate() applied — with GREATEST
+    # so an older client operating on a newer-but-additive database never DROPS the
+    # stamp: schema_version tracks the newest schema present, min_reader_version the
+    # highest breaking floor any client has imposed. Both are monotonic.
+    cur.execute(
+        "UPDATE memgres_meta SET "
+        "schema_version = GREATEST(schema_version, %s), "
+        "min_reader_version = GREATEST(min_reader_version, %s) "
+        "WHERE only_row",
+        (SCHEMA_VERSION, SCHEMA_BREAKING_VERSION))

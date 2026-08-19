@@ -39,21 +39,40 @@ from .schema import migrate
 from .store import Store
 
 
-def _mcp(name: str):
-    # The SDK renamed FastMCP -> MCPServer; support both.
+# The MCP `initialize` response carries a server-side `instructions` string; a
+# client that honors it (e.g. Claude Code) loads it ONCE at connect, so it guides
+# the model without inflating every tool response. Kept small on purpose.
+MCP_INSTRUCTION_MAX_BYTES = 2048
+
+
+def _instruction_text() -> Optional[str]:
+    """Operator-supplied MCP instructions from ``MEMGRES_INSTRUCTION``, or None to
+    omit the field entirely. Capped at ``MCP_INSTRUCTION_MAX_BYTES`` on a UTF-8
+    boundary (clients truncate anyway; we truncate cleanly)."""
+    import os
+    raw = os.environ.get("MEMGRES_INSTRUCTION", "").strip()
+    if not raw:
+        return None
+    b = raw.encode("utf-8")
+    if len(b) <= MCP_INSTRUCTION_MAX_BYTES:
+        return raw
+    return b[:MCP_INSTRUCTION_MAX_BYTES].decode("utf-8", "ignore")
+
+
+def _mcp(name: str, instructions: Optional[str] = None):
+    # The SDK renamed FastMCP -> MCPServer; support both. ``instructions`` is
+    # emitted in the initialize response; None => the SDK omits it.
+    kw = {"instructions": instructions} if instructions else {}
     try:
         from mcp.server.mcpserver import MCPServer
-        return MCPServer(name)
+        return MCPServer(name, **kw)
     except ImportError:
         from mcp.server.fastmcp import FastMCP
-        return FastMCP(name)
+        return FastMCP(name, **kw)
 
 
 def _mem(m) -> dict:
-    return {"id": m.id, "content_hash": m.content_hash, "body": m.body,
-            "tags": m.tags, "path": m.path, "seq": m.seq,
-            "created_at": str(m.created_at), "updated_at": str(m.updated_at),
-            "expires_at": str(m.expires_at) if m.expires_at else None}
+    return m.to_dict(stringify_dates=True)      # MCP layer needs plain strings
 
 
 def build_server(cfg: Optional[Config] = None):
@@ -68,7 +87,11 @@ def build_server(cfg: Optional[Config] = None):
                           max_size=cfg.pool_size, open=True)
     with pool.connection() as conn:
         migrate(conn, cfg)
-    mcp = _mcp("memgres")
+    # Start the in-process embed worker (if warranted) and set cfg.embed_dispatch
+    # to match, so writes defer to it. Kept alive by its own daemon thread.
+    from .embed_worker import wire_server
+    _worker, cfg, backend = wire_server(cfg, embedder)
+    mcp = _mcp("memgres", instructions=_instruction_text())
 
     # Should the LLM-facing tools carry a `token` argument at all?
     #   MEMGRES_MCP_TOKEN_ARG = on | off | auto (default).
@@ -83,10 +106,10 @@ def build_server(cfg: Optional[Config] = None):
     elif _arg in ("0", "false", "off", "no"):
         expose_token = False
     else:
-        expose_token = cfg.key_mode != "single" and not cfg.token
+        expose_token = cfg.key_mode != "single" and not cfg.default_token
 
     def _store(conn):
-        return Store(cfg, embedder=embedder, conn=conn)
+        return Store(cfg, embedder=embedder, conn=conn, backend=backend)
 
     def _token(ctx, arg: Optional[str] = None) -> Optional[str]:
         """The caller's token, resolved **authoritatively** so a pin can't be
@@ -108,15 +131,13 @@ def build_server(cfg: Optional[Config] = None):
                 req = None
         if req is not None:
             try:
-                auth = req.headers.get("authorization") or ""
-                if auth[:7].lower() == "bearer ":
-                    return auth[7:].strip()
-                xt = req.headers.get("x-memgres-token")
-                if xt:
-                    return xt.strip()
+                tok = identity.bearer_token(req.headers.get("authorization"),
+                                            req.headers.get("x-memgres-token"))
+                if tok:
+                    return tok
             except Exception:
                 pass
-        return cfg.token or arg or None
+        return cfg.default_token or arg or None
 
     def _uid(conn, token: Optional[str]) -> str:
         """Resolve a token to its user id (for read-level identity tools)."""
@@ -141,21 +162,32 @@ def build_server(cfg: Optional[Config] = None):
     @mcp.tool()
     def memory_write(body: Optional[str] = None, id: Optional[str] = None,
                      diff: Optional[str] = None, base_hash: Optional[str] = None,
+                     replace_old: Optional[str] = None,
+                     replace_new: Optional[str] = None, replace_all: bool = False,
                      path: Optional[str] = None, tags: Optional[List[str]] = None,
+                     title: Optional[str] = None,
                      source: Optional[str] = None, reason: Optional[str] = None,
                      ttl_days: Optional[int] = None,
                      space: Optional[str] = None, space_id: Optional[str] = None,
                      token: Optional[str] = None, ctx: Context = None) -> dict:
         """Create or edit a memory. Omit `id` to create (needs `body`). To edit,
-        pass `id` plus either a whole new `body` or a unified `diff` with the
-        `base_hash` it was cut from (stale base -> conflict). `path`/`tags` set
-        the tree position and labels; `source`/`reason` record provenance.
-        `space` picks one of your namespaces by name (`space_id` for a shared
-        one); omit both to use your default."""
+        pass `id` plus ONE of: a whole new `body`; a substring edit
+        `replace_old`→`replace_new` (server finds `replace_old` and rewrites just
+        it — no diff to hand-build, and a body larger than the write cap stays
+        editable since only old+new are sent; `replace_old` must be unique unless
+        `replace_all=true`); or a unified `diff` with the `base_hash` it was cut
+        from. `path`/`tags` set the tree position and labels; `title` is a short
+        curated caption (set whole, searchable via `memory_find`); `source`/`reason`
+        record provenance. `space` picks one of your namespaces by name (`space_id`
+        for a shared one); omit both to use your default."""
+        replace = None
+        if replace_old is not None or replace_new is not None:
+            replace = (replace_old or "", replace_new or "")
         with pool.connection() as conn:
             return _mem(_store(conn).write(
                 _token(ctx, token), id=id or None, body=body, diff=diff,
-                base_hash=base_hash, path=path, tags=tags, source=source,
+                base_hash=base_hash, replace=replace, replace_all=replace_all,
+                path=path, tags=tags, title=title, source=source,
                 reason=reason, ttl_days=ttl_days, space=space, space_id=space_id))
 
     @mcp.tool()
@@ -181,23 +213,20 @@ def build_server(cfg: Optional[Config] = None):
         governs lexical word combination — defaults to OR-any (any query word
         matches, forgiving recall); set 'all' to require every word (narrow).
         Optionally scope to a tag set (`tags`) or a subtree (`path_prefix`, e.g.
-        'ops.postgres'). Each hit carries a `snippet` (+`line`) by default —
-        semantic/hybrid use the best-matching segment, lexical uses ts_headline;
-        pass `full_body=false` to get just the snippet, `snippet=false` for none.
-        `space`/`space_id` pick which namespace to search (default: yours)."""
+        'ops.postgres'). Each hit carries a `snippet` plus `kind` and `lines`:
+        `kind="snippet"` is the most relevant slice (semantic/hybrid pick the
+        best-matching segment, lexical uses ts_headline) with `lines`=[start,end];
+        `kind="full"` means the snippet IS the whole body (short body, or
+        `full_body=true`). Pass `full_body=true` to force whole bodies,
+        `snippet=false` to skip slicing. `space`/`space_id` pick which namespace
+        to search (default: yours)."""
         with pool.connection() as conn:
-            out = []
-            for h in _store(conn).recall(
-                    _token(ctx, token), query, k=k, tags=tags,
-                    path_prefix=path_prefix, mode=mode, match=match,
-                    snippet=snippet, full_body=full_body,
-                    space=space, space_id=space_id):
-                d = {"id": h.id, "tags": h.tags, "path": h.path,
-                     "score": h.score, "snippet": h.snippet, "line": h.line}
-                if h.body is not None:
-                    d["body"] = h.body
-                out.append(d)
-            return out
+            return [h.to_recall_dict()
+                    for h in _store(conn).recall(
+                        _token(ctx, token), query, k=k, tags=tags,
+                        path_prefix=path_prefix, mode=mode, match=match,
+                        snippet=snippet, full_body=full_body,
+                        space=space, space_id=space_id)]
 
     @mcp.tool()
     def memory_list(path_prefix: Optional[str] = None,
@@ -215,6 +244,21 @@ def build_server(cfg: Optional[Config] = None):
             return _store(conn).list(
                 _token(ctx, token), path_prefix=path_prefix, tags=tags,
                 limit=limit, offset=offset, space=space, space_id=space_id)
+
+    @mcp.tool()
+    def memory_find(query: str, k: int = 10, tags: Optional[List[str]] = None,
+                    path_prefix: Optional[str] = None,
+                    match: Optional[Literal["any", "all"]] = None,
+                    space: Optional[str] = None, space_id: Optional[str] = None,
+                    token: Optional[str] = None, ctx: Context = None) -> List[dict]:
+        """LOCATE by curated `title` (+ tags) — a light "where is it" search over
+        titles only, NEVER the body. Returns {id, path, title, tags, score} (no
+        body/snippet), so it's cheap to scan before a heavier `memory_recall`.
+        Works even without an embedder. Narrow by `tags`/`path_prefix`."""
+        with pool.connection() as conn:
+            return _store(conn).find(_token(ctx, token), query, k=k, tags=tags,
+                                     path_prefix=path_prefix, match=match,
+                                     space=space, space_id=space_id)
 
     @mcp.tool()
     def memory_server_info(ctx: Context = None) -> dict:

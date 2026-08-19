@@ -45,6 +45,14 @@ class NoParent(ValueError):
     """MEMGRES_REQUIRE_PARENT is on and the node's parent path doesn't exist."""
 
 
+class ReplaceNotFound(ValueError):
+    """A substring `replace`'s `old` text does not occur in the current body."""
+
+
+class AmbiguousReplace(ValueError):
+    """A `replace`'s `old` occurs more than once and `replace_all` wasn't set."""
+
+
 @dataclass
 class Memory:
     id: str
@@ -56,6 +64,36 @@ class Memory:
     created_at: object
     updated_at: object
     expires_at: object
+    title: str = ""
+
+    def to_dict(self, *, stringify_dates: bool = False) -> dict:
+        """Serialize for an API layer. ``stringify_dates`` str()-coerces the
+        timestamps (the MCP layer needs plain strings; FastAPI JSON-encodes
+        datetimes itself, so the HTTP layer passes them through raw)."""
+        def d(v):
+            return (str(v) if v is not None else None) if stringify_dates else v
+        return {"id": self.id, "content_hash": self.content_hash, "body": self.body,
+                "title": self.title, "tags": self.tags, "path": self.path,
+                "seq": self.seq, "created_at": d(self.created_at),
+                "updated_at": d(self.updated_at), "expires_at": d(self.expires_at)}
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _fold(digest: str, label: str, *fields: str) -> str:
+    """Fold extra fields into a running digest through a DOMAIN-SEPARATED outer
+    hash rather than appending to the flat field list. `source`/`reason`/`title`
+    are client free text that may contain the ``\\x1f`` separator; concatenating
+    them raw would let a crafted field absorb a delimiter and collide two
+    logically different rows. So each field is first reduced to its own
+    fixed-width sha (``_sha(f)``) before the join: the label namespaces the
+    dimension, and every joined part (label, the inner digest, each field-hash) is
+    now fixed-width with no client bytes spanning a boundary — injective across
+    both dimensions AND the fields within one."""
+    parts = [label, digest, *(_sha(f) for f in fields)]
+    return _sha("\x1f".join(parts))
 
 
 def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
@@ -63,30 +101,27 @@ def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
               path_after: Optional[str], tags_after: Optional[Sequence[str]],
               source: Optional[str], reason: Optional[str],
               author_user_id: Optional[str] = None,
-              author_token_id: Optional[str] = None) -> str:
+              author_token_id: Optional[str] = None,
+              title_before: Optional[str] = None,
+              title_after: Optional[str] = None) -> str:
     parts = [prev or "", memory_id, str(seq), op, diff or "", hash_after or "",
              path_after or "", ",".join(tags_after or []), source or "", reason or ""]
-    base = hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
-    # User-less writes — single mode and the global-admin env token — return the
-    # base digest unchanged, byte-identical to the pre-authorship formula, so
-    # chains written before history_author still verify.
-    if not author_user_id:
-        return base
-    # Fold the author through a DOMAIN-SEPARATED outer hash over the fixed-width
-    # base digest — never by appending more \x1f-joined fields. `source`/`reason`
-    # are client free text that may contain the \x1f separator; concatenating
-    # author alongside them would let a crafted `reason` absorb the delimiter and
-    # collide an authored row with an author-less one (forging/stripping
-    # authorship undetectably). The base digest is fixed-width hex and the ids are
-    # uuids — none can carry \x1f — so the outer join is unambiguous.
-    outer = "\x1f".join(("memgres.author.v1", base,
-                         author_user_id, author_token_id or ""))
-    return hashlib.sha256(outer.encode("utf-8")).hexdigest()
+    h = _sha("\x1f".join(parts))
+    # Each optional dimension folds in ONLY when it was touched on this row. A row
+    # that touched neither title nor author — which includes EVERY row written
+    # before those features — returns the base digest unchanged and still
+    # verifies. Order (title then author) is fixed so compute and verify agree.
+    if title_before is not None or title_after is not None:
+        h = _fold(h, "memgres.title.v1", title_before or "", title_after or "")
+    if author_user_id:
+        h = _fold(h, "memgres.author.v1", author_user_id, author_token_id or "")
+    return h
 
 
 class Store:
     def __init__(self, cfg: Config, embedder: Optional[Embedder] = None,
-                 conn: Optional["psycopg.Connection"] = None):
+                 conn: Optional["psycopg.Connection"] = None,
+                 backend: object = None):
         self.cfg = cfg
         self.embedder = embedder if embedder is not None else get_embedder(cfg)
         # identity is on for open/managed; single mode is one shared space,
@@ -95,8 +130,11 @@ class Store:
         self._own_conn = conn is None
         self._conn = conn or psycopg.connect(cfg.database_url or "")
         # Vector backend picks itself from config (pgvector in-row by default,
-        # Qdrant out-of-band); None when there's no embedder (lexical-only).
-        self._vectors = make_backend(cfg, self.embedder)
+        # Qdrant out-of-band); None when there's no embedder (lexical-only). A
+        # server builds it ONCE and injects it here (a qdrant backend opens a
+        # client + does setup round-trips on construction, so per-request is
+        # wasteful); library/embedded use lets it default.
+        self._vectors = backend if backend is not None else make_backend(cfg, self.embedder)
 
     def close(self):
         if self._own_conn:
@@ -114,7 +152,7 @@ class Store:
         token is required and the returned id-string is a namespace uuid."""
         if not self._identity_on:
             return "", None
-        token = token or self.cfg.token or None
+        token = token or self.cfg.default_token or None
         with self._conn.transaction():
             principal = identity.resolve(self._conn, self.cfg, token)
             nsid, perm = identity.resolve_space(
@@ -146,10 +184,17 @@ class Store:
             raise NoParent(f"parent of '{path}' does not exist "
                            f"(MEMGRES_REQUIRE_PARENT is on)")
 
-    def _raw_vec(self, body: str) -> "Optional[list]":
-        if not self.embedder:
-            return None
-        return self.embedder.embed_documents([body])[0]
+    def _index_now(self, memory_id: str, body: str, ns: str, src_hash: str) -> None:
+        """Build this memory's chunk vectors inline, within the write transaction,
+        UNLESS the deployment defers to a worker (``embed_dispatch == "async"``).
+        Inline keeps semantic recall correct the instant a write commits
+        (library/embedded, tests); async leaves the row ``embed_pending`` for a
+        worker (in-process or a separate memgres-worker) and this is a no-op."""
+        if self.cfg.embed_dispatch == "async" or self._vectors is None:
+            return
+        from .indexing import index_memory
+        index_memory(self._conn, self.cfg, self.embedder, self._vectors,
+                     memory_id, body, ns, src_hash)
 
     # ─── write: create, replace, diff, move, retag (one entrypoint) ─────────
     def write(self, token: Optional[str] = None, *, id: Optional[str] = None,
@@ -157,18 +202,24 @@ class Store:
               base_hash: Optional[str] = None, path: Optional[str] = None,
               tags: Optional[Sequence[str]] = None, source: Optional[str] = None,
               reason: Optional[str] = None, ttl_days: Optional[int] = None,
+              title: Optional[str] = None,
+              replace: Optional[Sequence[str]] = None, replace_all: bool = False,
               space: Optional[str] = None, space_id: Optional[str] = None) -> Memory:
+        if replace is not None and id is None:
+            raise ValueError("replace edits an existing memory — pass its id")
         with self._conn.transaction():
             # authorize inside the tx so a lazily-created user/namespace commits
             # atomically with the write (or rolls back together on failure).
             ns, author = self._authorize(token, space=space, space_id=space_id,
                                          need="write", for_write=True)
             self._check_provenance_size(source, reason)
+            self._check_title_size(title)
             if id is None:
                 return self._create(ns, author, body, path, tags, source, reason,
-                                    ttl_days)
+                                    ttl_days, title)
             return self._update(ns, author, id, body, diff, base_hash, path, tags,
-                                source, reason, ttl_days)
+                                source, reason, ttl_days, title=title,
+                                replace=replace, replace_all=replace_all)
 
     def _check_write_size(self, payload: Optional[str]):
         if payload is not None and byte_len(payload) > self.cfg.max_write_bytes:
@@ -192,49 +243,68 @@ class Store:
                 f"reason is {byte_len(reason)}B > MEMGRES_MAX_REASON_BYTES "
                 f"{self.cfg.max_reason_bytes}")
 
-    def _create(self, ns, author, body, path, tags, source, reason, ttl_days) -> Memory:
+    def _check_title_size(self, title: Optional[str]):
+        if title is not None and byte_len(title) > self.cfg.max_title_bytes:
+            raise TooLarge(
+                f"title is {byte_len(title)}B > MEMGRES_MAX_TITLE_BYTES "
+                f"{self.cfg.max_title_bytes}")
+
+    def _create(self, ns, author, body, path, tags, source, reason, ttl_days,
+                title=None) -> Memory:
         if body is None:
             raise ValueError("create needs a body (diffs apply to an existing memory)")
         self._check_write_size(body)
         self._check_body_size(body)
         chash = content_hash(body)
         tags = list(tags or [])
+        title = title or ""
         cur = self._conn.cursor()
         self._check_parent(cur, ns, path)
+        pending = self._vectors is not None   # chunks need (async or inline) embedding
         cur.execute(
             f"""INSERT INTO memory (namespace, body, content_hash, tags, path, fts,
-                    seq, expires_at)
+                    title, title_fts, seq, embed_pending, expires_at)
                 VALUES (%s, %s, %s, %s, %s::ltree,
                         to_tsvector(%s::regconfig, %s),
-                        1, {self._expiry_sql(ttl_days)})
+                        %s, to_tsvector(%s::regconfig, %s),
+                        1, %s, {self._expiry_sql(ttl_days)})
                 RETURNING id, created_at, updated_at, expires_at""",
-            [ns, body, chash, tags, path, self.cfg.fts_language, body],
+            [ns, body, chash, tags, path, self.cfg.fts_language, body,
+             title, self.cfg.fts_language, title, pending],
         )
         mid, created, updated, expires = cur.fetchone()
-        if self._vectors is not None:
-            # pgvector: a second UPDATE in this same tx; qdrant: point upsert.
-            self._vectors.upsert_doc(self._conn, str(mid), self._raw_vec(body), ns)
+        if pending:
+            self._index_now(str(mid), body, ns, chash)   # inline unless async
         # store create as a diff-from-empty so the whole history is a self-contained
-        # chain (empty → current), replayable forward for reconstruct/annotate.
+        # chain (empty → current), replayable forward for reconstruct/annotate. A
+        # non-empty title at creation is audited (title_before None → title_after).
         self._append_history(str(mid), 1, "create", make_diff("", body), None, chash,
-                             None, path, None, tags, source, reason, author)
-        return Memory(str(mid), body, chash, tags, path, 1, created, updated, expires)
+                             None, path, None, tags, source, reason, author,
+                             title_after=(title or None))
+        return Memory(str(mid), body, chash, tags, path, 1, created, updated,
+                      expires, title)
 
     def _load(self, cur, ns, id) -> tuple:
         cur.execute(
-            "SELECT body, content_hash, tags, path::text, seq FROM memory "
+            "SELECT body, content_hash, tags, path::text, seq, title FROM memory "
             "WHERE id=%s AND namespace=%s FOR UPDATE", (id, ns))
         row = cur.fetchone()
         if row is None:
             raise NotFound(id)
-        return row  # body, content_hash, tags, path, seq
+        return row  # body, content_hash, tags, path, seq, title
 
-    def _update(self, ns, author, id, body, diff, base_hash, path, tags,
-                source, reason, ttl_days) -> Memory:
-        cur = self._conn.cursor()
-        cur_body, cur_hash, cur_tags, cur_path, seq = self._load(cur, ns, id)
+    def _resolve_new_body(self, cur_body, cur_hash, *, body, diff, base_hash,
+                          replace=None, replace_all=False):
+        """Decide the new body text + the body-op from whichever edit form was
+        given — a unified ``diff``, a substring ``replace`` (old, new), a whole
+        ``body``, or none (metadata-only). Returns ``(new_body, op)`` with ``op``
+        in ``{"diff", "replace", None}``.
 
-        # decide the new body
+        This is the ONLY place that turns an edit form into ``new_body``: OCC
+        (``base_hash``) and the incoming-payload size limit are enforced here, and
+        everything downstream is a single path that recomputes the canonical diff
+        from ``cur_body → new_body`` — so every form is line-attributable history
+        with no parallel path."""
         if diff is not None:
             if base_hash is None:
                 raise ValueError("a diff must carry base_hash (the body it was cut from)")
@@ -247,29 +317,78 @@ class Store:
             # guard: also catches an empty or net-zero diff).
             if new_body == cur_body:
                 raise DiffConflict("diff applied but changed nothing — empty or no-op diff")
-            op = "diff"
-        elif body is not None:
+            return new_body, "diff"
+        if replace is not None:
+            # Content-addressed edit (Edit-tool ergonomics): the server finds `old`
+            # and rewrites it, so the client never hand-builds a unified diff and
+            # never ships the whole body — a >MAX_WRITE_BYTES body stays editable
+            # because only old+new cross the wire. base_hash is optional here: a
+            # unique `old` match against the FOR-UPDATE-locked body already guards
+            # drift; when supplied it adds strict OCC.
+            old, new = replace
+            if not old:
+                raise ValueError("replace `old` must be a non-empty string")
             if base_hash is not None and base_hash != cur_hash:
                 raise Conflict(f"stale replace: base {base_hash[:12]} != current {cur_hash[:12]}")
+            count = cur_body.count(old)
+            if count == 0:
+                raise ReplaceNotFound(f"replace text not found in body: {old[:60]!r}")
+            if count > 1 and not replace_all:
+                raise AmbiguousReplace(
+                    f"replace text occurs {count}× — pass replace_all, or add "
+                    f"surrounding context to make it unique: {old[:60]!r}")
+            self._check_write_size(old + new)   # cap old+new, NOT the whole body
+            # Bound the RESULT before materializing it: replace_all over a
+            # many-occurrence body can multiply a 16 KB `new` by thousands of
+            # hits, so `cur_body.replace()` alone could allocate gigabytes (then
+            # hash + diff them) before the after-the-fact body-size check. Project
+            # the byte size from `count` and reject up front.
+            hits = count if replace_all else 1
+            projected = byte_len(cur_body) + hits * (byte_len(new) - byte_len(old))
+            if projected > self.cfg.max_body_bytes:
+                raise TooLarge(
+                    f"replace would grow the body to ~{projected}B > "
+                    f"MEMGRES_MAX_BODY_BYTES {self.cfg.max_body_bytes}")
+            new_body = (cur_body.replace(old, new) if replace_all
+                        else cur_body.replace(old, new, 1))
+            if new_body == cur_body:
+                raise DiffConflict("replace changed nothing (old == new)")
+            return new_body, "diff"             # lowers to the canonical diff path
+        if body is not None:
+            if base_hash is not None and base_hash != cur_hash:
+                raise Conflict(f"stale write: base {base_hash[:12]} != current {cur_hash[:12]}")
             self._check_write_size(body)
-            new_body = body
-            op = "replace"
-        else:
-            new_body = cur_body           # metadata-only
-            op = None
+            # op "replace" = a whole-body swap; the substring `replace` form above
+            # returns "diff" (it lowers to the canonical diff path).
+            return body, "replace"
+        return cur_body, None             # metadata-only
+
+    def _update(self, ns, author, id, body, diff, base_hash, path, tags,
+                source, reason, ttl_days, *, title=None,
+                replace=None, replace_all=False) -> Memory:
+        cur = self._conn.cursor()
+        cur_body, cur_hash, cur_tags, cur_path, seq, cur_title = self._load(cur, ns, id)
+
+        new_body, op = self._resolve_new_body(
+            cur_body, cur_hash, body=body, diff=diff, base_hash=base_hash,
+            replace=replace, replace_all=replace_all)
 
         new_hash = content_hash(new_body)
         new_path = path if path is not None else cur_path
         new_tags = list(tags) if tags is not None else list(cur_tags)
+        new_title = title if title is not None else cur_title
         body_changed = new_hash != cur_hash
         path_changed = new_path != cur_path
         tags_changed = new_tags != list(cur_tags)
+        title_changed = new_title != cur_title
 
         if op is None:  # nothing content-y: classify the metadata change
             if path_changed:
                 op = "move"
             elif tags_changed:
                 op = "retag"
+            elif title_changed:
+                op = "retitle"
             else:
                 # pure touch: renew TTL, no history row
                 cur.execute(
@@ -293,15 +412,20 @@ class Store:
         cur.execute(
             f"""UPDATE memory SET body=%s, content_hash=%s, tags=%s, path=%s::ltree,
                     fts=to_tsvector(%s::regconfig, %s),
-                    seq=seq+1, updated_at=now(), expires_at={self._expiry_sql(ttl_days)}
+                    title=%s, title_fts=to_tsvector(%s::regconfig, %s),
+                    seq=seq+1, updated_at=now(),
+                    embed_pending=(embed_pending OR %s),
+                    expires_at={self._expiry_sql(ttl_days)}
                 WHERE id=%s
                 RETURNING seq, created_at, updated_at, expires_at""",
             [new_body, new_hash, new_tags, new_path,
-             self.cfg.fts_language, new_body, id])
+             self.cfg.fts_language, new_body,
+             new_title, self.cfg.fts_language, new_title,
+             (body_changed and self._vectors is not None), id])
         new_seq, created, updated, expires = cur.fetchone()
         if body_changed and self._vectors is not None:
-            # pgvector: a second UPDATE in this same tx; qdrant: point upsert.
-            self._vectors.upsert_doc(self._conn, str(id), self._raw_vec(new_body), ns)
+            # only a body change re-chunks; path/tag/title edits leave vectors be.
+            self._index_now(str(id), new_body, ns, new_hash)   # inline unless async
         # store the canonical diff (recomputed) even for a whole-body replace, so
         # every body change is line-attributable and the chain stays replayable.
         stored_diff = make_diff(cur_body, new_body) if body_changed else None
@@ -311,13 +435,16 @@ class Store:
                              new_path if path_changed else None,
                              list(cur_tags) if tags_changed else None,
                              new_tags if tags_changed else None,
-                             source, reason, author)
+                             source, reason, author,
+                             title_before=cur_title if title_changed else None,
+                             title_after=new_title if title_changed else None)
         return Memory(str(id), new_body, new_hash, new_tags, new_path, new_seq,
-                      created, updated, expires)
+                      created, updated, expires, new_title)
 
     def _append_history(self, memory_id, seq, op, diff, hash_before, hash_after,
                         path_before, path_after, tags_before, tags_after,
-                        source, reason, author=None):
+                        source, reason, author=None, *,
+                        title_before=None, title_after=None):
         author_user_id, author_token_id = author or (None, None)
         cur = self._conn.cursor()
         cur.execute("SELECT row_hash FROM memory_history WHERE memory_id=%s "
@@ -326,16 +453,18 @@ class Store:
         prev_hash = prev[0] if prev else None
         rhash = _row_hash(prev_hash, memory_id, seq, op, diff, hash_after,
                           path_after, tags_after, source, reason,
-                          author_user_id, author_token_id)
+                          author_user_id, author_token_id,
+                          title_before, title_after)
         cur.execute(
             """INSERT INTO memory_history (memory_id, seq, op, diff, hash_before,
                    hash_after, path_before, path_after, tags_before, tags_after,
                    source, reason, author_user_id, author_token_id,
-                   prev_row_hash, row_hash)
-               VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                   title_before, title_after, prev_row_hash, row_hash)
+               VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (memory_id, seq, op, diff, hash_before, hash_after, path_before,
              path_after, tags_before, tags_after, source, reason,
-             author_user_id, author_token_id, prev_hash, rhash))
+             author_user_id, author_token_id, title_before, title_after,
+             prev_hash, rhash))
 
     # ─── recall: lexical / semantic / hybrid ────────────────────────────────
     def recall(self, token: Optional[str], query: str, *, k: int = 10,
@@ -350,6 +479,19 @@ class Store:
                        query, k=k, tags=tags, path_prefix=path_prefix, mode=mode,
                        match=match, backend=self._vectors,
                        snippet=snippet, full_body=full_body)
+
+    # ─── find: locate by title (+ tags), no body ────────────────────────────
+    def find(self, token: Optional[str], query: str, *, k: int = 10,
+             tags: Optional[Sequence[str]] = None,
+             path_prefix: Optional[str] = None, match: Optional[str] = None,
+             space: Optional[str] = None, space_id: Optional[str] = None) -> List[dict]:
+        """Locate memories whose curated `title` matches — a light "where is it"
+        search over titles + tags, never the body. Returns light rows; works
+        without an embedder. See ``search.find``."""
+        from .search import find as _find
+        ns, _ = self._authorize(token, space=space, space_id=space_id, need="read")
+        return _find(self._conn, self.cfg, ns, query, tags=tags,
+                     path_prefix=path_prefix, k=k, match=match)
 
     # ─── list: enumerate a subtree (no query, no ranking) ───────────────────
     def list(self, token: Optional[str], *, path_prefix: Optional[str] = None,
@@ -367,12 +509,12 @@ class Store:
         where, params = build_filters(ns, tags, path_prefix)
         cur = self._conn.cursor()
         cur.execute(
-            "SELECT id, path::text, tags, "
+            "SELECT id, path::text, tags, title, "
             "left(split_part(body, E'\\n', 1), %s) AS preview, "
             "created_at, updated_at "
             f"FROM memory WHERE {where} ORDER BY path, id LIMIT %s OFFSET %s",
             [self.cfg.list_preview_chars] + params + [limit, offset])
-        cols = ["id", "path", "tags", "preview", "created_at", "updated_at"]
+        cols = ["id", "path", "tags", "title", "preview", "created_at", "updated_at"]
         rows = []
         for r in cur.fetchall():
             d = dict(zip(cols, r))
@@ -397,7 +539,7 @@ class Store:
         cur = self._conn.cursor()
         cur.execute(
             "SELECT id, body, content_hash, tags, path::text, seq, created_at, "
-            "updated_at, expires_at FROM memory WHERE id=%s AND namespace=%s",
+            "updated_at, expires_at, title FROM memory WHERE id=%s AND namespace=%s",
             (id, ns))
         row = cur.fetchone()
         if row is None:
@@ -408,7 +550,7 @@ class Store:
                     f"UPDATE memory SET expires_at={self._expiry_sql(None)} WHERE id=%s",
                     (id,))
         return Memory(str(row[0]), row[1], row[2], list(row[3]), row[4], row[5],
-                      row[6], row[7], row[8])
+                      row[6], row[7], row[8], row[9])
 
     def history(self, token: Optional[str], id: str, *, space: Optional[str] = None,
                 space_id: Optional[str] = None) -> List[dict]:
@@ -423,13 +565,14 @@ class Store:
             "SELECT h.seq, h.op, h.diff, h.hash_before, h.hash_after, "
             "h.path_before::text, h.path_after::text, h.tags_before, h.tags_after, "
             "h.source, h.reason, h.author_user_id::text, h.author_token_id::text, "
-            "NULLIF(u.name, '') AS author_name, "
+            "NULLIF(u.name, '') AS author_name, h.title_before, h.title_after, "
             "h.prev_row_hash, h.row_hash, h.created_at FROM memory_history h "
             "LEFT JOIN app_user u ON u.id = h.author_user_id "
             "WHERE h.memory_id=%s ORDER BY h.seq", (id,))
         cols = ["seq", "op", "diff", "hash_before", "hash_after", "path_before",
                 "path_after", "tags_before", "tags_after", "source", "reason",
                 "author_user_id", "author_token_id", "author_name",
+                "title_before", "title_after",
                 "prev_row_hash", "row_hash", "created_at"]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
@@ -472,7 +615,8 @@ class Store:
             expect = _row_hash(prev, id, r["seq"], r["op"], r["diff"],
                                r["hash_after"], r["path_after"], r["tags_after"],
                                r["source"], r["reason"],
-                               r["author_user_id"], r["author_token_id"])
+                               r["author_user_id"], r["author_token_id"],
+                               r["title_before"], r["title_after"])
             if expect != r["row_hash"] or (r["prev_row_hash"] or None) != prev:
                 return False
             prev = r["row_hash"]
@@ -487,11 +631,9 @@ class Store:
             cur.execute("DELETE FROM memory WHERE id=%s AND namespace=%s", (id, ns))
             deleted = cur.rowcount > 0
         if deleted and self._vectors is not None:
-            # drop the out-of-band vector too (no-op for the in-row pgvector backend)
-            self._vectors.delete_doc(self._conn, id, ns)
-            # and the durable segment cache (pgvector: FK-cascaded already; qdrant:
-            # a sibling collection, so this is the actual cleanup there)
-            self._vectors.delete_segments(self._conn, id)
+            # drop this memory's chunk vectors (pgvector: FK-cascaded already;
+            # qdrant: an out-of-band collection, so this is the real cleanup there)
+            self._vectors.delete_chunks(self._conn, id, ns)
         return deleted
 
     def purge_expired(self) -> int:

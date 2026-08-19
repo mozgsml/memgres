@@ -16,7 +16,10 @@ psycopg = pytest.importorskip("psycopg")
 from memgres.config import load  # noqa: E402
 from memgres.diffing import make_diff, content_hash, DiffConflict  # noqa: E402
 from memgres.schema import migrate  # noqa: E402
-from memgres.store import Store, Conflict, NotFound, TooLarge, NoParent  # noqa: E402
+from memgres.store import (  # noqa: E402
+    Store, Conflict, NotFound, TooLarge, NoParent,
+    ReplaceNotFound, AmbiguousReplace,
+)  # noqa: E402
 
 DSN = os.environ.get("MEMGRES_TEST_DSN",
                      "postgresql://memgres:memgres@localhost:55432/memgres")
@@ -197,6 +200,144 @@ def test_deleted_author_leaves_verifiable_stamp(monkeypatch):
     assert h[0]["author_name"] is None            # user row gone → no name
     assert s.verify_history(tok_admin, m.id, space_id=nsid) is True
     conn.close()
+
+
+def test_replace_substring_unique(store):
+    # content-addressed edit: send old→new, server finds & rewrites just that,
+    # records it as a normal diff in history.
+    m = store.write(body="alpha\nbeta\ngamma\n")
+    m2 = store.write(id=m.id, replace=("beta", "BETA changed"), reason="edit")
+    assert m2.body == "alpha\nBETA changed\ngamma\n" and m2.seq == 2
+    ops = [r["op"] for r in store.history(None, m.id)]
+    assert ops == ["create", "diff"]          # lowers to the canonical diff path
+    assert store.verify_history(None, m.id) is True
+
+
+def test_replace_not_found_leaves_record_untouched(store):
+    m = store.write(body="alpha\nbeta\n")
+    with pytest.raises(ReplaceNotFound):
+        store.write(id=m.id, replace=("zzz", "x"))
+    again = store.get(None, m.id)
+    assert again.body == "alpha\nbeta\n" and again.seq == 1
+
+
+def test_replace_ambiguous_requires_all_or_context(store):
+    m = store.write(body="x x x\n")
+    with pytest.raises(AmbiguousReplace):
+        store.write(id=m.id, replace=("x", "y"))          # 3 matches, no all
+    assert store.get(None, m.id).seq == 1                  # untouched
+    m2 = store.write(id=m.id, replace=("x", "y"), replace_all=True)
+    assert m2.body == "y y y\n" and m2.seq == 2
+
+
+def test_replace_first_only_by_default(store):
+    m = store.write(body="a-a-a\n")
+    # unique per occurrence? "a" appears 3× → ambiguous; use a unique old instead
+    m2 = store.write(id=m.id, replace=("a-a-a", "Z"))
+    assert m2.body == "Z\n"
+
+
+def test_replace_noop_is_rejected(store):
+    from memgres.diffing import DiffConflict
+    m = store.write(body="alpha\nbeta\n")
+    with pytest.raises(DiffConflict):
+        store.write(id=m.id, replace=("beta", "beta"))    # old == new
+    assert store.get(None, m.id).seq == 1
+
+
+def test_replace_edits_body_larger_than_write_cap(store):
+    # the point of replace: old+new cross the wire, not the whole body — so a body
+    # bigger than MAX_WRITE_BYTES stays editable (whole-body rewrite could not).
+    m = store.write(body="head\n" + ("filler line\n" * 40) + "TARGET\n")
+    store.cfg = store.cfg.__class__(**{**store.cfg.__dict__, "max_write_bytes": 20})
+    # a whole-body rewrite of this body would exceed the cap
+    with pytest.raises(TooLarge):
+        store.write(id=m.id, body=m.body + "x\n")
+    # but a small replace succeeds — only old+new are size-checked
+    m2 = store.write(id=m.id, replace=("TARGET", "DONE"))
+    assert m2.body.endswith("DONE\n") and m2.seq == 2
+
+
+def test_replace_all_rejects_amplified_body_before_materializing(store):
+    # replace_all can multiply a small `new` by every occurrence; the result must
+    # be bounded against MAX_BODY_BYTES *before* the giant string is built, not
+    # after. old+new is tiny (passes the write cap), but the projected body isn't.
+    m = store.write(body="x" * 100)                 # 100 occurrences of "x"
+    store.cfg = store.cfg.__class__(**{**store.cfg.__dict__, "max_body_bytes": 200})
+    with pytest.raises(TooLarge):
+        store.write(id=m.id, replace=("x", "yyyy"), replace_all=True)  # →400B
+    # the body was never mutated (rejected up front, no seq bump)
+    after = store.get(None, m.id)
+    assert after.body == "x" * 100 and after.seq == 1
+
+
+def test_replace_requires_id(store):
+    with pytest.raises(ValueError, match="id"):
+        store.write(replace=("a", "b"))
+
+
+def test_title_set_and_returned(store):
+    m = store.write(body="b\n", title="My Note")
+    assert m.title == "My Note"
+    assert store.get(None, m.id).title == "My Note"
+    row = [r for r in store.list(None) if r["id"] == m.id][0]
+    assert row["title"] == "My Note"
+
+
+def test_title_change_audited_and_verifies(store):
+    m = store.write(body="b\n", title="First")
+    m2 = store.write(id=m.id, title="Second")          # title-only change
+    assert m2.title == "Second" and m2.seq == 2
+    h = store.history(None, m.id)
+    assert h[1]["op"] == "retitle"
+    assert h[1]["title_before"] == "First" and h[1]["title_after"] == "Second"
+    # the create row recorded the initial title (before None -> after "First")
+    assert h[0]["title_after"] == "First"
+    assert store.verify_history(None, m.id) is True
+
+
+def test_title_untouched_leaves_history_and_verify_intact(store):
+    # a body edit that doesn't touch the title records NULL title cols and the
+    # chain verifies — the no-title path must not perturb the hash.
+    m = store.write(body="one\n")                       # no title
+    store.write(id=m.id, body="two\n", reason="edit")   # body change, no title
+    h = store.history(None, m.id)
+    assert all(r["title_before"] is None and r["title_after"] is None for r in h)
+    assert store.verify_history(None, m.id) is True
+
+
+def test_title_clear_is_audited(store):
+    m = store.write(body="b\n", title="Some Title")
+    m2 = store.write(id=m.id, title="")                 # clear it
+    assert m2.title == ""
+    h = store.history(None, m.id)
+    assert h[1]["op"] == "retitle"
+    assert h[1]["title_before"] == "Some Title" and h[1]["title_after"] == ""
+    assert store.verify_history(None, m.id) is True
+
+
+def test_title_size_cap(store):
+    store.cfg = store.cfg.__class__(**{**store.cfg.__dict__, "max_title_bytes": 8})
+    with pytest.raises(TooLarge):
+        store.write(body="b\n", title="way too long a title")
+
+
+def test_find_matches_title_not_body(store):
+    # `store` has no embedder — find must work lexically, over the TITLE only.
+    a = store.write(body="the body mentions apples\n", title="Fruit Notes")
+    b = store.write(body="something about fruit here\n", title="Vegetable Notes")
+    hits = store.find(None, "fruit")
+    ids = [h["id"] for h in hits]
+    assert a.id in ids                 # 'fruit' is in a's TITLE
+    assert b.id not in ids             # b has 'fruit' only in its BODY → not matched
+    assert set(hits[0]) == {"id", "path", "title", "tags", "score"}   # light rows
+
+
+def test_find_respects_tag_filter(store):
+    store.write(body="x\n", title="alpha report", tags=["keep"])
+    store.write(body="y\n", title="alpha summary", tags=["drop"])
+    hits = store.find(None, "alpha", tags=["keep"])
+    assert len(hits) == 1 and hits[0]["title"] == "alpha report"
 
 
 def test_replace_and_retag(store):

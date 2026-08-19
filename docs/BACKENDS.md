@@ -116,9 +116,11 @@ at the PEM and the client verifies against exactly that cert; leave it unset for
 plain http or a publicly-trusted certificate. Reusing a Qdrant you already run? Give
 memgres its own `MEMGRES_QDRANT_COLLECTION` — a collection is the isolation unit, so
 your other collections are untouched, and within it every point is tagged by
-namespace for tenant-scoped search. When snippets are enabled, memgres also creates
-a sibling `<collection>_segments` collection for the per-memory segment cache — same
-isolation, cleaned up alongside the memory.
+namespace for tenant-scoped search. The chunk vectors (the semantic index) live in
+a sibling `<collection>_segments` collection — same isolation, cleaned up alongside
+the memory. (Upgrading from a pre-0.4 deployment? The old `<collection>` held one
+vector per memory and is no longer used — drop it; the chunks are rebuilt into
+`<collection>_segments` on first run.)
 
 With docker compose, start Qdrant alongside the service:
 ```bash

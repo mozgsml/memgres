@@ -92,6 +92,9 @@ def _base_env(monkeypatch):
     # small segments so each sentence is its own tile (default 400 = one tile)
     monkeypatch.setenv("MEMGRES_SNIPPET_SEG_CHARS", "45")
     monkeypatch.setenv("MEMGRES_SNIPPET_SEG_OVERLAP", "0")
+    # force slicing for the multi-sentence bodies (≈101 chars): a low
+    # short-body threshold, else they'd be returned whole (kind="full").
+    monkeypatch.setenv("MEMGRES_FULL_BODY_MAX_CHARS", "20")
 
 
 @pytest.fixture
@@ -147,7 +150,8 @@ def _semantic_best_segment(store):
     h = _find(hits, m.id)
     assert "apples" in h.snippet
     assert "Bananas" not in h.snippet and "Cherries" not in h.snippet
-    assert h.line == 2                      # the apples sentence is line 2
+    assert h.kind == "snippet"
+    assert h.lines == [2, 2]                 # the apples sentence is line 2
 
 
 def test_pg_semantic_best_segment(pg_store):
@@ -161,11 +165,10 @@ def test_qdrant_semantic_best_segment(qdrant_store):
 # ─── cache populate + reuse ──────────────────────────────────────────────────
 def _cache_populate_reuse(store):
     m = store.write(body=BODY)
+    # the write built the chunk index under the body's content_hash
+    assert store._vectors.chunk_src_hash(store._conn, m.id, _ns(store)) == content_hash(BODY)
     first = _find(store.recall(None, QUERY, mode="semantic"), m.id).snippet
-    # segments were computed + stored under the body's content_hash
-    segs = store._vectors.get_segments(store._conn, m.id, _ns(store), content_hash(BODY))
-    assert segs is not None and len(segs) >= 2
-    # a second recall reuses them and returns the same snippet
+    # a second recall returns the same snippet (chunks unchanged)
     second = _find(store.recall(None, QUERY, mode="semantic"), m.id).snippet
     assert first == second and "apples" in second
 
@@ -186,9 +189,9 @@ def _invalidate_on_edit(store):
     m2 = store.write(id=m.id, body=BODY2)             # new body, new hash
     new_hash = m2.content_hash
     h = _find(store.recall(None, QUERY, mode="semantic"), m.id)
-    # stale segments recomputed: old hash gone, new hash present
-    assert store._vectors.get_segments(store._conn, m.id, _ns(store), old_hash) is None
-    assert store._vectors.get_segments(store._conn, m.id, _ns(store), new_hash) is not None
+    # chunks rebuilt for the new body: the stored src_hash is the new body's
+    cur = store._vectors.chunk_src_hash(store._conn, m.id, _ns(store))
+    assert cur == new_hash and cur != old_hash
     # snippet now reflects the edited body
     assert "apples" in h.snippet and "orchard" in h.snippet
     assert "Bananas" not in h.snippet
@@ -206,10 +209,11 @@ def test_qdrant_invalidate_on_edit(qdrant_store):
 def _lexical_ts_headline(store):
     m = store.write(body=BODY)
     h = _find(store.recall(None, QUERY, mode="lexical"), m.id)
-    # ts_headline marks the matched word (default <b>…</b>)
+    # ts_headline snippet is clean prose — markers stripped (StartSel/StopSel="")
     assert "apples" in h.snippet
-    assert "<b>" in h.snippet or "<b>apples</b>" in h.snippet
-    assert h.line is None                    # ts_headline has no offset
+    assert "<b>" not in h.snippet
+    assert h.kind == "snippet"
+    assert h.lines is None                    # ts_headline has no offset
 
 
 def test_pg_lexical_ts_headline(pg_store):
@@ -220,16 +224,24 @@ def test_qdrant_lexical_ts_headline(qdrant_store):
     _lexical_ts_headline(qdrant_store)
 
 
-# ─── flags: snippet off / full_body off ──────────────────────────────────────
+# ─── flags: one body view per hit, never both ────────────────────────────────
 def _flags(store):
     m = store.write(body=BODY)
 
+    # snippet=False → skip slicing, return the whole body labelled full.
     no_snip = _find(store.recall(None, QUERY, mode="semantic", snippet=False), m.id)
-    assert no_snip.snippet is None and no_snip.body is not None
+    assert no_snip.kind == "full"
+    assert no_snip.snippet == BODY and no_snip.body is None
+    assert no_snip.lines == [1, BODY.count("\n") + 1]
 
-    no_body = _find(store.recall(None, QUERY, mode="semantic", full_body=False), m.id)
-    assert no_body.body is None and no_body.snippet is not None
-    assert "apples" in no_body.snippet
+    # full_body=True → force the whole body even though it would otherwise slice.
+    whole = _find(store.recall(None, QUERY, mode="semantic", full_body=True), m.id)
+    assert whole.kind == "full" and whole.snippet == BODY and whole.body is None
+
+    # default (long body > threshold) → a slice, body dropped.
+    sliced = _find(store.recall(None, QUERY, mode="semantic"), m.id)
+    assert sliced.kind == "snippet" and sliced.body is None
+    assert "apples" in sliced.snippet and sliced.snippet != BODY
 
 
 def test_pg_flags(pg_store):
@@ -240,23 +252,44 @@ def test_qdrant_flags(qdrant_store):
     _flags(qdrant_store)
 
 
-# ─── MEMGRES_SNIPPET_SEMANTIC=false → ts_headline, no segments created ────────
-def _semantic_disabled_no_segments(store):
+# ─── short body is returned whole (a slice would just repeat it) ──────────────
+def _short_body_full(store):
+    short = "Just apples here.\n"          # ≈18 chars < threshold (20)
+    m = store.write(body=short)
+    for mode in ("semantic", "lexical"):
+        h = _find(store.recall(None, QUERY, mode=mode), m.id)
+        assert h.kind == "full", mode
+        assert h.snippet == short and h.body is None
+        assert h.lines == [1, short.count("\n") + 1]
+
+
+def test_pg_short_body_full(pg_store):
+    _short_body_full(pg_store)
+
+
+def test_qdrant_short_body_full(qdrant_store):
+    _short_body_full(qdrant_store)
+
+
+# ─── MEMGRES_SNIPPET_SEMANTIC=false → snippet via ts_headline (chunks still exist)
+def _semantic_disabled_uses_headline(store):
     m = store.write(body=BODY)
     h = _find(store.recall(None, QUERY, mode="semantic"), m.id)
-    # fell back to ts_headline: a snippet, but no segment cache for this id
-    assert h.snippet is not None
-    assert store._vectors.get_segments(store._conn, m.id, _ns(store), content_hash(BODY)) is None
+    # chunks still exist (they're the ranking index) but the SNIPPET came from
+    # ts_headline, not a chunk slice: no offset, so lines is None.
+    assert h.snippet is not None and "apples" in h.snippet
+    assert h.kind == "snippet" and h.lines is None
+    assert store._vectors.chunk_src_hash(store._conn, m.id, _ns(store)) is not None
 
 
-def test_pg_semantic_disabled_no_segments(monkeypatch, pg_store):
+def test_pg_semantic_disabled_uses_headline(monkeypatch, pg_store):
     monkeypatch.setenv("MEMGRES_SNIPPET_SEMANTIC", "false")
     # rebuild the store's cfg with the flag off
     pg_store.cfg = load()
-    _semantic_disabled_no_segments(pg_store)
+    _semantic_disabled_uses_headline(pg_store)
 
 
-def test_qdrant_semantic_disabled_no_segments(monkeypatch, qdrant_store):
+def test_qdrant_semantic_disabled_uses_headline(monkeypatch, qdrant_store):
     monkeypatch.setenv("MEMGRES_SNIPPET_SEMANTIC", "false")
     qdrant_store.cfg = load()
-    _semantic_disabled_no_segments(qdrant_store)
+    _semantic_disabled_uses_headline(qdrant_store)

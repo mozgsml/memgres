@@ -16,30 +16,34 @@ from __future__ import annotations
 
 from typing import List, Optional, Sequence
 
-from .diffing import content_hash
-from .segments import segment
-from .vector.base import Hit, build_filters
+from .vector.base import HIT_COLUMNS, Hit, build_filters, row_to_hit
 
 RRF_K = 60  # standard RRF damping constant
 
 
+def _tsquery(cfg, match: Optional[str], query: str):
+    """The tsquery SQL fragment + the query text to bind, shared by every lexical
+    search (body recall and title find). One expression is reused in both the
+    ``ts_rank`` score and the ``@@`` filter of a query.
+
+      all -> plainto_tsquery: every word ANDed (narrow).
+      any -> websearch_to_tsquery over the words joined by " or ": OR-any
+             (forgiving; default). websearch_to_tsquery is injection-safe and
+             reads a bare ``or`` as the operator, so user text can't inject syntax.
+
+    An empty query yields ``""`` → matches nothing (never everything)."""
+    match = match or cfg.lexical_match
+    if match == "all":
+        return "plainto_tsquery(%s::regconfig, %s)", query
+    return "websearch_to_tsquery(%s::regconfig, %s)", " or ".join(query.split())
+
+
 def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
              match: Optional[str] = None) -> List[Hit]:
-    match = match or cfg.lexical_match
-    # One tsquery expression, reused in both the ts_rank score and the @@ filter.
-    #   all -> plainto_tsquery: every word ANDed (narrow; current behavior).
-    #   any -> websearch_to_tsquery over the words joined by " or ": OR-any
-    #          (forgiving). websearch_to_tsquery is injection-safe and reads
-    #          bare `or` as the OR operator, so user text can't inject syntax.
-    if match == "all":
-        tsq = "plainto_tsquery(%s::regconfig, %s)"
-        qtext = query
-    else:
-        tsq = "websearch_to_tsquery(%s::regconfig, %s)"
-        qtext = " or ".join(query.split())  # empty query -> "" -> no matches
+    tsq, qtext = _tsquery(cfg, match, query)
     where, params = build_filters(ns, tags, path_prefix)
     sql = (
-        "SELECT id, body, tags, path::text, "
+        f"SELECT {HIT_COLUMNS}, "
         f"ts_rank(fts, {tsq}) AS score "
         f"FROM memory WHERE {where} "
         f"AND fts @@ {tsq} "
@@ -48,8 +52,29 @@ def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
     args = [cfg.fts_language, qtext] + params + [cfg.fts_language, qtext, k]
     with conn.cursor() as cur:
         cur.execute(sql, args)
-        return [Hit(str(r[0]), r[1], list(r[2]), r[3], float(r[4]))
-                for r in cur.fetchall()]
+        return [row_to_hit(r, r[-1]) for r in cur.fetchall()]   # score = trailing col
+
+
+def find(conn, cfg, ns: str, query: str, *, tags: Optional[Sequence[str]] = None,
+         path_prefix: Optional[str] = None, k: int = 10,
+         match: Optional[str] = None) -> List[dict]:
+    """Locate memories whose TITLE matches — a light "where is it" search over the
+    curated title only (``title_fts``), never the body. Same tag/subtree/namespace
+    filters as recall (so it's multi-tenant safe by construction), but returns
+    light rows ``{id, path, title, tags, score}`` — no body, no snippet, no vectors.
+    Fast to scan before a heavier body recall, and works without an embedder."""
+    tsq, qtext = _tsquery(cfg, match, query)
+    where, params = build_filters(ns, tags, path_prefix)
+    sql = (
+        f"SELECT id, path::text, title, tags, ts_rank(title_fts, {tsq}) AS score "
+        f"FROM memory WHERE {where} AND title_fts @@ {tsq} "
+        "ORDER BY score DESC LIMIT %s"
+    )
+    args = [cfg.fts_language, qtext] + params + [cfg.fts_language, qtext, k]
+    with conn.cursor() as cur:
+        cur.execute(sql, args)
+        return [{"id": str(r[0]), "path": r[1], "title": r[2],
+                 "tags": list(r[3]), "score": float(r[4])} for r in cur.fetchall()]
 
 
 def _rrf(lists: Sequence[List[Hit]], k: int) -> List[Hit]:
@@ -65,27 +90,17 @@ def _rrf(lists: Sequence[List[Hit]], k: int) -> List[Hit]:
     return fused[:k]
 
 
-def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
-    """Cosine similarity. Scale-invariant, so a backend that returns normalized
-    vectors (qdrant does, under cosine distance) gives the same ranking as one
-    that returns raw vectors (pgvector)."""
-    dot = sum(x * y for x, y in zip(a, b))
-    na = sum(x * x for x in a) ** 0.5
-    nb = sum(x * x for x in b) ** 0.5
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    return dot / (na * nb)
-
-
 def _ts_headline(conn, cfg, ns: str, query: str, hits: List[Hit]) -> dict:
     """One batched ts_headline over every hit id — the lexical/fallback snippet.
     Returns {id: headline}. ids come from the already-ns-scoped ranked hits, so
-    the WHERE stays inside the caller's namespace (no cross-tenant read)."""
+    the WHERE stays inside the caller's namespace (no cross-tenant read).
+    ``StartSel``/``StopSel`` are emptied so the snippet is clean prose — no
+    ``<b>`` markers to mislead the model reading it."""
     ids = [h.id for h in hits]
     sql = (
         "SELECT id, ts_headline(%s::regconfig, body, "
         "plainto_tsquery(%s::regconfig, %s), "
-        "'MaxWords=40, MinWords=15, ShortWord=3') "
+        "'MaxWords=40, MinWords=15, ShortWord=3, StartSel=\"\", StopSel=\"\"') "
         "FROM memory WHERE namespace=%s AND id = ANY(%s)"
     )
     out: dict = {}
@@ -96,65 +111,74 @@ def _ts_headline(conn, cfg, ns: str, query: str, hits: List[Hit]) -> dict:
     return out
 
 
-def _best_segment_snippet(conn, cfg, embedder, backend, ns: str, hit: Hit,
-                          qvec: Sequence[float]) -> None:
-    """Set ``hit.snippet``/``hit.line`` from the body segment most similar to the
-    query. Uses the durable segment cache: compute+store on first sight of this
-    body, reuse after, recompute when the body changed (src_hash mismatch)."""
-    body = hit.body or ""
-    if not body:
-        hit.snippet, hit.line = "", 1
-        return
-    src = content_hash(body)
-    segs = backend.get_segments(conn, hit.id, ns, src)  # (seq, start, end, vec) or None
-    if segs is None:
-        spans = segment(body, cfg.snippet_seg_chars, cfg.snippet_seg_overlap)
-        vecs = embedder.embed_documents([body[s:e] for (s, e) in spans])
-        segs = [(i, s, e, v)
-                for i, ((s, e), v) in enumerate(zip(spans, vecs))]
-        backend.upsert_segments(conn, hit.id, ns, src, segs)
-    best_span = None
-    best_score = None
-    for (_seq, s, e, vec) in segs:
-        sc = _cosine(qvec, vec)
-        if best_score is None or sc > best_score:
-            best_score, best_span = sc, (s, e)
-    if best_span is None:
-        hit.snippet, hit.line = body[:cfg.snippet_seg_chars], 1
-        return
-    bs, be = best_span
+def _lines_for(body: str, start: int, end: int) -> List[int]:
+    """1-based inclusive line range that the ``body[start:end]`` slice spans."""
+    if end <= start:
+        n = body.count("\n", 0, start) + 1
+        return [n, n]
+    return [body.count("\n", 0, start) + 1,
+            body.count("\n", 0, end - 1) + 1]
+
+
+def _set_full(hit: Hit, body: str) -> None:
+    """Return the whole body as the snippet (it's short, or the caller forced it)."""
+    hit.snippet = body
+    hit.kind = "full"
+    hit.lines = [1, body.count("\n") + 1] if body else [1, 1]
+
+
+def _set_chunk(hit: Hit, body: str) -> None:
+    """Slice the snippet from the winning chunk's span (already chosen by the
+    grouped chunk ranking — no re-embedding on the read path)."""
+    bs, be = hit.chunk_span
+    bs = max(0, min(bs, len(body)))
+    be = max(bs, min(be, len(body)))
     hit.snippet = body[bs:be]
-    hit.line = body[:bs].count("\n") + 1
+    hit.lines = _lines_for(body, bs, be)
+    hit.kind = "snippet"
 
 
-def attach_snippets(conn, cfg, embedder, backend, ns: str, query: str, mode: str,
-                    hits: List[Hit], *, snippet: Optional[bool],
-                    full_body: Optional[bool]) -> List[Hit]:
-    """After ranking, hang a snippet (+line) on each hit and optionally drop the
-    full body. Semantic/hybrid hits pick their best-matching segment (embedded &
-    cached per body-hash); everything else uses Postgres ``ts_headline``."""
+def attach_snippets(conn, cfg, ns: str, query: str, hits: List[Hit], *,
+                    snippet: Optional[bool], full_body: Optional[bool]) -> List[Hit]:
+    """After ranking, give every hit exactly one body view — never both a slice
+    and the whole thing. A hit gets the WHOLE body (``kind="full"``) when the
+    caller opts out of snippeting (``snippet=False``), forces ``full_body=True``,
+    or the body is short enough (≤ ``full_body_max_chars``) that a slice would
+    just repeat it. Otherwise it gets a SLICE (``kind="snippet"``): a semantic hit
+    slices its winning chunk (chosen during ranking, so no re-embedding here); a
+    lexical hit uses Postgres ``ts_headline``. The raw ``body`` field is always
+    dropped — ``snippet`` carries the returned text, ``kind`` says which view."""
     snippet = cfg.snippet if snippet is None else snippet
     full_body = cfg.full_body if full_body is None else full_body
 
-    if snippet and hits:
-        use_semantic = (mode in ("semantic", "hybrid") and cfg.snippet_semantic
-                        and backend is not None and embedder is not None)
-        if use_semantic:
-            qvec = embedder.embed_query(query)   # once per call, not per hit
-            for h in hits:
-                _best_segment_snippet(conn, cfg, embedder, backend, ns, h, qvec)
+    # Whole-body hits and semantic-chunk hits are settled inline; only the ones
+    # needing a Postgres ts_headline slice are collected for the batched query.
+    lexical_hits: List[Hit] = []
+    for h in hits:
+        body = h.body or ""
+        if full_body or not snippet or len(body) <= cfg.full_body_max_chars:
+            _set_full(h, body)
+        elif h.chunk_span is not None and cfg.snippet_semantic:
+            _set_chunk(h, body)
         else:
-            heads = _ts_headline(conn, cfg, ns, query, hits)  # one batched query
-            for h in hits:
-                snip = heads.get(h.id)
-                if not snip:  # no match highlighted → a short head of the body
-                    snip = (h.body or "")[:200]
-                h.snippet = snip
-                h.line = None  # ts_headline gives no offset — fine
+            lexical_hits.append(h)
 
-    if not full_body:  # after snippets: the best-segment path needs the body
-        for h in hits:
-            h.body = None
+    if lexical_hits:
+        heads = _ts_headline(conn, cfg, ns, query, lexical_hits)  # one batched query
+        for h in lexical_hits:
+            snip = heads.get(h.id)
+            if snip:
+                h.snippet = snip
+                h.lines = None           # ts_headline gives no offset
+                h.kind = "snippet"
+            else:                        # no highlighted match → bounded head slice
+                body = h.body or ""
+                h.snippet = body[:cfg.full_body_max_chars]
+                h.lines = [1, h.snippet.count("\n") + 1]
+                h.kind = "snippet"
+
+    for h in hits:      # never leak the raw body as a separate field
+        h.body = None
     return hits
 
 
@@ -184,5 +208,5 @@ def recall(conn, cfg, embedder, ns: str, query: str, *, k: int = 10,
     else:
         raise ValueError(
             f"unknown recall mode: {mode!r} (lexical|semantic|hybrid|auto)")
-    return attach_snippets(conn, cfg, embedder, backend, ns, query, mode, hits,
+    return attach_snippets(conn, cfg, ns, query, hits,
                            snippet=snippet, full_body=full_body)

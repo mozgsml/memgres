@@ -1,0 +1,70 @@
+# Enterprise split topology for memgres — Postgres + Qdrant, an API tier that
+# only flags writes, and a dedicated embed-worker tier that does the embedding.
+# Scale `api` and `worker` independently (`docker compose up --scale api=3
+# --scale worker=2`); claim-based draining (FOR UPDATE SKIP LOCKED) makes multiple
+# workers safe. For a small deployment you don't need this — one `memgres-server`
+# with MEMGRES_EMBED_WORKER=on (its default) is the all-in-one path.
+#
+# This example uses a CLOUD embedder (light image, no GPU). Set MEMGRES_EMBED_API_KEY.
+# See docs/DEPLOYMENT.md for the full walkthrough, and docs/EMBEDDINGS.md for models.
+
+x-memgres-env: &memgres-env
+  MEMGRES_DATABASE_URL: postgresql://memgres:${POSTGRES_PASSWORD:-memgres}@postgres:5432/memgres
+  MEMGRES_KEY_MODE: managed                 # multi-tenant: per-client tokens/namespaces
+  MEMGRES_ADMIN_TOKEN: ${MEMGRES_ADMIN_TOKEN:?set a strong admin token}
+  MEMGRES_VECTOR_BACKEND: qdrant
+  QDRANT_URL: http://qdrant:6333
+  # cloud embedder (recommended at scale — sub-second, no local model):
+  MEMGRES_EMBED_PROVIDER: openai
+  MEMGRES_EMBED_MODEL: text-embedding-3-small
+  MEMGRES_EMBED_DIM: "1536"
+  MEMGRES_EMBED_API_KEY: ${MEMGRES_EMBED_API_KEY:?set your embedding API key}
+  # chunk sizing (tune per model/cost; larger = fewer API calls):
+  MEMGRES_CHUNK_CHARS: "400"
+  MEMGRES_CHUNK_OVERLAP: "80"
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: memgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-memgres}
+      POSTGRES_DB: memgres
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes: [qdrantdata:/qdrant/storage]
+
+  # API tier — serves HTTP, only FLAGS writes (embedding deferred to the worker).
+  api:
+    build: { context: .., args: { EXTRAS: "server,qdrant" } }   # or image: ghcr.io/mozgsml/memgres:0.4.0
+    command: ["memgres-server"]
+    environment:
+      <<: *memgres-env
+      MEMGRES_EMBED_DISPATCH: async          # flag pending, don't embed on the request
+      MEMGRES_EMBED_WORKER: "false"           # no in-process worker here
+      MEMGRES_POOL_SIZE: "30"                 # size for concurrent clients
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      qdrant:   { condition: service_started }
+
+  # Worker tier — does the embedding. Scale replicas as write volume grows.
+  worker:
+    build: { context: .., args: { EXTRAS: "qdrant" } }          # or image: ghcr.io/mozgsml/memgres:0.4.0
+    command: ["memgres-worker"]
+    environment:
+      <<: *memgres-env                        # same embedder + backend as the API
+    depends_on:
+      postgres: { condition: service_healthy }
+      qdrant:   { condition: service_started }
+
+volumes:
+  pgdata:
+  qdrantdata:

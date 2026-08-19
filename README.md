@@ -5,7 +5,7 @@
 
 **Versioned document memory for AI agents — one Postgres, lexical *or* semantic recall, diff-based history, GDPR-erasable.**
 
-> Status: v0.2.0 — on [PyPI](https://pypi.org/project/memgres/) (`pip install memgres`) and [GHCR](https://ghcr.io/mozgsml/memgres). Core library, search (pgvector/Qdrant), multi-tenant identity (users / namespaces / scoped tokens), HTTP API and MCP server, all tested in CI against live Postgres + Qdrant.
+> Status: released on [PyPI](https://pypi.org/project/memgres/) (`pip install memgres`) and [GHCR](https://ghcr.io/mozgsml/memgres) — see the [releases](https://github.com/mozgsml/memgres/releases) page for the current version. Core library, search (pgvector/Qdrant), multi-tenant identity (users / namespaces / scoped tokens), HTTP API and MCP server, all tested in CI against live Postgres + Qdrant.
 
 memgres is a lightweight, drop-in memory layer — a Python library plus an optional HTTP/MCP service — backed by a single PostgreSQL database. You store **documents** (bodies of text an agent owns and edits), not facts an LLM guessed at. Every change is an authored diff with provenance, kept in a tamper-evident history that you can still delete when the law says you must.
 
@@ -35,7 +35,7 @@ Reach for memgres when you want **auditable, authored, versioned text memory**.
 | **Hash-chained, GDPR-deletable history** | Tamper-evident provenance you can *still* erase: `forget()` hard-deletes the row, its vectors, and crypto-shreds the chain — no ["ghost vectors" left reconstructible in the index](https://arxiv.org/pdf/2606.18497). |
 | **Lexical works with zero embeddings** | Deploy with no model, no API, no GPU — Postgres full-text search out of the box. Turn on semantic recall only when you want it. |
 | **Lexical *and* semantic (hybrid)** | Exact identifiers/codes go to lexical (where [dense retrieval alone stumbles](https://tianpan.co/blog/2026-04-12-hybrid-search-production-bm25-dense-embeddings)); meaning-based queries go to vectors; hybrid fuses both with RRF. |
-| **Snippets, not walls of text** | Recall returns the most relevant slice of each hit plus its line number — semantic hits pick their best segment (embedded once, then cached), lexical uses `ts_headline`. Pass `full_body=false` for just the snippet. |
+| **Snippets, not walls of text** | Recall returns one body view per hit — never both a slice and the whole thing. Long hits come back as the most relevant slice (`kind="snippet"`) with its `lines` range; semantic hits pick their best segment (embedded once, then cached), lexical uses a clean `ts_headline` (no markup). A body short enough that a slice would just repeat it comes back whole (`kind="full"`). Pass `full_body=true` to force whole bodies. |
 | **Embedding-model safety by construction** | The model id + dimension are stamped into the schema; a mismatch **hard-fails** instead of silently returning garbage. |
 | **Optional TTL, renewed on read** | Off by default — memory is kept forever. Turn on a retention window and active memory persists because it's used, while abandoned memory expires itself: storage self-cleans instead of growing. |
 | **Optional multi-tenant identity** | Users, namespaces and rotatable scoped tokens when you need isolation; nothing to configure for single-user. |
@@ -148,11 +148,14 @@ Or pull the container image (public, no login):
 docker pull ghcr.io/mozgsml/memgres:latest
 ```
 
-### Three ways to run it
+### Ways to run it
+
+Not sure which fits? Start with the decision guide: [docs/CHOOSING.md](docs/CHOOSING.md). In short — **more than one user → run the Docker server (shared), not a per-machine install.**
 
 1. **`docker compose up`** — `pgvector` + service, nothing to configure. For a dedicated vector service instead, `docker compose --profile qdrant up` and set `MEMGRES_VECTOR_BACKEND=qdrant` (Qdrant ranks vectors; Postgres still holds bodies and does tag/subtree/TTL filtering).
 2. **Your own Postgres** — install the `[server]` extra (above), point `MEMGRES_DATABASE_URL` at it, run `memgres-server` (migrates on startup).
 3. **Embedded library** — install the core package, use `Store` directly, no HTTP at all.
+4. **Split service (many clients)** — a stateless API tier that only flags writes plus a scalable `memgres-worker` tier that embeds; see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) and `deploy/docker-compose.yml`. Switch the embedding model later with `memgres-reembed`.
 
 Semantic recall is optional: the default `MEMGRES_EMBED_PROVIDER=none` gives you lexical FTS with zero models. Turn on `local` (sentence-transformers), a cloud API (`openai`/`jina`), or any OpenAI-compatible server (LM Studio, Ollama, …) when you want meaning-based search — see [docs/EMBEDDINGS.md](docs/EMBEDDINGS.md) for choosing local vs cloud and [docs/BACKENDS.md](docs/BACKENDS.md) for copy-paste setups. The model id + dimension get stamped into the schema and a later mismatch hard-fails instead of silently returning garbage.
 
@@ -177,12 +180,20 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_HISTORY` | `true` | keep the hash-chained diff history (deleted with the record) |
 | `MEMGRES_FTS_LANGUAGE` | `simple` | Postgres FTS dictionary (`simple`/`english`/…) |
 | `MEMGRES_LEXICAL_MATCH` | `any` | lexical query words OR-ed (`any`) or AND-ed (`all`); per-call `match` overrides |
-| `MEMGRES_SNIPPET` | `true` | attach a best-match snippet + line to each hit (`MEMGRES_SNIPPET_*` tune size/semantic; `full_body` per call) |
+| `MEMGRES_SNIPPET` | `true` | extract a best-match slice per hit (`MEMGRES_SNIPPET_*` tune size/semantic); `false` returns whole bodies |
+| `MEMGRES_FULL_BODY` | `false` | force the whole body on every hit (off = auto: short whole, long sliced); `full_body` per call overrides |
+| `MEMGRES_FULL_BODY_MAX_CHARS` | `500` | a body this short is returned whole (`kind="full"`) instead of sliced |
 | `MEMGRES_LIST_PREVIEW_CHARS` | `120` | first-line preview length returned by `memory_list` |
+| `MEMGRES_INSTRUCTION` | — | server-side MCP instructions emitted at `initialize` (a client like Claude Code loads it once at connect); unset = omitted; capped at 2 KB |
 | `MEMGRES_VECTOR_BACKEND` | `pgvector` | `pgvector` (same DB) or `qdrant` (set `QDRANT_URL`, `QDRANT_API_KEY`, `MEMGRES_QDRANT_COLLECTION`) |
 | `MEMGRES_EMBED_PROVIDER` | `none` | `none` / `local` / `openai` / `jina` / `openai-compatible` (LM Studio, Ollama, vLLM, TEI…) |
 | `MEMGRES_EMBED_MODEL` / `_DIM` / `_API_KEY` / `_API_BASE` | — | model id · dimension (HTTP providers require it, `local` infers) · token · server URL |
 | `MEMGRES_EMBED_MAX_SEQ` | `0` | override the local model's max input length in tokens (`0` = the model's default) |
+| `MEMGRES_CHUNK_CHARS` / `_OVERLAP` | `400` / `80` | chunk size / overlap for the chunk index (legacy names `MEMGRES_SNIPPET_SEG_CHARS` / `_OVERLAP` still work) |
+| `MEMGRES_EMBED_DISPATCH` | `inline` | `inline` = embed within the write (safe default, no worker); `async` = flag `embed_pending` and let a worker embed. A server sets `async` when it starts an in-process worker; set `async` + `MEMGRES_EMBED_WORKER=off` for a split deployment with a separate `memgres-worker` |
+| `MEMGRES_EMBED_WORKER` | `true` | a server process runs an in-process embed worker |
+| `MEMGRES_EMBED_WORKER_INTERVAL` | `1.0` | worker idle poll seconds between drains |
+| `MEMGRES_EMBED_MAX_ATTEMPTS` / `_RETRY_BACKOFF_S` | `5` / `60` | a failing row is retried after the back-off; after this many attempts it's dead-lettered (left flagged, out of rotation, logged) so it can't wedge the queue |
 
 ## HTTP API
 
