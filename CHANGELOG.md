@@ -41,6 +41,13 @@ patch = fixes).
   could mislead a model reading it.
 
 ### Added
+- **Startup version guard** — on connect, memgres refuses to run when the database
+  is stamped at a **higher** schema version than the client understands (a newer
+  memgres already migrated the shared store), failing with an actionable "update
+  this client" message instead of silently misreading the newer schema. Because
+  the Postgres/Qdrant state is shared across machines, this is what stops an
+  un-upgraded machine from breaking after another upgrades. A fresh or
+  same/older-version database migrates forward as usual.
 - **Server-side MCP `instructions`** — set `MEMGRES_INSTRUCTION` and the text is
   emitted in the MCP `initialize` response, so a client that honors it (e.g.
   Claude Code) loads it once at connect to guide how the model uses the memory

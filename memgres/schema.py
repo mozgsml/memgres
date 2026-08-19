@@ -48,11 +48,42 @@ def migrate(conn, cfg: Config) -> None:
     """
     with conn.transaction():
         with conn.cursor() as cur:
+            _guard_client_version(cur)
             for path in sorted(MIGRATIONS_DIR.glob("[0-9]*.sql")):
                 cur.execute(path.read_text(encoding="utf-8"))
             _apply_tree(cur, cfg)
             _apply_vector(cur, cfg)
             _stamp(cur, cfg)
+
+
+def _guard_client_version(cur) -> None:
+    """Refuse to run an OUTDATED client against a NEWER database — checked FIRST,
+    before any migration touches the schema.
+
+    Migrations are forward-only: this build carries migrations up to
+    ``SCHEMA_VERSION``. If the database is stamped at a HIGHER version, a newer
+    memgres already migrated it into a shape this one doesn't understand (dropped
+    columns, new tables, changed semantics) — proceeding would misread or corrupt
+    it. Since state is shared across machines, this is exactly what happens when
+    one machine upgrades and another still runs the old client: the old one stops
+    with a clear ask to update, instead of silently breaking.
+
+    A fresh database (no ``memgres_meta`` yet) or one at/below this version passes
+    through — the normal forward migrate then brings it up and re-stamps."""
+    cur.execute("SELECT to_regclass('memgres_meta')")
+    if cur.fetchone()[0] is None:
+        return                       # brand-new database — nothing to compare
+    cur.execute("SELECT schema_version FROM memgres_meta WHERE only_row")
+    row = cur.fetchone()
+    stored = row[0] if row else None
+    if stored is not None and stored > SCHEMA_VERSION:
+        raise SchemaMismatch(
+            f"this memgres speaks schema v{SCHEMA_VERSION}, but the database is at "
+            f"v{stored} — it was migrated by a NEWER memgres. Update this client "
+            f"(in its venv: pip install -U 'memgres[local,qdrant,mcp]', or pull the "
+            f"repo for an editable install) and restart it. Refusing to run an "
+            f"outdated client against a newer schema."
+        )
 
 
 def _apply_tree(cur, cfg: Config) -> None:
