@@ -52,8 +52,8 @@ fixed worker pool, instead of N processes each polling the DB and embedding.
 |---|---|
 | Concurrent clients per API instance | `MEMGRES_POOL_SIZE` (raise from 4 → 20–50) |
 | Embedding throughput | worker replicas + a fast embedder (cloud, or local GPU) |
-| Worker poll cadence | `MEMGRES_EMBED_WORKER_INTERVAL` (s), `MEMGRES_EMBED_BATCH` |
-| Hung-embed safety | `MEMGRES_EMBED_TX_TIMEOUT_MS` (kills a stalled embed's tx, frees the row) |
+| Worker poll cadence | `MEMGRES_EMBED_WORKER_INTERVAL` (s) |
+| Poison-row handling | `MEMGRES_EMBED_MAX_ATTEMPTS` / `_RETRY_BACKOFF_S` (retry, then dead-letter) |
 | Chunk size / overlap | `MEMGRES_CHUNK_CHARS` (400), `MEMGRES_CHUNK_OVERLAP` (80) |
 
 **Embedder:** at scale prefer a **cloud** model (`MEMGRES_EMBED_PROVIDER=openai`
@@ -66,9 +66,12 @@ throttles a single worker; add replicas or a GPU. See `docs/EMBEDDINGS.md`.
 - **Crash-safe embedding.** A write only flags `embed_pending`; the worker embeds
   and clears the flag in one transaction. A crash mid-embed rolls back → the row
   stays flagged and another worker (or the next restart's backfill) picks it up.
-  Nothing is lost, and a row is never "locked forever": the lock lives with the DB
-  connection and is released when it dies, and `MEMGRES_EMBED_TX_TIMEOUT_MS` bounds
-  a hung embed.
+  Nothing is lost, and a row is never "locked forever": the claim lock lives with
+  the DB connection and is released when it dies (power cut, kill). A slow/stalled
+  embed is bounded by the embedder's own request timeout, not a DB-side kill.
+- **One poison row can't wedge the queue.** A row that keeps failing to embed is
+  retried after a back-off and, after `MEMGRES_EMBED_MAX_ATTEMPTS`, dead-lettered
+  (left flagged, out of the claim rotation, logged) — newer rows always progress.
 - **Version guard.** On connect, a client refuses to run below the database's
   recorded compatibility floor (a newer memgres migrated it past a breaking
   change) with an actionable "update this client" error — so a stale replica can't

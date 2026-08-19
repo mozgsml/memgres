@@ -51,14 +51,25 @@ def reembed(cfg, *, embedder=None, drain_now: bool = True) -> Tuple[int, int]:
     _log.info("re-embedding: %s → %s/%s (%s backend)",
               old, cfg.embed_model, cfg.embed_dim, cfg.vector_backend)
 
-    # 1. Re-stamp the model/dim so migrate() accepts the change instead of failing.
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE memgres_meta SET embed_provider=%s, embed_model=%s, embed_dim=%s "
-            "WHERE only_row",
-            (cfg.embed_provider, cfg.embed_model, cfg.embed_dim))
+    # Ordering matters for crash-safety. The invariant: never leave the meta
+    # stamped at the NEW model while the chunk store still holds OLD-dim vectors
+    # (startup would then pass the stamp check but insert wrong-dim vectors — a
+    # silent break migrate can't repair). So:
 
-    # 2. Wipe the chunk store so it's rebuilt at the new dimension.
+    # 1. Flag every bodied memory FIRST — durable regardless of what follows.
+    #    Only embed_pending here (it predates the retry columns; migrate() below
+    #    adds those, then we reset them).
+    with conn.cursor() as cur:
+        cur.execute("UPDATE memory SET embed_pending=true "
+                    "WHERE body IS NOT NULL AND body <> ''")
+        flagged = cur.rowcount
+    _log.info("flagged %d memories for re-embedding", flagged)
+
+    # 2. WIPE the chunk store BEFORE re-stamping. Now a crash after the re-stamp
+    #    finds the store already absent, and startup recreates it at the new dim
+    #    (self-heal). A crash before the re-stamp leaves the OLD stamp, so startup
+    #    refuses loudly (SchemaMismatch) rather than serving wrong-dim — never
+    #    silent. Re-running memgres-reembed recovers either way.
     if cfg.vector_backend == "qdrant":
         from .vector.qdrant import QdrantBackend
         QdrantBackend.drop_chunks_collection()
@@ -66,17 +77,22 @@ def reembed(cfg, *, embedder=None, drain_now: bool = True) -> Tuple[int, int]:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS memory_segment CASCADE")
 
-    # 3. Recreate the store at the new dim (pgvector: migrate re-adds
-    #    memory_segment; qdrant: make_backend._ensure creates the new collection).
-    migrate(conn, cfg)
-    backend = make_backend(cfg, embedder)
-
-    # 4. Flag every bodied memory for re-chunking.
+    # 3. Re-stamp the model/dim so migrate() accepts the change instead of failing.
     with conn.cursor() as cur:
-        cur.execute("UPDATE memory SET embed_pending=true "
-                    "WHERE body IS NOT NULL AND body <> ''")
-        flagged = cur.rowcount
-    _log.info("flagged %d memories for re-embedding", flagged)
+        cur.execute(
+            "UPDATE memgres_meta SET embed_provider=%s, embed_model=%s, embed_dim=%s "
+            "WHERE only_row",
+            (cfg.embed_provider, cfg.embed_model, cfg.embed_dim))
+
+    # 4. Recreate the store at the new dim (pgvector: migrate re-adds
+    #    memory_segment; qdrant: make_backend._ensure creates the new collection).
+    #    migrate() also ensures the retry columns exist — reset them so any
+    #    dead-lettered rows re-enter the rotation for this rebuild.
+    migrate(conn, cfg)
+    with conn.cursor() as cur:
+        cur.execute("UPDATE memory SET embed_attempts=0, embed_failed_at=NULL "
+                    "WHERE embed_pending")
+    backend = make_backend(cfg, embedder)
 
     embedded = 0
     if drain_now:

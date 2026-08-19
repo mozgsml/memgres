@@ -46,8 +46,10 @@ patch = fixes).
   `MEMGRES_EMBED_WORKER=off`) plus a scalable `memgres-worker` tier that embeds.
   Draining is **claim-based** (`FOR UPDATE SKIP LOCKED`), so worker replicas never
   embed a memory twice or block each other, and a crash mid-embed leaves the row
-  flagged for retry — never stuck (a hung embed's row lock is freed by
-  `MEMGRES_EMBED_TX_TIMEOUT_MS`, default 60 s). `MEMGRES_EMBED_DISPATCH`
+  flagged for retry — never stuck (the claim lock releases when the connection
+  dies). A row that keeps failing to embed is retried with back-off and, after
+  `MEMGRES_EMBED_MAX_ATTEMPTS`, dead-lettered (out of rotation, logged) so one
+  poison body can't wedge the queue behind it. `MEMGRES_EMBED_DISPATCH`
   (`inline`|`async`) replaces the derived async flag; `inline` stays the safe
   library/all-in-one default. New `memgres-worker` entrypoint,
   `deploy/docker-compose.yml`, and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).

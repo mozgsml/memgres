@@ -98,12 +98,11 @@ class Config:
                                  #     deployment where an external worker embeds.
     embed_worker: bool           # a server process runs an in-process embed worker
     embed_worker_interval: float # seconds the idle worker sleeps between drains
-    embed_batch: int             # max memories a single drain() pass claims
-    embed_tx_timeout_ms: int     # idle_in_transaction_session_timeout on a worker's
-                                 # connection: if an embed hangs (a stalled cloud
-                                 # API) Postgres kills the transaction, releasing the
-                                 # SKIP-LOCKED row lock so the row is retried and
-                                 # never stuck. 0 disables (rely on TCP keepalive).
+    embed_max_attempts: int      # after this many failed embed attempts a row is a
+                                 # dead letter — left flagged but out of the claim
+                                 # rotation (logged), so one poison body can't wedge
+                                 # the queue behind it. A successful embed resets it.
+    embed_retry_backoff_s: float # seconds a failed row is skipped before retry
     # listing / browse
     list_preview_chars: int      # first-line preview length for memory_list (0 = none)
     # embeddings
@@ -141,10 +140,10 @@ class Config:
             raise ValueError("MEMGRES_FULL_BODY_MAX_CHARS must be >= 0")
         if self.embed_worker_interval <= 0:
             raise ValueError("MEMGRES_EMBED_WORKER_INTERVAL must be > 0")
-        if self.embed_batch < 1:
-            raise ValueError("MEMGRES_EMBED_BATCH must be >= 1")
-        if self.embed_tx_timeout_ms < 0:
-            raise ValueError("MEMGRES_EMBED_TX_TIMEOUT_MS must be >= 0")
+        if self.embed_max_attempts < 1:
+            raise ValueError("MEMGRES_EMBED_MAX_ATTEMPTS must be >= 1")
+        if self.embed_retry_backoff_s < 0:
+            raise ValueError("MEMGRES_EMBED_RETRY_BACKOFF_S must be >= 0")
         if self.max_write_bytes > self.max_body_bytes:
             raise ValueError(
                 "MEMGRES_MAX_WRITE_BYTES must be <= MEMGRES_MAX_BODY_BYTES"
@@ -197,8 +196,8 @@ def load() -> Config:
         embed_dispatch=_str("MEMGRES_EMBED_DISPATCH", "inline"),
         embed_worker=_bool("MEMGRES_EMBED_WORKER", True),
         embed_worker_interval=_float("MEMGRES_EMBED_WORKER_INTERVAL", 1.0),
-        embed_batch=_int("MEMGRES_EMBED_BATCH", 16),
-        embed_tx_timeout_ms=_int("MEMGRES_EMBED_TX_TIMEOUT_MS", 60_000),
+        embed_max_attempts=_int("MEMGRES_EMBED_MAX_ATTEMPTS", 5),
+        embed_retry_backoff_s=_float("MEMGRES_EMBED_RETRY_BACKOFF_S", 60.0),
         list_preview_chars=_int("MEMGRES_LIST_PREVIEW_CHARS", 120),
         embed_provider=_str("MEMGRES_EMBED_PROVIDER", "none"),
         embed_model=_str("MEMGRES_EMBED_MODEL", ""),

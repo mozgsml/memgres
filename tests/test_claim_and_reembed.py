@@ -178,6 +178,48 @@ def _reembed_dim_change(backend):
     return run
 
 
+# ─── a poison row (always fails to embed) must not wedge the queue ────────────
+class _Poison(_KW):
+    def embed_documents(self, texts):
+        if any("poison" in t.lower() for t in texts):
+            raise RuntimeError("embedder blew up on this body")
+        return super().embed_documents(texts)
+
+
+def test_poison_row_does_not_wedge_queue(monkeypatch):
+    if not _pg_reachable():
+        pytest.skip("no test Postgres")
+    _fresh_pg()
+    _env(monkeypatch, 3)
+    conn = psycopg.connect(DSN)
+    migrate(conn, load())
+    # backoff 0 so both attempts happen in one pass; max 2 → quick dead-letter
+    cfg = replace(load(), embed_dispatch="async",
+                  embed_max_attempts=2, embed_retry_backoff_s=0.0)
+    s = Store(cfg, embedder=_Poison(3), conn=conn)
+    good1 = s.write(body="apple apple\n")
+    bad = s.write(body="poison apple\n")     # embedder raises on this one
+    good2 = s.write(body="banana banana\n")
+
+    n = drain(conn, cfg, s.embedder, s._vectors)
+    # the poison row did NOT block the good rows on either side of it
+    assert s._vectors.chunk_src_hash(conn, good1.id, "") is not None
+    assert s._vectors.chunk_src_hash(conn, good2.id, "") is not None
+    assert n == 2
+    # the poison row is still pending, dead-lettered at max attempts
+    assert _pending(conn, bad.id) is True
+    with conn.cursor() as cur:
+        cur.execute("SELECT embed_attempts FROM memory WHERE id=%s", (bad.id,))
+        assert cur.fetchone()[0] == 2
+
+    # further drains touch nothing (poison out of rotation, goods done)
+    assert drain(conn, cfg, s.embedder, s._vectors) == 0
+    with conn.cursor() as cur:
+        cur.execute("SELECT embed_attempts FROM memory WHERE id=%s", (bad.id,))
+        assert cur.fetchone()[0] == 2       # not retried past the cap
+    conn.close()
+
+
 def test_pg_reembed_dim_change(monkeypatch):
     _reembed_dim_change("pgvector")(monkeypatch)
 

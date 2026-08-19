@@ -190,8 +190,8 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_CHUNK_CHARS` / `_OVERLAP` | `400` / `80` | chunk size / overlap for the chunk index (legacy names `MEMGRES_SNIPPET_SEG_CHARS` / `_OVERLAP` still work) |
 | `MEMGRES_EMBED_DISPATCH` | `inline` | `inline` = embed within the write (safe default, no worker); `async` = flag `embed_pending` and let a worker embed. A server sets `async` when it starts an in-process worker; set `async` + `MEMGRES_EMBED_WORKER=off` for a split deployment with a separate `memgres-worker` |
 | `MEMGRES_EMBED_WORKER` | `true` | a server process runs an in-process embed worker |
-| `MEMGRES_EMBED_WORKER_INTERVAL` / `_BATCH` | `1.0` / `16` | worker idle poll seconds · rows a drain pass processes |
-| `MEMGRES_EMBED_TX_TIMEOUT_MS` | `60000` | idle-in-transaction cap on a worker connection — frees a hung embed's row lock (`0` disables) |
+| `MEMGRES_EMBED_WORKER_INTERVAL` | `1.0` | worker idle poll seconds between drains |
+| `MEMGRES_EMBED_MAX_ATTEMPTS` / `_RETRY_BACKOFF_S` | `5` / `60` | a failing row is retried after the back-off; after this many attempts it's dead-lettered (left flagged, out of rotation, logged) so it can't wedge the queue |
 
 ## HTTP API
 

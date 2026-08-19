@@ -37,20 +37,6 @@ class EmbedWorker:
     def _conn_ok(self):
         if self._conn is None or getattr(self._conn, "closed", False):
             self._conn = self._connect()
-            # Bound how long a single embed transaction may sit between statements
-            # (i.e. while the embed call runs): if it hangs, Postgres kills the tx
-            # and releases the SKIP-LOCKED row lock, so the row is retried and
-            # never stuck. Autocommit so this SET isn't itself inside a tx.
-            if self.cfg.embed_tx_timeout_ms > 0:
-                try:
-                    prev = self._conn.autocommit
-                    self._conn.autocommit = True
-                    with self._conn.cursor() as cur:
-                        cur.execute("SET idle_in_transaction_session_timeout = %s",
-                                    (self.cfg.embed_tx_timeout_ms,))
-                    self._conn.autocommit = prev
-                except Exception:
-                    _log.exception("could not set idle_in_transaction timeout")
         return self._conn
 
     def drain_once(self) -> int:
@@ -138,4 +124,11 @@ def wire_server(cfg, embedder):
         cfg, embedder, backend,
         connect=lambda: psycopg.connect(cfg.database_url or ""))
     dispatch = "async" if worker is not None else cfg.embed_dispatch
+    if dispatch == "async" and worker is None and backend is not None:
+        # async + no local worker: writes will flag embed_pending and this process
+        # embeds nothing. Correct ONLY in a split deployment with a separate
+        # memgres-worker. Warn loudly so a missing/failed worker isn't a silent gap.
+        _log.warning("MEMGRES_EMBED_DISPATCH=async with no in-process worker: writes "
+                     "will be flagged but NOT embedded here — a separate "
+                     "memgres-worker MUST be running, or semantic recall will lag.")
     return worker, replace(cfg, embed_dispatch=dispatch), backend
