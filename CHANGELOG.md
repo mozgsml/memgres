@@ -5,6 +5,17 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.4.1] — 2026-08-19
+
+### Fixed
+- **`replace_old` without `replace_new` no longer silently deletes the matched
+  text.** Both the `memory_write` MCP tool and `PATCH /memories/{id}` coerced a
+  missing `replace_new` to `""`, so a lone `replace_old` (a client that dropped
+  the field, or a parameter-name typo) rewrote the match to nothing and returned
+  success — a silent edit-into-delete on durable memory. A shared `build_replace`
+  helper now rejects exactly one of the pair with a `ValueError` (HTTP 422),
+  while an *explicit* `replace_new=""` still deletes on purpose.
+
 ## [0.4.0] — 2026-08-19
 
 ### Changed
