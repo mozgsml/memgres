@@ -17,17 +17,25 @@ ALTER TABLE memory ADD COLUMN IF NOT EXISTS embed_pending boolean NOT NULL DEFAU
 -- Partial index over just the pending rows: the worker drains oldest-first.
 CREATE INDEX IF NOT EXISTS memory_embed_pending ON memory (updated_at) WHERE embed_pending;
 
--- Retire the whole-body doc vector. Ranking is chunk-based now, so this column
--- and its HNSW index are dead weight. Bodies and history are untouched; the
--- chunk vectors are rebuilt from the bodies. Guarded so the one-time data
--- backfill (flag every existing row for re-chunking) runs ONLY on the upgrade
--- that still has the column — re-running migrate() after the drop is a no-op.
+-- One-time data backfill: on any deployment created BEFORE chunks existed
+-- (stored schema_version < 6, on EITHER backend), flag every bodied row so the
+-- worker rebuilds the chunk index from the bodies. The trigger is the stored
+-- version, not the pgvector `embedding` column — a qdrant deployment never had
+-- that column, so a column-based guard would skip the backfill there and leave
+-- semantic recall silently empty. Idempotent: _stamp bumps the version to 6 at
+-- the end of this same migrate(), so a re-run sees 6 (not < 6) and does nothing;
+-- a fresh install has no meta row yet (NULL), so it flags nothing either.
 DO $$
+DECLARE v integer;
 BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.columns
-               WHERE table_name = 'memory' AND column_name = 'embedding') THEN
+    SELECT schema_version INTO v FROM memgres_meta WHERE only_row;
+    IF v IS NOT NULL AND v < 6 THEN
         UPDATE memory SET embed_pending = true WHERE body IS NOT NULL AND body <> '';
     END IF;
 END $$;
+
+-- Retire the whole-body doc vector (pgvector only — ranking is chunk-based now,
+-- so the column and its HNSW index are dead weight). No-op on qdrant, where the
+-- column never existed.
 DROP INDEX IF EXISTS memory_embedding_hnsw;
 ALTER TABLE memory DROP COLUMN IF EXISTS embedding;
