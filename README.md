@@ -153,6 +153,7 @@ docker pull ghcr.io/mozgsml/memgres:latest
 1. **`docker compose up`** — `pgvector` + service, nothing to configure. For a dedicated vector service instead, `docker compose --profile qdrant up` and set `MEMGRES_VECTOR_BACKEND=qdrant` (Qdrant ranks vectors; Postgres still holds bodies and does tag/subtree/TTL filtering).
 2. **Your own Postgres** — install the `[server]` extra (above), point `MEMGRES_DATABASE_URL` at it, run `memgres-server` (migrates on startup).
 3. **Embedded library** — install the core package, use `Store` directly, no HTTP at all.
+4. **Split service (many clients)** — a stateless API tier that only flags writes plus a scalable `memgres-worker` tier that embeds; see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) and `deploy/docker-compose.yml`. Switch the embedding model later with `memgres-reembed`.
 
 Semantic recall is optional: the default `MEMGRES_EMBED_PROVIDER=none` gives you lexical FTS with zero models. Turn on `local` (sentence-transformers), a cloud API (`openai`/`jina`), or any OpenAI-compatible server (LM Studio, Ollama, …) when you want meaning-based search — see [docs/EMBEDDINGS.md](docs/EMBEDDINGS.md) for choosing local vs cloud and [docs/BACKENDS.md](docs/BACKENDS.md) for copy-paste setups. The model id + dimension get stamped into the schema and a later mismatch hard-fails instead of silently returning garbage.
 
@@ -186,8 +187,11 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_EMBED_PROVIDER` | `none` | `none` / `local` / `openai` / `jina` / `openai-compatible` (LM Studio, Ollama, vLLM, TEI…) |
 | `MEMGRES_EMBED_MODEL` / `_DIM` / `_API_KEY` / `_API_BASE` | — | model id · dimension (HTTP providers require it, `local` infers) · token · server URL |
 | `MEMGRES_EMBED_MAX_SEQ` | `0` | override the local model's max input length in tokens (`0` = the model's default) |
-| `MEMGRES_EMBED_WORKER` | `true` | the HTTP/MCP server runs a background embed worker (writes defer to it — fast writes, embedding off the request path). Off = the server embeds inline instead. Library/embedded use always embeds inline (no worker), so semantic recall is correct the instant a write commits |
-| `MEMGRES_EMBED_WORKER_INTERVAL` / `_BATCH` | `1.0` / `16` | worker idle poll seconds · memories embedded per drain batch |
+| `MEMGRES_CHUNK_CHARS` / `_OVERLAP` | `400` / `80` | chunk size / overlap for the chunk index (legacy names `MEMGRES_SNIPPET_SEG_CHARS` / `_OVERLAP` still work) |
+| `MEMGRES_EMBED_DISPATCH` | `inline` | `inline` = embed within the write (safe default, no worker); `async` = flag `embed_pending` and let a worker embed. A server sets `async` when it starts an in-process worker; set `async` + `MEMGRES_EMBED_WORKER=off` for a split deployment with a separate `memgres-worker` |
+| `MEMGRES_EMBED_WORKER` | `true` | a server process runs an in-process embed worker |
+| `MEMGRES_EMBED_WORKER_INTERVAL` / `_BATCH` | `1.0` / `16` | worker idle poll seconds · rows a drain pass processes |
+| `MEMGRES_EMBED_TX_TIMEOUT_MS` | `60000` | idle-in-transaction cap on a worker connection — frees a hung embed's row lock (`0` disables) |
 
 ## HTTP API
 

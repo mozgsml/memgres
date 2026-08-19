@@ -40,6 +40,23 @@ patch = fixes).
   empty `StartSel`/`StopSel`, so the returned text has no `<b>…</b>` markup that
   could mislead a model reading it.
 
+### Added
+- **Split (enterprise) deployment topology.** For many clients, run a stateless
+  API tier that only *flags* writes (`MEMGRES_EMBED_DISPATCH=async` +
+  `MEMGRES_EMBED_WORKER=off`) plus a scalable `memgres-worker` tier that embeds.
+  Draining is **claim-based** (`FOR UPDATE SKIP LOCKED`), so worker replicas never
+  embed a memory twice or block each other, and a crash mid-embed leaves the row
+  flagged for retry — never stuck (a hung embed's row lock is freed by
+  `MEMGRES_EMBED_TX_TIMEOUT_MS`, default 60 s). `MEMGRES_EMBED_DISPATCH`
+  (`inline`|`async`) replaces the derived async flag; `inline` stays the safe
+  library/all-in-one default. New `memgres-worker` entrypoint,
+  `deploy/docker-compose.yml`, and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+- **`memgres-reembed`** — switch the embedding model/dimension on an existing
+  store: re-stamps the model, wipes and recreates the chunk index at the new
+  dimension, flags every memory, and rebuilds — bodies and history untouched.
+  (Normal startup still refuses a silent model change.)
+- **`MEMGRES_CHUNK_CHARS` / `_OVERLAP`** — clearer names for the chunk index size
+  and overlap (the legacy `MEMGRES_SNIPPET_SEG_*` still work).
 - **Compatibility floor + startup version guard.** The meta row now carries
   `min_reader_version` alongside `schema_version` — the low end of the range of
   client `SCHEMA_VERSION`s allowed to operate against the data (the high end is
