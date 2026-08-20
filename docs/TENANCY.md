@@ -42,7 +42,17 @@ A token also has its own ceiling. Effective permission on a space is
 `min(your membership there, the token's ceiling)`. A read-only token never
 writes, even in a namespace you own.
 
-A global **admin token** (`MEMGRES_ADMIN_TOKEN`) can provision anything.
+Beyond per-namespace membership, a user has a **service role** (`app_user.role`)
+that governs the control plane:
+
+| role | can |
+|---|---|
+| `user` (default) | own namespaces; manage access to its **own** spaces (approve requests) |
+| `user_manager` | + create users and (re)issue tokens — provisioning only, **no** cross-tenant data access |
+| `superadmin` | + full root: read/write **any** namespace, add members anywhere, grant/revoke roles |
+
+A `superadmin`'s data access is capped by its token ceiling like anyone's; a
+`user_manager` never gains implicit access to another tenant's memories.
 
 ## Addressing a space
 
@@ -139,12 +149,45 @@ curl -s $BASE/access-requests/<req_id>/approve  -H "Authorization: Bearer $ADMIN
 After approval the requester's tokens reach the shared space **by id**, at the
 granted permission.
 
-## Admin provisioning (managed mode)
+## First admin — bootstrap (managed mode)
 
-With `MEMGRES_ADMIN_TOKEN` set, provision users, namespaces and tokens:
+A fresh managed database has no users, so someone must be seeded before anyone
+can be provisioned. At startup, if **zero admin users exist**, memgres seeds the
+first one from a bootstrap secret and then goes inert (the secret is never a
+standing backdoor). The secret is stored hashed as an ordinary token of the
+seeded user, so the same value afterwards authenticates that **real** user —
+admin actions are attributable, not anonymous.
+
+Provide the secret one of two ways (setting both is an error):
+
+- `MEMGRES_ADMIN_TOKEN` — the secret itself (must be a strong `mgk_` token).
+- `MEMGRES_ADMIN_TOKEN_FILE` — a path, **read-or-create** (Jenkins-style): if the
+  file holds a token it's used; if missing/empty, memgres generates one, writes
+  it `0600`, and logs the **path only** (never the secret). Copy it out and
+  delete the file on your own schedule.
+
+The seeded role is `MEMGRES_ADMIN_ROLE` — `user_manager` (default) or
+`superadmin`. A legacy/non-`mgk_` `MEMGRES_ADMIN_TOKEN` is not seeded but still
+works as an anonymous break-glass root (with a warning).
+
+Need a superadmin later (you seeded only a `user_manager`, or revoked the last
+one)? Use the CLI — it talks straight to the database, so the gate is host/DB
+access, not a network token:
 
 ```bash
-A='-H "Authorization: Bearer $MEMGRES_ADMIN_TOKEN"'
+memgres-grant-superadmin --list                # users + roles
+memgres-grant-superadmin --user <uuid>         # promote
+memgres-grant-superadmin --revoke --user <uuid># demote (anti-lockout applies)
+```
+
+## Admin provisioning (managed mode)
+
+An admin-role token (or the env break-glass root) provisions users, namespaces
+and tokens. `user_manager` covers users/tokens; cross-tenant membership and role
+grants require `superadmin`:
+
+```bash
+A='-H "Authorization: Bearer $ADMIN_TOKEN"'
 
 # create a user, a namespace they own, and a token for them
 UID=$(curl -s $BASE/admin/users -d '{"name":"alice"}' $A | jq -r .id)
@@ -153,9 +196,13 @@ NS=$(curl -s $BASE/admin/namespaces \
 curl -s $BASE/admin/tokens \
   -d "{\"user_id\":\"$UID\",\"permission\":\"write\"}" $A     # → token (once)
 
-# add another user as a member; revoke a token
+# add another user as a member; revoke a token       (member add: superadmin)
 curl -s $BASE/admin/namespaces/$NS/members -d '{"user_id":"…","permission":"read"}' $A
 curl -s $BASE/admin/tokens/<token_id>/revoke $A
+
+# service-role management (superadmin only)
+curl -s $BASE/admin/users/$UID/grant-superadmin $A
+curl -s $BASE/admin/users/$UID/revoke-superadmin -d '{"demote_to":"user"}' $A
 ```
 
 ## Anti-garbage
@@ -171,5 +218,7 @@ registrations.
 | var | meaning |
 |---|---|
 | `MEMGRES_KEY_MODE` | `single` (default) \| `open` \| `managed` |
-| `MEMGRES_ADMIN_TOKEN` | global admin bearer for provisioning |
+| `MEMGRES_ADMIN_TOKEN` | bootstrap/break-glass bearer (managed): seeds the first admin, then resolves to that user |
+| `MEMGRES_ADMIN_TOKEN_FILE` | read-or-create path for the bootstrap token (mutually exclusive with the above) |
+| `MEMGRES_ADMIN_ROLE` | role the bootstrap admin is seeded with: `user_manager` (default) \| `superadmin` |
 | `MEMGRES_TOKEN` | a default token used when a call passes none (single-tenant endpoints) |
