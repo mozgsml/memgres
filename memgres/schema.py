@@ -18,7 +18,7 @@ from pathlib import Path
 from .config import Config
 
 # The version this build migrates the database TO (the latest migration it carries).
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # The compatibility FLOOR: the schema version of the most recent backward-
 # INCOMPATIBLE migration — one that changed the shape/semantics old code relied on
@@ -33,6 +33,7 @@ SCHEMA_VERSION = 8
 #   v6 (0005): dropped the whole-body doc vector, moved ranking to chunks → BREAKING.
 #   v7 (0006): added min_reader_version column → additive, floor stays 6.
 #   v8 (0007): added embed_attempts/embed_failed_at → additive, floor stays 6.
+#   v9 (0008): added app_user.role service role → additive, floor stays 6.
 SCHEMA_BREAKING_VERSION = 6
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are

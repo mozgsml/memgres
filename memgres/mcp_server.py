@@ -35,6 +35,7 @@ except ImportError:  # mcp SDK 1.x
 from . import identity
 from .config import Config, load
 from .embeddings import get_embedder
+from .bootstrap import bootstrap_admin
 from .schema import migrate
 from .store import Store, build_replace
 
@@ -87,6 +88,7 @@ def build_server(cfg: Optional[Config] = None):
                           max_size=cfg.pool_size, open=True)
     with pool.connection() as conn:
         migrate(conn, cfg)
+        bootstrap_admin(conn, cfg)      # seed first service admin once (managed)
     # Start the in-process embed worker (if warranted) and set cfg.embed_dispatch
     # to match, so writes defer to it. Kept alive by its own daemon thread.
     from .embed_worker import wire_server

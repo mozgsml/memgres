@@ -30,6 +30,7 @@ from .config import Config, load
 from .diffing import DiffConflict
 from .embeddings import get_embedder
 from .identity import SpaceNotFound
+from .bootstrap import bootstrap_admin
 from .schema import migrate
 from .store import Conflict, NoParent, NotFound, Store, TooLarge, build_replace
 
@@ -65,6 +66,7 @@ def create_app(cfg: Optional[Config] = None):
     # closures below capture the finalized cfg.
     with psycopg.connect(cfg.database_url or "") as _mc:
         migrate(_mc, cfg)               # idempotent; stamps embed model/dim
+        bootstrap_admin(_mc, cfg)       # seed first service admin once (managed)
     from .embed_worker import wire_server
     _worker, cfg, backend = wire_server(cfg, embedder)
     pool = ConnectionPool(cfg.database_url or "", min_size=1,

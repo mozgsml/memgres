@@ -48,6 +48,16 @@ def bearer_token(authorization: Optional[str],
 # permission lattice
 _RANK = {"read": 1, "write": 2, "admin": 3}
 
+# service roles (app_user.role) — orthogonal to the per-namespace permission
+# lattice above. `user` is the default; the two admin roles govern the CONTROL
+# plane (provisioning) and, for superadmin, cross-namespace data access:
+#   user         — owns namespaces, manages access to its OWN spaces only.
+#   user_manager — user + create users + (re)issue tokens. No cross-tenant data.
+#   superadmin   — full root: read/write any namespace, grant any access,
+#                  grant/revoke roles. Principal.is_admin derives from this.
+SERVICE_ROLES = ("user", "user_manager", "superadmin")
+_ADMIN_ROLES = ("user_manager", "superadmin")
+
 
 class AuthError(PermissionError):
     """Bad/expired/revoked token, or the token may not do this here."""
@@ -91,46 +101,66 @@ class Principal:
     scope_namespace_id: Optional[str]      # scoped to one ns, or None = all the user's
     token_id: Optional[str] = None
     token_hash: Optional[str] = None
-    is_admin: bool = False                 # global admin (MEMGRES_ADMIN_TOKEN)
+    is_admin: bool = False                 # full root: env break-glass (user_id
+                                           # None) or a superadmin-role user
     provisional: bool = False              # valid token, user not yet materialized
+    role: str = "user"                     # service role of the owning user
+
+
+def can_manage_users(p: "Principal") -> bool:
+    """May this principal provision users / (re)issue tokens? True for a
+    user_manager, a superadmin, or the env break-glass root."""
+    return p.is_admin or p.role in _ADMIN_ROLES
 
 
 # ─── authentication ──────────────────────────────────────────────────────────
 def resolve(conn, cfg, secret: Optional[str]) -> Principal:
     """Authenticate a bearer secret into a :class:`Principal`.
 
-    * global admin token → admin principal;
-    * known token → its user/ceiling/scope (rejects revoked/expired);
+    * known token → its user/ceiling/scope/role (rejects revoked/expired). A
+      token whose user is a superadmin resolves with ``is_admin`` — so once
+      bootstrap has stored the env token as a real superadmin's token, that same
+      secret authenticates as the *attributed* user, not the anonymous root.
+    * env ``admin_token`` (break-glass) → anonymous admin principal. Tried only
+      *after* the stored-token lookup, so a seeded env token attributes to its
+      user; reachable before the first seed, or in modes bootstrap skips.
     * unknown but well-formed token in ``open`` mode → *provisional* principal
       (user materialized on first write); in ``managed`` mode → rejected.
     """
-    if cfg.admin_token and secret and hmac.compare_digest(secret, cfg.admin_token):
-        return Principal(user_id=None, permission="admin",
-                         scope_namespace_id=None, is_admin=True)
     if not secret:
         raise AuthError("a token is required")
-    if not valid_format(secret):
-        raise AuthError("malformed token (expected mgk_ + 43 url-safe chars)")
 
     h = token_hash(secret)
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id, user_id, namespace_id, permission, "
-            "       (revoked_at IS NOT NULL) AS revoked, "
-            "       (expires_at IS NOT NULL AND expires_at <= now()) AS expired "
-            "FROM token WHERE token_hash=%s", (h,))
-        row = cur.fetchone()
-        if row is not None:
-            tid, uid, nsid, perm, revoked, expired = row
-            if revoked:
-                raise AuthError("token revoked")
-            if expired:
-                raise AuthError("token expired")
-            cur.execute("UPDATE token SET last_used_at=now() WHERE id=%s", (tid,))
-            return Principal(user_id=str(uid), permission=perm,
-                             scope_namespace_id=str(nsid) if nsid else None,
-                             token_id=str(tid), token_hash=h)
+    if valid_format(secret):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT t.id, t.user_id, t.namespace_id, t.permission, "
+                "       (t.revoked_at IS NOT NULL) AS revoked, "
+                "       (t.expires_at IS NOT NULL AND t.expires_at <= now()) AS expired, "
+                "       u.role "
+                "FROM token t JOIN app_user u ON u.id = t.user_id "
+                "WHERE t.token_hash=%s", (h,))
+            row = cur.fetchone()
+            if row is not None:
+                tid, uid, nsid, perm, revoked, expired, role = row
+                if revoked:
+                    raise AuthError("token revoked")
+                if expired:
+                    raise AuthError("token expired")
+                cur.execute("UPDATE token SET last_used_at=now() WHERE id=%s", (tid,))
+                return Principal(user_id=str(uid), permission=perm,
+                                 scope_namespace_id=str(nsid) if nsid else None,
+                                 token_id=str(tid), token_hash=h, role=role,
+                                 is_admin=(role == "superadmin"))
 
+    # env break-glass root — any format (an operator may set a non-mgk secret);
+    # constant-time compare. Never reached for a seeded env token (matched above).
+    if cfg.admin_token and hmac.compare_digest(secret, cfg.admin_token):
+        return Principal(user_id=None, permission="admin",
+                         scope_namespace_id=None, is_admin=True)
+
+    if not valid_format(secret):
+        raise AuthError("malformed token (expected mgk_ + 43 url-safe chars)")
     if cfg.key_mode == "open":
         # accepted, but nothing is created until the first write
         return Principal(user_id=None, permission="write",
@@ -197,7 +227,8 @@ def resolve_space(conn, principal: Principal, *, space_id: Optional[str] = None,
     default). Reads never create. The returned permission is the token ceiling
     min the caller's membership; the caller enforces it against the op needed.
     """
-    if principal.is_admin:
+    if principal.is_admin and principal.user_id is None:
+        # env break-glass root: anonymous, addresses only by id
         if space_id:
             return str(space_id), "admin"
         raise AuthError("global admin must address a space by id")
@@ -216,11 +247,14 @@ def resolve_space(conn, principal: Principal, *, space_id: Optional[str] = None,
             raise AuthError("token is scoped to a different namespace")
 
     with conn.cursor() as cur:
-        # 1) by id — reach anything owned or shared
+        # 1) by id — reach anything owned or shared; a superadmin user reaches
+        #    ANY space by id (full root), still capped by its token ceiling.
         if space_id is not None:
             _scoped_ok(space_id)
             perm = _reach(cur, uid, str(space_id))
             if perm is None:
+                if principal.is_admin:
+                    return str(space_id), perm_min("admin", ceiling)
                 raise SpaceNotFound(f"namespace {space_id} not reachable")
             return str(space_id), perm_min(perm, ceiling)
 
@@ -259,11 +293,70 @@ def resolve_space(conn, principal: Principal, *, space_id: Optional[str] = None,
 
 
 # ─── management: users / namespaces / members ────────────────────────────────
-def create_user(conn, name: str = "", description: str = "") -> str:
+def create_user(conn, name: str = "", description: str = "",
+                role: str = "user") -> str:
+    if role not in SERVICE_ROLES:
+        raise ValueError(f"bad role: {role}")
     with conn.cursor() as cur:
-        cur.execute("INSERT INTO app_user (name, description) VALUES (%s, %s) "
-                    "RETURNING id", (name, description))
+        cur.execute("INSERT INTO app_user (name, description, role) "
+                    "VALUES (%s, %s, %s) RETURNING id", (name, description, role))
         return str(cur.fetchone()[0])
+
+
+# ─── service roles (control plane; see SERVICE_ROLES) ────────────────────────
+def count_service_admins(conn) -> int:
+    """How many users hold an admin role (user_manager or superadmin). Zero ⇒ a
+    fresh install with no control plane — the trigger for bootstrap seeding."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM app_user WHERE role IN "
+                    "('user_manager','superadmin')")
+        return int(cur.fetchone()[0])
+
+
+def count_superadmins(conn) -> int:
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM app_user WHERE role='superadmin'")
+        return int(cur.fetchone()[0])
+
+
+def get_role(conn, user_id: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT role FROM app_user WHERE id=%s", (user_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def set_role(conn, user_id: str, role: str) -> None:
+    """Set a user's service role directly. Callers that lower a superadmin must
+    guard against lockout themselves; :func:`revoke_superadmin` does that."""
+    if role not in SERVICE_ROLES:
+        raise ValueError(f"bad role: {role}")
+    with conn.cursor() as cur:
+        cur.execute("UPDATE app_user SET role=%s WHERE id=%s", (role, user_id))
+        if cur.rowcount == 0:
+            raise SpaceNotFound(f"no such user {user_id}")
+
+
+def grant_superadmin(conn, user_id: str) -> None:
+    set_role(conn, user_id, "superadmin")
+
+
+def revoke_superadmin(conn, user_id: str, *, demote_to: str = "user") -> None:
+    """Drop a user out of the superadmin role. Anti-lockout: refuses to remove
+    the **last** superadmin (recover such a lockout via the grant CLI)."""
+    if demote_to not in SERVICE_ROLES or demote_to == "superadmin":
+        raise ValueError(f"bad demote target: {demote_to}")
+    with conn.cursor() as cur:
+        cur.execute("SELECT role FROM app_user WHERE id=%s", (user_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise SpaceNotFound(f"no such user {user_id}")
+        if row[0] != "superadmin":
+            return                        # nothing to revoke
+        cur.execute("SELECT count(*) FROM app_user WHERE role='superadmin'")
+        if int(cur.fetchone()[0]) <= 1:
+            raise AuthError("cannot revoke the last superadmin")
+        cur.execute("UPDATE app_user SET role=%s WHERE id=%s", (demote_to, user_id))
 
 
 def create_namespace(conn, owner_user_id: str, name: str, *,
