@@ -5,7 +5,7 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
-## [Unreleased]
+## [0.5.0] — 2026-08-21
 
 ### Added
 - **Service roles + first-admin bootstrap (managed mode).** Users now carry a
