@@ -61,7 +61,15 @@ class Config:
                                  # (set in MCP/env for a single-tenant deployment)
     # identity / tenancy (see docs/TENANCY.md)
     key_mode: str                # single | open | managed  (how tokens/users are minted)
-    admin_token: str             # global-admin bearer: provision users/namespaces anywhere
+    admin_token: str             # bootstrap/break-glass bearer (managed): seeds the
+                                 # first service admin at startup, then resolves to
+                                 # that real user (see memgres.bootstrap)
+    admin_token_file: str        # read-or-create path for the bootstrap token
+                                 # (Jenkins-style): present → read it; missing/empty
+                                 # → generate an mgk_ token, write it 0600, log the
+                                 # path only. Mutually exclusive with admin_token.
+    admin_role: str              # role the bootstrap admin is seeded with:
+                                 # user_manager (default) | superadmin
     # organization
     tree_enabled: bool           # ltree path column + GiST index for fast subtree selection
     require_parent: bool         # False = sparse paths (create food.apple with no food row);
@@ -158,6 +166,13 @@ class Config:
             raise ValueError(f"unknown MEMGRES_VECTOR_BACKEND: {self.vector_backend}")
         if self.key_mode not in ("single", "open", "managed"):
             raise ValueError(f"unknown MEMGRES_KEY_MODE: {self.key_mode}")
+        if self.admin_role not in ("user_manager", "superadmin"):
+            raise ValueError(
+                "MEMGRES_ADMIN_ROLE must be user_manager or superadmin "
+                f"(got {self.admin_role!r})")
+        if self.admin_token and self.admin_token_file:
+            raise ValueError(
+                "set only one of MEMGRES_ADMIN_TOKEN / MEMGRES_ADMIN_TOKEN_FILE")
         if self.embed_provider != "none" and self.vector_backend == "pgvector" \
                 and self.embed_dim <= 0:
             raise ValueError(
@@ -179,6 +194,8 @@ def load() -> Config:
         default_token=_str("MEMGRES_TOKEN", ""),
         key_mode=_str("MEMGRES_KEY_MODE", "single"),
         admin_token=_str("MEMGRES_ADMIN_TOKEN", ""),
+        admin_token_file=_str("MEMGRES_ADMIN_TOKEN_FILE", ""),
+        admin_role=_str("MEMGRES_ADMIN_ROLE", "user_manager"),
         tree_enabled=_bool("MEMGRES_TREE", True),
         require_parent=_bool("MEMGRES_REQUIRE_PARENT", False),
         history_enabled=_bool("MEMGRES_HISTORY", True),

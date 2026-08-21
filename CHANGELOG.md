@@ -5,6 +5,24 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.5.0] — 2026-08-21
+
+### Added
+- **Service roles + first-admin bootstrap (managed mode).** Users now carry a
+  service role (`user` | `user_manager` | `superadmin`) via `app_user.role`,
+  orthogonal to per-namespace membership. `Principal.is_admin` derives from the
+  superadmin role, so admin actions attribute to a real user instead of an
+  anonymous env root. A managed server seeds its first admin once at startup from
+  `MEMGRES_ADMIN_TOKEN` or `MEMGRES_ADMIN_TOKEN_FILE` (read-or-create,
+  Jenkins-style) — only when zero admins exist; inert thereafter. The seed role is
+  `MEMGRES_ADMIN_ROLE` (default `user_manager`). Schema v9 (additive).
+- **Role-gated REST provisioning + `grant`/`revoke-superadmin` endpoints.**
+  `/admin/*` is gated by the caller's role: user/token management needs
+  `user_manager`+, cross-tenant member-add and role grants need `superadmin`. A
+  `user_manager` cannot mint an admin-role user.
+- **`memgres-grant-superadmin` CLI** — promotes a user directly over the database
+  (Django `createsuperuser` analog); the break-glass path and lockout recovery.
+
 ## [0.4.1] — 2026-08-19
 
 ### Fixed
