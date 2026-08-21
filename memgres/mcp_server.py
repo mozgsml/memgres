@@ -426,9 +426,18 @@ def main():  # pragma: no cover - entrypoint
     server = build_server()
     transport = os.environ.get("MEMGRES_MCP_TRANSPORT", "stdio").lower()
     if transport in ("http", "streamable-http", "streamable_http"):
-        server.settings.host = os.environ.get("MEMGRES_MCP_HOST", "0.0.0.0")
-        server.settings.port = int(os.environ.get("MEMGRES_MCP_PORT", "8765"))
-        server.run(transport="streamable-http")
+        host = os.environ.get("MEMGRES_MCP_HOST", "0.0.0.0")
+        port = int(os.environ.get("MEMGRES_MCP_PORT", "8765"))
+        # mcp SDK 1.x (FastMCP) reads host/port from `settings`; 2.x (MCPServer)
+        # dropped those fields and takes them as run() kwargs (forwarded to
+        # run_streamable_http_async). Pick the path the installed SDK supports.
+        fields = getattr(type(server.settings), "model_fields", {})
+        if "host" in fields:
+            server.settings.host = host
+            server.settings.port = port
+            server.run(transport="streamable-http")
+        else:
+            server.run(transport="streamable-http", host=host, port=port)
     else:
         server.run()
 

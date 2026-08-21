@@ -5,6 +5,16 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.5.1] — 2026-08-21
+
+### Fixed
+- **HTTP MCP transport now binds under mcp SDK 2.x.** `memgres-mcp` with
+  `MEMGRES_MCP_TRANSPORT=http` set `server.settings.host/port`, which the 2.x
+  `MCPServer` rejects (`"Settings" object has no field "host"`) — the container
+  crash-looped and never served on its port (bootstrap still ran). `main()` now
+  passes host/port as `run()` kwargs on 2.x and keeps the `settings` path for
+  1.x. Added a regression test that spawns the transport and asserts it answers.
+
 ## [0.5.0] — 2026-08-21
 
 ### Added
