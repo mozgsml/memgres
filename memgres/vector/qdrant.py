@@ -155,6 +155,32 @@ class QdrantBackend:
             return None
         return (points[0].payload or {}).get("src_hash")
 
+    def retag_namespace(self, conn, old_ns: str, new_ns: str) -> int:
+        """Rewrite the namespace payload on every chunk point of ``old_ns``.
+
+        Qdrant is out of band, so this cannot join the Postgres transaction. It
+        is therefore done FIRST and the memories move second: a run that dies in
+        between leaves points tagged for a namespace whose memories are still
+        orphaned, and orphaned memories are unreachable anyway — so the halfway
+        state answers nothing wrong, and re-running finishes the job."""
+        from qdrant_client.models import (FieldCondition, Filter, MatchValue)
+
+        flt = Filter(must=[FieldCondition(key="namespace",
+                                          match=MatchValue(value=old_ns))])
+        moved, offset = 0, None
+        while True:
+            points, offset = self.client.scroll(
+                self.chunks, scroll_filter=flt, limit=256,
+                with_payload=False, with_vectors=False, offset=offset)
+            if not points:
+                break
+            self.client.set_payload(self.chunks, payload={"namespace": new_ns},
+                                    points=[p.id for p in points])
+            moved += len(points)
+            if offset is None:
+                break
+        return moved
+
     # ─── grouped semantic ranking ─────────────────────────────────────────────
     def search(self, conn, cfg, query_vec: Sequence[float], k: int, ns,
                tags: Optional[Sequence[str]], path_prefix: Optional[str]) -> List[Hit]:

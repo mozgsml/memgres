@@ -365,6 +365,63 @@ def list_tokens(conn, p: Principal, *, user_id: str) -> List[dict]:
 
 # ─── access requests: ask to join a namespace, an admin decides ──────────────
 
+# ─── adopting data left behind by single mode ───────────────────────────────
+# In `single` mode every memory is stored under the namespace `''`. Switching to
+# open/managed does not move them, and no principal ever resolves to `''`, so the
+# whole corpus becomes unreachable — present, unharmed, and invisible. These two
+# make that state visible and then fixable.
+ORPHAN_NAMESPACE = ""
+
+
+def count_orphans(conn, p: Principal) -> dict:
+    """How many memories are stranded in the pre-identity namespace.
+
+    Reported rather than merely fixable: a deployment that switched modes has no
+    other signal that its old memories exist, because every read simply comes
+    back empty."""
+    require_superadmin(p)
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM memory WHERE namespace=%s",
+                    (ORPHAN_NAMESPACE,))
+        return {"orphans": cur.fetchone()[0]}
+
+
+def adopt_orphans(conn, p: Principal, *, namespace_id: str, vectors=None) -> dict:
+    """Move every stranded memory into a real namespace.
+
+    Idempotent: with nothing stranded it changes nothing and says so, so it is
+    safe to call twice or to leave wired into a startup script.
+
+    The order matters and is the whole subtlety. A memory's namespace is written
+    down twice — on the row, and on every chunk vector — and the two live in
+    different stores when the backend is Qdrant, which cannot join a Postgres
+    transaction. Rewriting the rows first and dying before the vectors leaves
+    lexical recall working and semantic recall returning NOTHING for the adopted
+    memories: not an error, just an empty answer, which is the failure this
+    codebase treats as worse than a crash. So the vectors move first. A run that
+    dies in between leaves chunks pointing at a namespace whose memories are
+    still stranded — and stranded memories were already unreachable, so the
+    halfway state answers nothing wrong, and running it again finishes the job.
+    """
+    require_superadmin(p)
+    require_namespace_admin(conn, p, namespace_id)
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM memory WHERE namespace=%s",
+                    (ORPHAN_NAMESPACE,))
+        found = cur.fetchone()[0]
+    if not found:
+        return {"adopted": 0, "chunks": 0, "namespace_id": namespace_id}
+
+    chunks = 0
+    if vectors is not None:
+        chunks = vectors.retag_namespace(conn, ORPHAN_NAMESPACE, namespace_id)
+    with conn.cursor() as cur:
+        cur.execute("UPDATE memory SET namespace=%s WHERE namespace=%s",
+                    (namespace_id, ORPHAN_NAMESPACE))
+        adopted = cur.rowcount
+    return {"adopted": adopted, "chunks": chunks, "namespace_id": namespace_id}
+
+
 def request_access(conn, p: Principal, *, namespace_id: str,
                    permission: str = "read") -> str:
     """Ask for membership. Any authenticated user with an owning account may."""

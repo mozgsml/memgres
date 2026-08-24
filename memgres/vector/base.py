@@ -215,6 +215,14 @@ class VectorBackend(Protocol):
         already current (idempotent drain)."""
         ...
 
+    def retag_namespace(self, conn, old_ns: str, new_ns: str) -> int:
+        """Move every chunk vector from one namespace to another; returns how
+        many moved. Used when adopting orphaned single-mode data: the chunk
+        index carries its own copy of the namespace, and leaving it behind makes
+        semantic recall return NOTHING for the adopted rows — silently, since a
+        filter that matches no points is not an error."""
+        ...
+
     def search(self, conn, cfg, query_vec: Sequence[float], k: int, ns: str,
                tags: Optional[Sequence[str]], path_prefix: Optional[str]
                ) -> List[Hit]:

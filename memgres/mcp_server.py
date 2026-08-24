@@ -628,6 +628,30 @@ def build_server(cfg: Optional[Config] = None):
                     instruction=instruction)
 
         @mcp.tool()
+        def memory_admin_count_orphans(token: Optional[str] = None,
+                                       ctx: Context = None) -> dict:
+            """How many memories are stranded in the pre-identity namespace.
+            `single` mode stores everything under one nameless namespace; after a
+            switch to open/managed nobody resolves to it, so the old corpus is
+            present but invisible and every read of it just comes back empty.
+            This is the only thing that says so."""
+            with pool.connection() as conn:
+                return admin.count_orphans(conn, _principal(conn, _token(ctx, token)))
+
+        @mcp.tool()
+        def memory_admin_adopt_orphans(space_id: str,
+                                       token: Optional[str] = None,
+                                       ctx: Context = None) -> dict:
+            """Move every stranded `single`-mode memory into a real namespace.
+            Idempotent — with nothing stranded it changes nothing. Moves the chunk
+            vectors too, so semantic recall keeps working; leaving them behind
+            would make it answer empty without erroring."""
+            with pool.connection() as conn, conn.transaction():
+                return admin.adopt_orphans(
+                    conn, _principal(conn, _token(ctx, token)),
+                    namespace_id=space_id, vectors=backend)
+
+        @mcp.tool()
         def memory_admin_add_member(space_id: str, user_id: str,
                                     permission: str = "read",
                                     token: Optional[str] = None,

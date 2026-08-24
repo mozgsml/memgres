@@ -158,6 +158,8 @@ def _matrix(uid: str, nsid: str, token_id: str) -> dict:
         "memory_admin_issue_token": {"user_id": uid},
         "memory_admin_list_tokens": {"user_id": uid},
         "memory_admin_revoke_token": {"token_id": token_id},
+        "memory_admin_count_orphans": {},
+        "memory_admin_adopt_orphans": {"space_id": nsid},
     }
 
 

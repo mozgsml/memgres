@@ -43,6 +43,14 @@ class PgvectorBackend:
             row = cur.fetchone()
         return row[0] if row else None
 
+    def retag_namespace(self, conn, old_ns: str, new_ns: str) -> int:
+        # Same database, so this rides in the caller's transaction and commits
+        # or rolls back with the memories themselves.
+        with conn.cursor() as cur:
+            cur.execute("UPDATE memory_segment SET namespace=%s WHERE namespace=%s",
+                        (new_ns, old_ns))
+            return cur.rowcount
+
     # ─── grouped semantic ranking ─────────────────────────────────────────────
     def search(self, conn, cfg, query_vec: Sequence[float], k: int, ns,
                tags: Optional[Sequence[str]], path_prefix: Optional[str]) -> List[Hit]:

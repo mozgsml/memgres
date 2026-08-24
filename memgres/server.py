@@ -561,6 +561,24 @@ def create_app(cfg: Optional[Config] = None):
             return _guard(lambda: admin.list_members(conn, p,
                                                      namespace_id=space_id))
 
+    class Adopt(BaseModel):
+        namespace_id: str
+
+    @app.get("/admin/orphans")
+    def admin_count_orphans(p=Depends(principal)):
+        """How many memories are stranded in the pre-identity namespace — the
+        only signal a deployment gets that its `single`-mode corpus survived a
+        switch to open/managed, since every read of it simply comes back empty."""
+        with pool.connection() as conn:
+            return _guard(lambda: admin.count_orphans(conn, p))
+
+    @app.post("/admin/adopt-orphans")
+    def admin_adopt_orphans(req: Adopt, p=Depends(principal)):
+        """Move stranded `single`-mode memories into a real namespace. Idempotent."""
+        with pool.connection() as conn, conn.transaction():
+            return _guard(lambda: admin.adopt_orphans(
+                conn, p, namespace_id=req.namespace_id, vectors=_store(conn)._vectors))
+
     # ─── service-role management (superadmin only) ──────────────────────────
     @app.post("/admin/users/{user_id}/grant-superadmin")
     def admin_grant_superadmin(user_id: str, p=Depends(principal)):
