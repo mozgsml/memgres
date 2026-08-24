@@ -438,11 +438,26 @@ def adopt_orphans(conn, p: Principal, *, namespace_id: str, vectors=None) -> dic
 
 
 def request_access(conn, p: Principal, *, namespace_id: str,
-                   permission: str = "read") -> str:
-    """Ask for membership. Any authenticated user with an owning account may."""
+                   permission: str = "read") -> dict:
+    """Ask for membership. Any authenticated user with an owning account may.
+
+    The answer says what happened to the *request*, never what exists: a
+    namespace the caller cannot reach and a namespace that does not exist are
+    reported identically, because telling them apart is exactly what an outsider
+    probing uuids would be after. It carries no request id for the same reason —
+    and the requester has no use for one, since deciding a request belongs to
+    whoever administers the namespace, who reads ids from `list_requests`.
+
+    Already reaching it is reported plainly: that is the caller's own access,
+    which `list_spaces` shows them anyway.
+    """
     if p.user_id is None:
         raise identity.AuthError("this token has no owning user")
-    return identity.request_access(conn, p.user_id, namespace_id, permission)
+    perm = identity.reaches(conn, p.user_id, namespace_id)
+    if perm is not None:
+        return {"status": "already_reachable", "permission": perm}
+    identity.request_access(conn, p.user_id, namespace_id, permission)
+    return {"status": "submitted"}
 
 
 def list_requests(conn, p: Principal, *, namespace_id: str) -> List[dict]:

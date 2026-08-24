@@ -391,13 +391,16 @@ def create_app(cfg: Optional[Config] = None):
     class RequestBody(BaseModel):
         permission: str = "read"
 
-    @app.post("/spaces/{space_id}/access-requests", status_code=201)
+    # 202, not 201: the answer deliberately does not say whether anything was
+    # created — an unreachable namespace and a nonexistent one must read the
+    # same, or the status alone becomes the existence oracle the body no longer is.
+    @app.post("/spaces/{space_id}/access-requests", status_code=202)
     def request_access(space_id: str, req: RequestBody,
                        tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
-            return {"id": _guard(lambda: admin.request_access(
+            return _guard(lambda: admin.request_access(
                 conn, identity.resolve(conn, cfg, tok),
-                namespace_id=space_id, permission=req.permission))}
+                namespace_id=space_id, permission=req.permission))
 
     @app.get("/spaces/{space_id}/access-requests")
     def list_access_requests(space_id: str, tok: Optional[str] = Depends(token)):

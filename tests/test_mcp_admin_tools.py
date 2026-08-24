@@ -59,12 +59,20 @@ def _call(mcp, tool, /, **kw):
     with this signature.
     """
     res = asyncio.run(mcp.call_tool(tool, kw))
-    if isinstance(res, tuple):                      # mcp 1.x: (unstructured, structured)
+    # Several shapes across SDK versions, and they change under us: some 1.x
+    # returned (unstructured, structured); 1.28 returns either a bare structured
+    # dict or a plain SEQUENCE of content blocks; 2.x returns a result object.
+    # Read all of them — a helper that knows only one turns an SDK bump into six
+    # red tests that look like a regression in the code under test.
+    if isinstance(res, tuple):
         out = res[1]
+    elif isinstance(res, dict):
+        out = res
     elif getattr(res, "structured_content", None) is not None:
         out = res.structured_content
     else:
-        out = json.loads(res.content[0].text)
+        blocks = getattr(res, "content", res)
+        out = json.loads(blocks[0].text)
     if isinstance(out, dict) and set(out) == {"result"}:   # list returns get wrapped
         return out["result"]
     return out

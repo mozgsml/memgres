@@ -218,6 +218,12 @@ def _fold(digest: str, label: str, *fields: str) -> str:
     return _sha("\x1f".join(parts))
 
 
+# The recipe new history rows are hashed with. Stored per row (`hash_version`)
+# so rows written by older versions keep verifying against the recipe that
+# produced them — see migrations/0013 for why the recipe changed.
+HASH_VERSION = 2
+
+
 def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
               diff: Optional[str], hash_after: Optional[str],
               path_after: Optional[str], tags_after: Optional[Sequence[str]],
@@ -225,10 +231,31 @@ def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
               author_user_id: Optional[str] = None,
               author_token_id: Optional[str] = None,
               title_before: Optional[str] = None,
-              title_after: Optional[str] = None) -> str:
+              title_after: Optional[str] = None,
+              version: int = HASH_VERSION) -> str:
+    """The chain digest for one history row, computed by recipe ``version``.
+
+    v1 left the tag list joined by commas inside the flat field list, which is
+    not injective: ``['a','b']`` and ``['a,b']`` produce the same digest, so a
+    tag set could be rewritten into another with the same joined text without
+    breaking the chain. v2 folds tags the way title and author are already
+    folded — each value reduced to a fixed-width digest before joining.
+
+    v1 is kept, exactly as it was, because it is the only thing that can verify
+    rows written before the change: rehashing stored history to "upgrade" it
+    would rewrite the record whose immutability is the entire point.
+    """
+    tags = list(tags_after or [])
+    flat_tags = ",".join(tags) if version < 2 else ""
     parts = [prev or "", memory_id, str(seq), op, diff or "", hash_after or "",
-             path_after or "", ",".join(tags_after or []), source or "", reason or ""]
+             path_after or "", flat_tags, source or "", reason or ""]
     h = _sha("\x1f".join(parts))
+    # v2: the tags leave the flat list and fold in through their own domain. The
+    # fold is unconditional (an empty tag set folds too), so a v2 row recomputed
+    # under v1 — or a v1 row under v2 — cannot come out the same. That is what
+    # keeps `hash_version` a selector rather than a claim the recipe must trust.
+    if version >= 2:
+        h = _fold(h, "memgres.tags.v2", *tags)
     # Each optional dimension folds in ONLY when it was touched on this row. A row
     # that touched neither title nor author — which includes EVERY row written
     # before those features — returns the base digest unchanged and still
@@ -777,13 +804,15 @@ class Store:
                               None, None)
             params.append((mid, seq, "move", None, chash, chash, before, after,
                            None, None, source, reason, author_user_id,
-                           author_token_id, None, None, prev_hash, rhash))
+                           author_token_id, None, None, prev_hash, rhash,
+                           HASH_VERSION))
         cur.executemany(
             """INSERT INTO memory_history (memory_id, seq, op, diff, hash_before,
                    hash_after, path_before, path_after, tags_before, tags_after,
                    source, reason, author_user_id, author_token_id,
-                   title_before, title_after, prev_row_hash, row_hash)
-               VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                   title_before, title_after, prev_row_hash, row_hash,
+                   hash_version)
+               VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             params)
 
     def _append_history(self, memory_id, seq, op, diff, hash_before, hash_after,
@@ -804,12 +833,13 @@ class Store:
             """INSERT INTO memory_history (memory_id, seq, op, diff, hash_before,
                    hash_after, path_before, path_after, tags_before, tags_after,
                    source, reason, author_user_id, author_token_id,
-                   title_before, title_after, prev_row_hash, row_hash)
-               VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                   title_before, title_after, prev_row_hash, row_hash,
+                   hash_version)
+               VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (memory_id, seq, op, diff, hash_before, hash_after, path_before,
              path_after, tags_before, tags_after, source, reason,
              author_user_id, author_token_id, title_before, title_after,
-             prev_hash, rhash))
+             prev_hash, rhash, HASH_VERSION))
 
     # ─── recall: lexical / semantic / hybrid ────────────────────────────────
     def recall(self, token: Optional[str], query: str, *, k: int = 10,
@@ -1060,14 +1090,14 @@ class Store:
             "h.source, h.reason, h.author_user_id::text, h.author_token_id::text, "
             "COALESCE(NULLIF(u.full_name, ''), NULLIF(u.name, '')) AS author_name, "
             "NULLIF(u.email, '') AS author_email, "
-            "h.title_before, h.title_after, "
+            "h.title_before, h.title_after, h.hash_version, "
             "h.prev_row_hash, h.row_hash, h.created_at FROM memory_history h "
             "LEFT JOIN app_user u ON u.id = h.author_user_id "
             "WHERE h.memory_id=%s ORDER BY h.seq", (id,))
         cols = ["seq", "op", "diff", "hash_before", "hash_after", "path_before",
                 "path_after", "tags_before", "tags_after", "source", "reason",
                 "author_user_id", "author_token_id", "author_name", "author_email",
-                "title_before", "title_after",
+                "title_before", "title_after", "hash_version",
                 "prev_row_hash", "row_hash", "created_at"]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
@@ -1109,7 +1139,12 @@ class Store:
                        at: Optional[str] = None,
                        space: Optional[str] = None,
                        space_id: Optional[str] = None) -> bool:
-        """Recompute the chain; True if untampered."""
+        """Recompute the chain; True if untampered.
+
+        Each row is recomputed with the recipe it records (`hash_version`), so a
+        chain written across an upgrade verifies end to end: the rows from before
+        keep their original digests and the rows after use the stronger one.
+        """
         # resolved here rather than inside `history`, because the memory id is
         # itself hashed into every row — verifying against the address the caller
         # typed instead of the id it resolves to would fail every chain.
@@ -1122,7 +1157,8 @@ class Store:
                                r["hash_after"], r["path_after"], r["tags_after"],
                                r["source"], r["reason"],
                                r["author_user_id"], r["author_token_id"],
-                               r["title_before"], r["title_after"])
+                               r["title_before"], r["title_after"],
+                               version=int(r["hash_version"] or 1))
             if expect != r["row_hash"] or (r["prev_row_hash"] or None) != prev:
                 return False
             prev = r["row_hash"]

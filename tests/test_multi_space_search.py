@@ -217,6 +217,87 @@ def test_every_hit_carries_its_namespace(env):
     assert row["space"] == "work" and row["space_id"] == ids[0]
 
 
+# ─── a superadmin reaches more than it belongs to, so `all` is two questions ──
+def _superadmin(setup, name, *spaces):
+    uid, tok, ids = _owner(setup, name, *spaces)
+    ident.set_role(setup, uid, "superadmin")
+    tok, _ = ident.issue_token(setup, uid, permission="admin")
+    return uid, tok, ids
+
+
+def test_all_is_refused_for_a_superadmin_that_would_under_answer(env):
+    """The failure this closes: `all` returned the caller's MEMBERSHIPS, while a
+    superadmin reads any namespace by id. Searching 2 of 3 namespaces and
+    reporting nothing found is indistinguishable from an answer — the same class
+    of silent partial result the whole addressing model exists to prevent."""
+    setup, s = env
+    _, root, _ = _superadmin(setup, "root", "ops")
+    _, other, _ = _owner(setup, "tenant", "theirs")
+    s.write(other, body="apple in someone else's space\n", space="theirs")
+    s.write(root, body="apple in mine\n", space="ops")
+
+    with pytest.raises(SpaceAmbiguous) as e:
+        s.recall(root, "apple", space="all")
+    msg = str(e.value)
+    assert "superadmin" in msg and "'ops'" in msg      # names what it DOES cover
+    assert "'*'" in msg                                # …and the wide word
+
+    # `*` is the explicit wide read, and it sees both
+    assert len(s.recall(root, "apple", space="*")) == 2
+    # naming them still works, and stays narrow
+    assert len(s.recall(root, "apple", space="ops")) == 1
+
+
+def test_a_plain_user_never_sees_the_ambiguity_or_the_wide_word(env):
+    """`all` is unchanged for everyone whose reach IS their memberships."""
+    setup, s = env
+    _, tok, _ = _owner(setup, "plain", "work", "home")
+    _, other, _ = _owner(setup, "tenant", "theirs")
+    s.write(other, body="apple elsewhere\n", space="theirs")
+    s.write(tok, body="apple at work\n", space="work")
+
+    assert len(s.recall(tok, "apple", space="all")) == 1     # no refusal
+    with pytest.raises(ident.AuthError) as e:
+        s.recall(tok, "apple", space="*")
+    assert "superadmin" in str(e.value)
+
+
+def test_a_superadmin_whose_memberships_cover_everything_is_not_bothered(env):
+    """The refusal fires only where the two answers actually differ."""
+    setup, s = env
+    _, root, _ = _superadmin(setup, "root", "ops")
+    s.write(root, body="apple\n", space="ops")
+    assert len(s.recall(root, "apple", space="all")) == 1
+
+
+def test_the_wide_word_does_not_widen_a_scoped_token(env):
+    """A token pinned to one namespace was narrowed on purpose; the role behind
+    it does not undo that."""
+    setup, s = env
+    uid, root, ids = _superadmin(setup, "root", "ops", "second")
+    _, other, _ = _owner(setup, "tenant", "theirs")
+    s.write(other, body="apple elsewhere\n", space="theirs")
+    s.write(root, body="apple in ops\n", space_id=ids[0])
+    scoped, _ = ident.issue_token(setup, uid, namespace_id=ids[0],
+                                  permission="admin")
+
+    hits = s.recall(scoped, "apple", space="*")
+    assert [h.namespace for h in hits] == [ids[0]]
+
+
+def test_a_namespace_actually_named_like_a_keyword_is_not_swallowed(env):
+    """Namespace names are free text, so a keyword can collide with a real name.
+    Neither meaning is assumed — the call is refused and told to use the id."""
+    setup, s = env
+    _, tok, ids = _owner(setup, "clever", "all", "other")
+    s.write(tok, body="apple\n", space_id=ids[0])
+
+    with pytest.raises(SpaceAmbiguous) as e:
+        s.recall(tok, "apple", space="all")
+    assert "space_id" in str(e.value)
+    assert len(s.recall(tok, "apple", space_id=ids[0])) == 1
+
+
 # ─── single mode is untouched: no identity, one implicit space ───────────────
 def test_single_mode_ignores_addressing(env):
     setup, _ = env

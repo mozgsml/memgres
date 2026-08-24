@@ -275,10 +275,15 @@ def test_admin_provisioning_and_request_access(monkeypatch):
         # joiner can't reach it yet
         assert client.get(f"/memories/{mid}", params={"space_id": ns},
                           headers=hj).status_code == 404
-        # joiner requests read access; owner approves
-        rid = client.post(f"/spaces/{ns}/access-requests", json={"permission": "read"},
-                          headers=hj).json()["id"]
-        assert len(client.get(f"/spaces/{ns}/access-requests", headers=ho).json()) == 1
+        # joiner requests read access; owner approves. The requester's receipt
+        # says only that the request was submitted — no id, and nothing that
+        # distinguishes an unreachable namespace from one that doesn't exist.
+        r = client.post(f"/spaces/{ns}/access-requests", json={"permission": "read"},
+                        headers=hj)
+        assert r.status_code == 202 and r.json() == {"status": "submitted"}
+        pending = client.get(f"/spaces/{ns}/access-requests", headers=ho).json()
+        assert len(pending) == 1
+        rid = pending[0]["id"]                  # the id lives with the decider
         # joiner (only a requester, no membership) can't approve their own request
         # (404 — the namespace isn't even visible to them, existence not leaked)
         assert client.post(f"/access-requests/{rid}/approve",

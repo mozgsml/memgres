@@ -343,3 +343,54 @@ def test_read_only_ceiling_holds_across_all_spaces(env):
     assert len(s.recall(reader, "note", space="all")) == 2
     with pytest.raises(DENIED):
         s.write(reader, body="should not land\n", space="a")
+
+
+def test_request_access_does_not_reveal_which_uuids_are_namespaces(env):
+    """The oracle this closes: an unreachable namespace produced a request, a
+    uuid that named nothing produced a foreign-key error. The difference told an
+    outsider which uuids are real — membership-blind, and independent of the
+    caller's own access. Both answers are now the same."""
+    import uuid
+
+    from memgres import admin
+
+    setup, make_store = env
+    make_store("managed")
+    victim = ident.create_user(setup, name="victim")
+    hidden = ident.create_namespace(setup, victim, "private")
+
+    outsider = ident.create_user(setup, name="outsider")
+    ident.create_namespace(setup, outsider, "own")
+    tok, _ = ident.issue_token(setup, outsider)
+    cfg = dataclasses.replace(load(), key_mode="managed")
+    p = ident.resolve(setup, cfg, tok)
+
+    real = admin.request_access(setup, p, namespace_id=hidden)
+    fake = admin.request_access(setup, p, namespace_id=str(uuid.uuid4()))
+    assert real == fake == {"status": "submitted"}
+
+    # the request against the namespace that exists was in fact recorded…
+    assert len(ident.list_requests(setup, hidden)) == 1
+    # …and a malformed id is a plain argument error, which reveals nothing about
+    # what exists — and must not abort the transaction with a driver fault
+    with pytest.raises(ValueError):
+        admin.request_access(setup, p, namespace_id="not-a-uuid")
+    assert ident.reaches(setup, outsider, hidden) is None
+
+
+def test_request_access_tells_you_about_your_own_access(env):
+    """Reporting reachability leaks nothing: it is the caller's own membership,
+    which `list_spaces` shows them anyway."""
+    from memgres import admin
+
+    setup, make_store = env
+    make_store("managed")
+    uid = ident.create_user(setup, name="u")
+    ns = ident.create_namespace(setup, uid, "own")
+    tok, _ = ident.issue_token(setup, uid)
+    cfg = dataclasses.replace(load(), key_mode="managed")
+    p = ident.resolve(setup, cfg, tok)
+
+    assert admin.request_access(setup, p, namespace_id=ns) == {
+        "status": "already_reachable", "permission": "admin"}
+    assert ident.list_requests(setup, ns) == []

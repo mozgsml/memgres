@@ -404,6 +404,48 @@ def test_hash_chain_verifies(store):
     assert store.verify_history(None, m.id) is True
 
 
+def test_a_tag_rewrite_breaks_the_chain(store):
+    """v1 joined the tag list with commas inside an otherwise \\x1f-separated
+    field list, so ['a','b'] and ['a,b'] hashed the SAME: anyone able to write
+    the table could rewrite what a memory says about itself and verify_history
+    would still call the chain intact. Tags are not decoration here — recall can
+    be scoped to them."""
+    m = store.write(body="1\n", tags=["a", "b"])
+    assert store.verify_history(None, m.id) is True
+
+    with store._conn.cursor() as cur:
+        cur.execute("UPDATE memory_history SET tags_after=%s WHERE memory_id=%s",
+                    (["a,b"], m.id))
+    store._conn.commit()
+    assert store.verify_history(None, m.id) is False
+
+
+def test_a_chain_written_across_the_upgrade_still_verifies(store):
+    """Rows keep the recipe they were written with. Rehashing stored history to
+    "upgrade" it would rewrite the very record whose immutability is the point,
+    so old rows verify under v1 and new ones under v2 — in one chain."""
+    from memgres.store import _row_hash
+
+    m = store.write(body="1\n", tags=["a", "b"], source="s")
+    # make the first row look like one written before the upgrade
+    [row] = store.history(None, m.id)
+    legacy = _row_hash(None, m.id, row["seq"], row["op"], row["diff"],
+                       row["hash_after"], row["path_after"], row["tags_after"],
+                       row["source"], row["reason"], row["author_user_id"],
+                       row["author_token_id"], row["title_before"],
+                       row["title_after"], version=1)
+    with store._conn.cursor() as cur:
+        cur.execute("UPDATE memory_history SET row_hash=%s, hash_version=1 "
+                    "WHERE memory_id=%s AND seq=%s", (legacy, m.id, row["seq"]))
+    store._conn.commit()
+    assert store.verify_history(None, m.id) is True         # verified as v1
+
+    store.write(id=m.id, body="2\n", reason="r2")           # appends a v2 row
+    seen = {r["seq"]: r["hash_version"] for r in store.history(None, m.id)}
+    assert seen == {1: 1, 2: 2}
+    assert store.verify_history(None, m.id) is True         # across the boundary
+
+
 def test_forget_erases_history(store):
     m = store.write(body="secret\n")
     assert store.forget(None, m.id) is True

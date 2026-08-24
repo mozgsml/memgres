@@ -29,7 +29,7 @@ import hmac
 import re
 import secrets
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 # ─── token format: mgk_ + 43 url-safe chars (256-bit) ────────────────────────
 TOKEN_RE = re.compile(r"^mgk_[A-Za-z0-9_-]{43}$")
@@ -376,7 +376,22 @@ def resolve_space(conn, principal: Principal, *, space_id: Optional[str] = None,
         "you can reach no namespaces yet — create one, or ask for access to one")
 
 
+# The two words that address a SET of namespaces rather than one.
+#
+# `all` means every namespace you reach as a member. For a superadmin that is
+# NOT everything it can read — its role reaches any namespace by id — so for
+# that one caller the word asks two different questions, and answering the
+# narrow one silently is a partial result wearing the shape of a complete one.
+# `*` is the wide answer, said out loud.
+#
+# There is deliberately no second word for "the ones I belong to": a namespace
+# can be called anything, and the obvious candidates (`mine`, `own`) are names
+# people actually use — the first draft of this shadowed a namespace literally
+# named `mine` in this repo's own tests. `*` survives that objection because a
+# namespace named `*` is not something anyone types by accident, and the
+# collision is still checked rather than assumed away.
 ALL_SPACES = "all"
+EVERY_SPACE = "*"
 
 
 def _as_list(v) -> List[str]:
@@ -388,13 +403,18 @@ def _as_list(v) -> List[str]:
     return [str(x) for x in v]
 
 
-def _wants_all(space) -> bool:
-    """True when ``space`` IS the ``all`` keyword — as a bare string or as the
-    sole element of a list. Anywhere else (``["all", "notes"]``) it is read as a
-    literal namespace name, so the keyword can never silently widen a list the
+def _wants(space, keyword: str) -> bool:
+    """True when ``space`` IS this keyword — as a bare string or as the sole
+    element of a list. Anywhere else (``["all", "notes"]``) it is read as a
+    literal namespace name, so a keyword can never silently widen a list the
     caller meant literally."""
     names = _as_list(space)
-    return len(names) == 1 and names[0] == ALL_SPACES
+    return len(names) == 1 and names[0] == keyword
+
+
+def _wants_all(space) -> bool:
+    """True when ``space`` is the ``all`` keyword."""
+    return _wants(space, ALL_SPACES)
 
 
 def resolve_spaces(conn, principal: Principal, *, space=None,
@@ -404,8 +424,9 @@ def resolve_spaces(conn, principal: Principal, *, space=None,
     Returns ``[(namespace_id, effective_permission), …]`` — deduped, in the order
     the caller named them (or creation order for ``all``).
 
-    * ``space`` — a namespace name or your alias for one, a list of them, or the
-      keyword ``"all"`` (every namespace the caller reaches).
+    * ``space`` — a namespace name or your alias for one, a list of them, or one
+      of the set keywords: ``"all"``/``"mine"`` (every namespace you belong to)
+      or ``"*"`` (every namespace in the deployment, superadmin only).
     * ``space_id`` — a reachable namespace id or a list of them; always
       unambiguous, and the only address left when one name means two spaces.
       ``space`` and ``space_id`` may be combined.
@@ -424,11 +445,14 @@ def resolve_spaces(conn, principal: Principal, *, space=None,
     """
     names, ids = _as_list(space), _as_list(space_id)
 
-    if _wants_all(space):
+    if _wants_all(space) or _wants(space, EVERY_SPACE):
         if ids:
             raise SpaceAmbiguous(
-                "`space='all'` already means every namespace you reach — drop "
-                "`space_id`, or list the namespaces you want explicitly")
+                f"`space='{names[0]}'` already names a whole set of namespaces "
+                "— drop `space_id`, or list the namespaces you want explicitly")
+        if _wants(space, EVERY_SPACE):
+            return _every_namespace(conn, principal)
+        _refuse_ambiguous_all(conn, principal)
         return _all_reachable(conn, principal)
 
     if not names and not ids:
@@ -452,7 +476,62 @@ def _collect(out: List[Tuple[str, str]], seen: set, resolved: Tuple[str, str]) -
         out.append((nsid, perm))
 
 
-def _all_reachable(conn, principal: Principal) -> List[Tuple[str, str]]:
+def _no_such_name(names: Sequence[str], keyword: str) -> None:
+    """Refuse a set keyword that is ALSO the name of a namespace in play.
+
+    A namespace really can be called `mine`, and then the word means two things
+    at once. Nobody can tell which was meant, so neither is assumed."""
+    if keyword in names:
+        raise SpaceAmbiguous(
+            f"a namespace here is actually named '{keyword}', so the keyword is "
+            f"ambiguous — address that one by `space_id`")
+
+
+def _unreached_count(conn, principal: Principal) -> int:
+    """How many namespaces the caller could read but is not a member of.
+
+    Zero for everyone but a superadmin, whose reach is defined by its role
+    rather than by membership rows — which is precisely why `all` has to be
+    disambiguated for it and for nobody else.
+    """
+    if not principal.is_admin or principal.user_id is None:
+        return 0
+    if principal.scope_namespace_id is not None:
+        return 0                              # pinned to one; nothing is outside
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM namespace n WHERE n.owner_user_id <> %(u)s "
+            "AND NOT EXISTS (SELECT 1 FROM namespace_member m "
+            "                WHERE m.namespace_id=n.id AND m.user_id=%(u)s)",
+            {"u": principal.user_id})
+        return int(cur.fetchone()[0])
+
+
+def _refuse_ambiguous_all(conn, principal: Principal) -> None:
+    """`all` from a superadmin, when it would answer less than it can read.
+
+    For every other caller `all` IS everything, and the word stays untouched.
+    For a superadmin it is two different questions, and the narrow answer looks
+    exactly like the wide one — a search returning nothing reads as "there is
+    nothing", not as "not where I looked". So the word is refused, both explicit
+    words are named, and it is refused only while the two answers differ: a
+    superadmin whose memberships already cover the deployment sees no change.
+    """
+    outside = _unreached_count(conn, principal)
+    if not outside:
+        return
+    own = [s["name"] for s in list_spaces(conn, principal.user_id)]
+    listed = ", ".join(repr(n) for n in sorted(own)) or "none"
+    raise SpaceAmbiguous(
+        f"you are a superadmin, so '{ALL_SPACES}' is ambiguous here: you belong "
+        f"to {len(own)} namespace(s) ({listed}), and {outside} more exist that "
+        f"your role can also read. Say `space='{EVERY_SPACE}'` for every "
+        f"namespace in this deployment, or name the ones you mean with "
+        f"`space=[…]` / `space_id=[…]`")
+
+
+def _all_reachable(conn, principal: Principal,
+                   keyword: str = ALL_SPACES) -> List[Tuple[str, str]]:
     """Every namespace the caller reaches, capped by the token ceiling."""
     if principal.user_id is None:
         # An env break-glass root has no membership rows to enumerate, and a
@@ -468,11 +547,36 @@ def _all_reachable(conn, principal: Principal) -> List[Tuple[str, str]]:
     reachable = list_spaces(conn, principal.user_id)
     if not reachable:
         raise SpaceNotFound("you can reach no namespaces yet")
-    if any(s["name"] == ALL_SPACES for s in reachable):
-        raise SpaceAmbiguous(
-            f"you can reach a namespace actually named '{ALL_SPACES}', so the "
-            f"keyword is ambiguous here — address that one by `space_id`")
+    _no_such_name([s["name"] for s in reachable], keyword)
     return [(s["id"], perm_min(s["permission"], ceiling)) for s in reachable]
+
+
+def _every_namespace(conn, principal: Principal) -> List[Tuple[str, str]]:
+    """Every namespace in the deployment — the superadmin's explicit wide read.
+
+    The counterpart to refusing `all` for a superadmin: having said that the
+    narrow answer must not be given silently, there has to be a way to ask for
+    the wide one. It is the same reach `resolve_space(space_id=…)` already grants
+    that role one namespace at a time, so it adds no authority — only a way to
+    spend it in one call instead of N.
+    """
+    if not principal.is_admin:
+        raise AuthError(
+            f"`space='{EVERY_SPACE}'` means every namespace in this deployment "
+            f"and is superadmin-only — use '{ALL_SPACES}' for the ones you reach")
+    if principal.scope_namespace_id is not None:
+        # The pin is a property of THIS credential and outranks the role: a
+        # token deliberately narrowed to one namespace does not widen back.
+        return [resolve_space(conn, principal,
+                              space_id=principal.scope_namespace_id)]
+    ceiling = principal.permission
+    with conn.cursor() as cur:
+        cur.execute("SELECT id::text, name FROM namespace ORDER BY created_at, id")
+        rows = cur.fetchall()
+    if not rows:
+        raise SpaceNotFound("this deployment has no namespaces yet")
+    _no_such_name([r[1] for r in rows], EVERY_SPACE)
+    return [(r[0], perm_min("admin", ceiling)) for r in rows]
 
 
 def _sole_reachable(conn, principal: Principal) -> Tuple[str, str]:
@@ -968,11 +1072,49 @@ def list_tokens(conn, user_id: str) -> List[dict]:
 
 
 # ─── request-access: join an existing namespace ──────────────────────────────
+def reaches(conn, user_id: str, namespace_id: str) -> Optional[str]:
+    """The user's effective permission on a namespace, or None. The public form
+    of :func:`_reach`, for callers outside this module that must ask about
+    reachability without going through an address resolver that raises."""
+    _as_uuid(namespace_id)
+    with conn.cursor() as cur:
+        return _reach(cur, user_id, str(namespace_id))
+
+
+def _as_uuid(value: str) -> str:
+    """``value`` as a uuid string, or a plain ValueError.
+
+    Handing Postgres a malformed uuid aborts the transaction with a driver
+    error, which reads to the caller as a server fault rather than a bad
+    argument. Checked here so every id-taking entry point fails the same way.
+    """
+    import uuid as _uuid
+    try:
+        return str(_uuid.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError(f"not a namespace id: {value!r}")
+
+
 def request_access(conn, requester_user_id: str, namespace_id: str,
-                   permission: str = "read") -> str:
+                   permission: str = "read") -> Optional[str]:
+    """Record a request to join a namespace; the id of the request, or None if
+    no such namespace exists.
+
+    **A missing namespace is not an error here, and that is deliberate.** The
+    insert used to be attempted regardless: an existing namespace the requester
+    cannot reach produced a request, a namespace id that names nothing produced
+    a foreign-key violation. The difference in the two answers told an outsider
+    which uuids are real — a membership-blind existence oracle. Both cases now
+    return the same thing to the caller (see :func:`admin.request_access`), so
+    the only way to learn a namespace exists is to be able to reach it.
+    """
     if permission not in _RANK:
         raise ValueError(f"bad permission: {permission}")
+    namespace_id = _as_uuid(namespace_id)
     with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM namespace WHERE id=%s", (namespace_id,))
+        if cur.fetchone() is None:
+            return None
         cur.execute(
             "INSERT INTO access_request (requester_user_id, namespace_id, "
             "requested_permission) VALUES (%s, %s, %s) "

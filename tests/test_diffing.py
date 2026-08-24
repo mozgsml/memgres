@@ -77,20 +77,23 @@ def test_empty_patch_is_still_a_noop():
 
 
 # ─── history row_hash stays backward-compatible when there's no author ────
-def test_row_hash_unchanged_without_author():
-    # A history row with no author must hash IDENTICALLY to the pre-authorship
+def test_row_hash_v1_unchanged_without_author():
+    # A v1 history row with no author must hash IDENTICALLY to the pre-authorship
     # formula, so hash-chains written before history_author still verify after
     # the upgrade. Single-mode and global-admin writes are exactly this case.
+    # v1 is frozen: rows already in the database can only ever be verified by the
+    # recipe that produced them.
     import hashlib
 
     from memgres.store import _row_hash
 
     parts = ["", "m", "1", "create", "d", "h", "", "t", "s", "r"]
     legacy = hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
-    assert _row_hash(None, "m", 1, "create", "d", "h", None, ["t"], "s", "r") == legacy
+    assert _row_hash(None, "m", 1, "create", "d", "h", None, ["t"], "s", "r",
+                     version=1) == legacy
     # None author is the same as omitting it
     assert _row_hash(None, "m", 1, "create", "d", "h", None, ["t"], "s", "r",
-                     None, None) == legacy
+                     None, None, version=1) == legacy
 
 
 def test_row_hash_folds_author_when_present():
@@ -106,6 +109,28 @@ def test_row_hash_folds_author_when_present():
     other_tok = _row_hash(None, "m", 1, "create", "d", "h", None, ["t"], "s", "r",
                           "user-x", "tok-z")
     assert other_tok != with_author
+
+
+def test_row_hash_v2_is_injective_over_tags():
+    """The defect v2 exists for: v1 joined tags with a comma inside an otherwise
+    \\x1f-separated list, so two DIFFERENT tag sets hashed the same. Anyone able
+    to write the table could swap one for the other and verify_history would
+    still call the chain intact."""
+    from memgres.store import HASH_VERSION, _row_hash
+
+    def h(tags, version):
+        return _row_hash(None, "m", 1, "create", "d", "h", None, tags, "s", "r",
+                         version=version)
+
+    assert h(["a", "b"], 1) == h(["a,b"], 1)          # the collision, preserved
+    assert h(["a", "b"], 2) != h(["a,b"], 2)          # …and closed in v2
+    assert HASH_VERSION == 2                          # what new rows are written with
+
+    # A v2 row relabelled as v1 (or a v1 row as v2) does not verify: the recipes
+    # place the tags differently, so `hash_version` selects an algorithm rather
+    # than being a claim that algorithm has to trust.
+    assert h(["a", "b"], 2) != h(["a", "b"], 1)
+    assert h([], 2) != h([], 1)
 
 
 def test_row_hash_unchanged_without_title():
