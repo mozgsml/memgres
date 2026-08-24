@@ -5,6 +5,25 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [Unreleased]
+
+### Fixed
+- **Container healthcheck is role-aware.** The image's `HEALTHCHECK` probed a
+  hardcoded `localhost:8080/healthz` — the REST server's endpoint. An MCP
+  container (`memgres-mcp`, `/mcp` on `MEMGRES_MCP_PORT`) never listens there, so
+  it reported *unhealthy* forever while serving normally; a permanently-red check
+  masks real failures and blocks anything waiting on `service_healthy`. The probe
+  now lives in `memgres/healthcheck.py` (entry point `memgres-healthcheck`) and
+  picks its target from PID 1's argv, not an env convention: `/healthz` on
+  `MEMGRES_HTTP_PORT` for REST, `/mcp` on `MEMGRES_MCP_PORT` for MCP over HTTP,
+  and an unconditional pass for MCP over stdio (no socket exists to probe). Two
+  details it now gets right: it uses `127.0.0.1` rather than `localhost` (a
+  server bound to `0.0.0.0` is IPv4-only, while `localhost` may resolve to `::1`
+  first), and it treats *any* HTTP answer from the MCP port as healthy, since
+  Streamable HTTP rejects a bare GET with 400 — a response that still proves the
+  port is bound. This also fixes REST deployments that remap `MEMGRES_HTTP_PORT`,
+  which the fixed-8080 probe failed.
+
 ## [0.5.1] — 2026-08-21
 
 ### Fixed

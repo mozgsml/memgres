@@ -16,8 +16,11 @@ ENV MEMGRES_HTTP_HOST=0.0.0.0 \
     MEMGRES_HTTP_PORT=8080
 EXPOSE 8080
 
+# Role-aware: probes /healthz on MEMGRES_HTTP_PORT for the REST entrypoint and
+# /mcp on MEMGRES_MCP_PORT for the MCP one (see memgres/healthcheck.py). A fixed
+# 8080 probe reported every MCP container unhealthy forever.
 HEALTHCHECK --interval=10s --timeout=4s --start-period=20s --retries=5 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz',timeout=3).status==200 else 1)"
+    CMD memgres-healthcheck
 
 # The server migrates the schema on startup (idempotent), then serves.
 CMD ["memgres-server"]
