@@ -48,7 +48,7 @@ def parse_line_spec(spec: Optional[str],
                 hi = min(hi, total)
             if hi < lo:
                 continue
-            if hi - lo + 1 > MAX_SPAN or len(out) > MAX_SPAN:
+            if hi - lo + 1 > MAX_SPAN or len(out) + (hi - lo + 1) > MAX_SPAN:
                 raise ValueError(
                     f"a line selector may name at most {MAX_SPAN} lines; "
                     f"'{part}' asks for {hi - lo + 1}")

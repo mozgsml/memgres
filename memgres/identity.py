@@ -411,13 +411,11 @@ def resolve_spaces(conn, principal: Principal, *, space=None,
       ``space`` and ``space_id`` may be combined.
     * neither — one reachable namespace is used silently; SEVERAL is an error.
 
-    That last rule is the one difference from :func:`resolve_space`, and it is
-    deliberate: a write with no address falls back on the declared default,
-    because filing something in your own drawer is a choice the user already made.
-    A read cannot do the same — searching the default while three other reachable
-    namespaces go unsearched returns "nothing found", which reads as *absence* and
-    is indistinguishable from an answer. A partial result that looks complete is
-    the expensive failure, so the caller is asked to say where to look.
+    Nothing is inferred: there is no default namespace to fall back on, for a
+    read or a write. Searching one of several reachable namespaces and returning
+    "nothing found" reads as *absence* and is indistinguishable from an answer,
+    and a write that guesses is a misfile. A partial result that looks complete
+    is the expensive failure, so the caller is asked to say where to look.
 
     Every address is resolved through :func:`resolve_space`, so scope pinning,
     reachability and the token's permission ceiling are enforced in exactly one
@@ -542,9 +540,14 @@ def edit_user(conn, user_id: str, **profile) -> None:
         if v is not None:
             sets.append(f"{f}=%s")
             vals.append(v)
-    if not sets:
-        return
     with conn.cursor() as cur:
+        if not sets:
+            # Nothing to change still has to be true OF SOMEBODY: reporting
+            # success for an id that does not exist is a lie a caller acts on.
+            cur.execute("SELECT 1 FROM app_user WHERE id=%s", (user_id,))
+            if cur.fetchone() is None:
+                raise SpaceNotFound(f"no such user {user_id}")
+            return
         cur.execute(f"UPDATE app_user SET {', '.join(sets)} WHERE id=%s",
                     vals + [user_id])
         if cur.rowcount == 0:
@@ -652,9 +655,39 @@ def revoke_superadmin(conn, user_id: str, *, demote_to: str = "user") -> None:
         cur.execute("UPDATE app_user SET role=%s WHERE id=%s", (demote_to, user_id))
 
 
+# How many namespaces one account may own. Not a business rule — a bound, so a
+# self-service deployment cannot be turned into an INSERT loop by anyone holding
+# a well-formed token.
+MAX_NAMESPACES_PER_USER = 50
+
+
 def create_namespace(conn, owner_user_id: str, name: str, *,
                      description: str = "", instruction: str = "") -> str:
-    """Create (or return the existing) namespace ``name`` owned by the user."""
+    """Create (or return the existing) namespace ``name`` owned by the user.
+
+    Refuses a name the owner already uses as an alias: the new namespace would
+    be born unaddressable by its own name, and — worse — every existing call
+    saying that name would go on resolving to the ALIASED space, silently. This
+    check lives here, at the single point every door funnels through, rather than
+    at the doors: it was written on the self-service door first and the two
+    admin-side doors did not have it, which is exactly the duplication this
+    codebase keeps paying for.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT namespace_id FROM namespace_alias "
+                    "WHERE user_id=%s AND alias=%s", (owner_user_id, name))
+        if cur.fetchone() is not None:
+            raise SpaceAmbiguous(
+                f"'{name}' is already one of that user's aliases — the new "
+                "namespace could not be addressed by its own name, and their "
+                "existing calls using it would keep resolving elsewhere. Drop "
+                "the alias or choose another name")
+        cur.execute("SELECT count(*) FROM namespace WHERE owner_user_id=%s",
+                    (owner_user_id,))
+        if cur.fetchone()[0] >= MAX_NAMESPACES_PER_USER:
+            raise SpaceAmbiguous(
+                f"that account already owns {MAX_NAMESPACES_PER_USER} "
+                "namespaces, which is the cap")
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO namespace (owner_user_id, name, description, instruction) "
@@ -738,16 +771,18 @@ def create_own_namespace(conn, principal: Principal, name: str, *,
         ensure_user_for_token(conn, principal)
     if principal.scope_namespace_id is not None:
         raise AuthError("a scoped token cannot create a namespace")
+    if not perm_at_least(principal.permission, "write"):
+        # A token deliberately weakened to read-only is the configuration the
+        # docs recommend for agents; it must not be able to change deployment
+        # state, whatever the account behind it is allowed to do.
+        raise AuthError(
+            f"creating a namespace needs a write-capable token "
+            f"(this one grants {principal.permission})")
     if not can_create_namespace(conn, principal):
         raise AuthError("you may not create namespaces — ask an admin to create "
                         "one for you or share theirs")
-    with conn.cursor() as cur:
-        cur.execute("SELECT namespace_id FROM namespace_alias "
-                    "WHERE user_id=%s AND alias=%s", (principal.user_id, name))
-        if cur.fetchone() is not None:
-            raise SpaceAmbiguous(
-                f"'{name}' is one of your aliases — the new namespace could not "
-                "be addressed by its own name. Drop the alias or choose another name")
+    # the alias collision and the per-account cap are enforced in
+    # `create_namespace`, so every door gets them
     return create_namespace(conn, principal.user_id, name,
                             description=description, instruction=instruction)
 

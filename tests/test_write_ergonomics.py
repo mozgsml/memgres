@@ -140,7 +140,7 @@ def test_a_line_range_returns_part_and_admits_it(store):
     part = store.get(None, m.id, lines="3-5")
     assert part.body == "line 3\nline 4\nline 5\n"
     assert part.partial is True
-    assert part.lines == [3, 5] and part.total_lines == 12
+    assert part.lines == [[3, 5]] and part.total_lines == 12
     # the hash is withheld: it would describe text the caller cannot see, and
     # the dangerous move is sending a slice back as a whole body
     assert part.content_hash is None
@@ -155,8 +155,20 @@ def test_a_line_range_returns_part_and_admits_it(store):
 def test_a_line_range_past_the_end_returns_what_exists(store):
     m = store.write(body="one\ntwo\n")
     part = store.get(None, m.id, lines="1,40-80")
-    assert part.body == "one\n" and part.lines == [1, 1]
-    assert store.get(None, m.id, lines="40-80").body == ""
+    assert part.body == "one\n" and part.lines == [[1, 1]]
+    # …but a selection that matches NOTHING is an error, not an empty body
+    # wearing `partial: true` — that would be an answer-shaped nothing
+    with pytest.raises(ValueError):
+        store.get(None, m.id, lines="40-80")
+
+
+def test_a_partial_read_reports_the_runs_it_returned(store):
+    """`lines=1,5` reporting [1, 5] reads as "one through five", and a caller
+    acting on that believes it holds five lines."""
+    m = store.write(body="".join(f"l{i}\n" for i in range(1, 6)))
+    part = store.get(None, m.id, lines="1,5")
+    assert part.body == "l1\nl5\n"
+    assert part.lines == [[1, 1], [5, 5]]
 
 
 def test_an_absurd_line_range_costs_nothing(store):
@@ -171,7 +183,7 @@ def test_an_absurd_line_range_costs_nothing(store):
     before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     t = time.time()
     part = store.get(None, m.id, lines="1-50000000")
-    assert part.total_lines == 10 and part.lines == [1, 10]
+    assert part.total_lines == 10 and part.lines == [[1, 10]]
     assert time.time() - t < 1.0
     grew_mb = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before) / 1024
     assert grew_mb < 100, f"grew {grew_mb:.0f}MB"

@@ -174,8 +174,11 @@ class QdrantBackend:
                 with_payload=False, with_vectors=False, offset=offset)
             if not points:
                 break
+            # wait=True because `adopt_orphans` moves the vectors FIRST and the
+            # rows second, and that ordering only protects anything if the
+            # vector write is durable before the rows follow.
             self.client.set_payload(self.chunks, payload={"namespace": new_ns},
-                                    points=[p.id for p in points])
+                                    points=[p.id for p in points], wait=True)
             moved += len(points)
             if offset is None:
                 break

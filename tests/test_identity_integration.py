@@ -250,6 +250,54 @@ def test_an_alias_may_not_shadow_a_name_that_already_works(conn):
         space="notes")[0] == mine
 
 
+def test_no_door_may_create_a_namespace_your_alias_shadows(conn):
+    """The rule was written on the self-service door and missing from the two
+    admin-side ones, so an admin provisioning you a namespace could leave every
+    call naming it resolving to a DIFFERENT, shared space — silently. It now
+    lives at the single point all three funnel through."""
+    alice = ident.create_user(conn, name="alice", can_create_namespace=True)
+    bob = ident.create_user(conn, name="bob")
+    b_ns = ident.create_namespace(conn, bob, "b-stuff")
+    ident.add_member(conn, b_ns, alice, "write")
+    ident.create_alias(conn, alice, "private", b_ns)
+
+    # the admin door — this is the one that was missing the check
+    with pytest.raises(SpaceAmbiguous):
+        ident.create_namespace(conn, alice, "private")
+    # and no namespace was made, so nothing to clean up
+    assert [n["name"] for n in ident.list_namespaces(conn, owner_user_id=alice)] == []
+
+    secret, _ = ident.issue_token(conn, alice, permission="write")
+    p = ident.resolve(conn, cfg(conn), secret)
+    assert ident.resolve_space(conn, p, space="private")[0] == b_ns
+
+
+def test_a_read_only_token_may_not_create_a_namespace(conn):
+    """A token weakened to read-only is what the docs tell you to give an agent;
+    it must not be able to change deployment state."""
+    uid = ident.create_user(conn, name="u", can_create_namespace=True)
+    ro, _ = ident.issue_token(conn, uid, permission="read")
+    p = ident.resolve(conn, cfg(conn), ro)
+    with pytest.raises(AuthError, match="write-capable"):
+        ident.create_own_namespace(conn, p, "nope")
+    assert ident.list_namespaces(conn) == []
+
+
+def test_one_account_cannot_own_unbounded_namespaces(conn):
+    """A bound, not a business rule: self-service must not be turnable into an
+    INSERT loop by anyone holding a well-formed token."""
+    uid = ident.create_user(conn, name="u", can_create_namespace=True)
+    for i in range(ident.MAX_NAMESPACES_PER_USER):
+        ident.create_namespace(conn, uid, f"ns{i}")
+    with pytest.raises(SpaceAmbiguous, match="cap"):
+        ident.create_namespace(conn, uid, "one-too-many")
+
+
+def test_an_empty_profile_edit_still_has_to_find_the_user(conn):
+    with pytest.raises(SpaceNotFound):
+        ident.edit_user(conn, "00000000-0000-0000-0000-000000000000")
+
+
 def test_a_namespace_may_not_be_born_shadowed_by_your_alias(conn):
     alice = ident.create_user(conn, name="alice", can_create_namespace=True)
     bob = ident.create_user(conn, name="bob")

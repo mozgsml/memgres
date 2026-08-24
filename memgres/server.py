@@ -261,7 +261,9 @@ def create_app(cfg: Optional[Config] = None):
         """Who last changed each line. Grouped into author-blocks by default
         (`group=false` for per-line); `text=false` drops bodies for a pure
         ownership map; `lines` selects specific 1-based lines/ranges (per-line)."""
-        want = parse_line_spec(lines)
+        # inside _guard: an impossible selector is a 422 about the request, not
+        # a 500 about the server
+        want = _guard(lambda: parse_line_spec(lines))
         with pool.connection() as conn:
             s = _store(conn)
             if want is not None or not group:

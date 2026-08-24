@@ -182,7 +182,7 @@ class Memory:
     warnings: List[str] = field(default_factory=list)
     # set only by a line-ranged read (see `_slice_lines`)
     partial: bool = False
-    lines: Optional[List[int]] = None
+    lines: Optional[List[List[int]]] = None    # contiguous runs actually returned
     total_lines: Optional[int] = None
 
     def to_dict(self, *, stringify_dates: bool = False) -> dict:
@@ -250,11 +250,25 @@ def _slice_lines(m: "Memory", spec: str) -> "Memory":
     """
     body = m.body or ""
     all_lines = body.splitlines(keepends=True)
-    wanted = parse_line_spec(spec, len(all_lines)) or []
+    wanted = parse_line_spec(spec, len(all_lines))
+    if not wanted:
+        # An empty body with `partial: true` is an answer-shaped nothing. The
+        # caller asked for lines this memory does not have; say that.
+        raise ValueError(
+            f"no such lines: '{spec}' selects nothing in a {len(all_lines)}-line "
+            f"memory")
     m.body = "".join(all_lines[i - 1] for i in wanted)
     m.content_hash = None
     m.partial = True
-    m.lines = [wanted[0], wanted[-1]] if wanted else []
+    # Contiguous RUNS, not first-and-last: `lines=1,5` returning [1, 5] reads as
+    # "lines 1 through 5" and the caller believes it holds five.
+    runs = []
+    for n in wanted:
+        if runs and n == runs[-1][1] + 1:
+            runs[-1][1] = n
+        else:
+            runs.append([n, n])
+    m.lines = runs
     m.total_lines = len(all_lines)
     return m
 
@@ -1002,10 +1016,12 @@ class Store:
 
         `lines` ("40-80", "5", "1,10-12") returns only those lines of the body,
         for reading part of something long without paying for all of it. The
-        result then says so loudly — `partial` is set, `lines` gives the range,
-        `total_lines` the whole size, and `content_hash` comes back **None** —
-        because the one dangerous thing to do with a slice is send it back as a
-        whole `body` and erase everything around it."""
+        result then says so loudly — `partial` is set, `lines` lists the
+        contiguous runs actually returned, `total_lines` the whole size, and
+        `content_hash` comes back **None**, because the one dangerous thing to do
+        with a slice is send it back as a whole `body` and erase everything
+        around it. A selection that matches nothing is an error, not an empty
+        body."""
         ns = _ns if _ns is not None else self._authorize(
             token, space=space, space_id=space_id, need="read")[0]
         id, moved_from = self._address(ns, id, at, follow=if_moved == "follow")

@@ -15,6 +15,12 @@
 -- make it useless for that. NULL is allowed and repeats freely (Postgres does
 -- not compare NULLs in a unique index), so accounts that are services rather
 -- than people are unaffected.
+--
+-- 🔴 It is NOT verified. Anyone who may provision users can set any address on
+-- any plain-user account, which means an address can be claimed before its real
+-- owner has one. That is harmless while email is only a label — and becomes an
+-- authentication bypass the day something treats it as identity. Whatever adds
+-- email login must add ownership verification in the same change, not after.
 ALTER TABLE app_user ADD COLUMN IF NOT EXISTS email       text;
 ALTER TABLE app_user ADD COLUMN IF NOT EXISTS full_name   text NOT NULL DEFAULT '';
 ALTER TABLE app_user ADD COLUMN IF NOT EXISTS department  text NOT NULL DEFAULT '';

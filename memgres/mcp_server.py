@@ -34,6 +34,7 @@ except ImportError:  # mcp SDK 1.x
 
 from . import admin, identity
 from .config import Config, load
+from .lines import parse_line_spec
 from .embeddings import get_embedder
 from .bootstrap import bootstrap_admin
 from .schema import migrate
@@ -242,7 +243,8 @@ def build_server(cfg: Optional[Config] = None):
         `tags` labels it; `title` is a short curated caption (set whole,
         searchable via `memory_find`); `source`/`reason` record provenance.
         `space` picks one of your namespaces by name (`space_id` for a shared
-        one); omit both to use your default. The answer's `created` says whether
+        one); omit both when you reach exactly one namespace — with several, say
+        which. The answer's `created` says whether
         this made a new memory or edited one."""
         folded = fold_replace_aliases(
             {"replace_old": replace_old, "replace_new": replace_new,
@@ -261,6 +263,7 @@ def build_server(cfg: Optional[Config] = None):
     @mcp.tool()
     def memory_get(id: Optional[str] = None, at: Optional[str] = None,
                    if_moved: Literal["follow", "error"] = "follow",
+                   lines: Optional[str] = None,
                    space: Optional[str] = None,
                    space_id: Optional[str] = None,
                    token: Optional[str] = None, ctx: Context = None) -> dict:
@@ -277,7 +280,7 @@ def build_server(cfg: Optional[Config] = None):
         `replace_old`/`replace_new` instead."""
         with pool.connection() as conn:
             return _mem(_store(conn).get(_token(ctx, token), id, at=at,
-                                         if_moved=if_moved,
+                                         if_moved=if_moved, lines=lines,
                                          space=space, space_id=space_id))
 
     @mcp.tool()
@@ -365,20 +368,23 @@ def build_server(cfg: Optional[Config] = None):
 
     @mcp.tool()
     def memory_blame(id: Optional[str] = None, at: Optional[str] = None,
-                     grouped: bool = True,
+                     grouped: bool = True, lines: Optional[str] = None,
                      space: Optional[str] = None, space_id: Optional[str] = None,
                      token: Optional[str] = None, ctx: Context = None) -> List[dict]:
-        """Who last changed each line. Grouped into author-blocks by default;
+        """Who last changed each line. `lines` ("2", "1,3-5") narrows it to
+        specific lines (per-line attribution). Grouped into author-blocks by default;
         set grouped=false for per-line attribution. Each entry carries the
         server-stamped author (author_user_id / author_name) alongside
         seq/op/source/reason — in a shared namespace this says who, authoritatively."""
         with pool.connection() as conn:
             s = _store(conn)
             tok = _token(ctx, token)
-            if grouped:
+            want = parse_line_spec(lines)
+            if grouped and want is None:
                 return s.annotate_grouped(tok, id, at=at, space=space,
                                           space_id=space_id)
-            return s.annotate(tok, id, at=at, space=space, space_id=space_id)
+            return s.annotate(tok, id, lines=want, at=at, space=space,
+                              space_id=space_id)
 
     @mcp.tool()
     def memory_history(id: Optional[str] = None, at: Optional[str] = None,
@@ -552,7 +558,8 @@ def build_server(cfg: Optional[Config] = None):
         def memory_admin_list_users(role: Optional[str] = None, limit: int = 50,
                                     offset: int = 0, token: Optional[str] = None,
                                     ctx: Context = None) -> List[dict]:
-            """The user directory: id, name, service role, default namespace.
+            """The user directory: id, name, service role, profile
+            (full_name/email/department/position) and the namespace-creation right.
             `role` filters to one tier (user | user_manager | superadmin)."""
             with pool.connection() as conn:
                 out = admin.list_users(conn, _principal(conn, _token(ctx, token)),
