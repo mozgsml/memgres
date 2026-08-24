@@ -212,7 +212,11 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `GET` | `/recall` | `?q=&k=&mode=&tags=&path_prefix=&match=&snippet=&full_body=` |
 | `GET` | `/memories` | list a subtree, no query: `?path_prefix=&tags=&limit=&offset=&bodies=` |
 | `GET` | `/whoami` | what this token may do, as capabilities |
+| `GET` | `/admin/orphans` | memories stranded by a `single` → managed switch |
+| `POST` | `/admin/adopt-orphans` | move them into a real namespace (idempotent) |
 | `GET` | `/spaces` | namespaces this token can reach (identity modes) |
+| `POST` | `/spaces` | create one of your own (nothing is created by being named) |
+| `POST` | `/spaces/aliases` | give a reachable namespace a name of your own |
 | `GET` | `/info` | effective config: limits, embed provider/model/dim, recall modes, backend |
 | `GET` | `/healthz` | liveness |
 
@@ -224,8 +228,10 @@ A path that a memory has since moved away from is followed on a read
 edit meant for one memory from quietly becoming a second memory beside it.
 
 Every memory/recall route also takes optional `space` (one of your namespaces by
-name) and `space_id` (canonical id, for shared spaces); a search takes a list of
-either, or `space=all`, and each hit says which namespace answered. In
+name — your own, one shared with you, or an **alias** you set) and `space_id`
+(canonical id, always unambiguous); a search takes a list of either, or
+`space=all`, and each hit says which namespace answered. Addressing a namespace
+that does not exist is an error, never a new one. In
 `open`/`managed` mode
 the token goes in `Authorization: Bearer <token>` or `X-Memgres-Token`; there are
 also request-access and `/admin/*` provisioning routes — see

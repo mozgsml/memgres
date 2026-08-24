@@ -51,7 +51,66 @@ patch = fixes).
   Neither had been caught by the existing matrix, which only ever pointed weak
   credentials at a plain-`user` account — where the role check refuses anyway.
 
+### Removed
+- **The default namespace.** `app_user.default_namespace_id` answered "where does
+  an unaddressed write land", and a better mechanism already existed: a
+  namespace-scoped **token** says the same thing as a property of the credential
+  rather than the person — revocable, auditable, and per-credential, so one
+  person can run an agent on `public` and another on `private` without the two
+  fighting over a single pointer. It was also the last place anything happened
+  silently, and, as the security fix above showed, it was an authority rather
+  than a preference. A concept that has to be guarded is worse than one that does
+  not exist. Dropping the column forgets each user's chosen default; that is the
+  point, since the choice no longer means anything.
+- **Implicit namespace creation.** Addressing a namespace that did not exist
+  created it, so a name typed slightly wrong produced a new, empty,
+  plausible-looking space and the write landed in it looking like it had worked.
+  Creating one is now something you ask for — `POST /spaces`,
+  `memory_create_space` — which makes a typo an error rather than a place.
+
 ### Added
+- **A namespace can have a name of your own.** Name resolution now spans every
+  namespace you reach rather than only the ones you own, which is what makes a
+  shared namespace addressable by name at all. That admits a collision: two
+  people may each own `notes`, and once one is shared with you the bare name
+  means two things. It cannot be refused when a namespace is created, because the
+  collision is created LATER by someone else's act of sharing — refusing then
+  would let your names block other people from sharing. So it is refused when you
+  address it, both candidates named, and you settle it with an **alias**: a
+  private name of your own for a namespace you already reach, granting nothing.
+  `POST /spaces/aliases`, `memory_set_alias`, and `list_spaces` reports it as
+  what to type.
+- **Adopting what `single` mode left behind.** Switching `MEMGRES_KEY_MODE` from
+  `single` to open/managed stranded the entire existing corpus: everything was
+  stored under one nameless namespace, no principal resolves to it afterwards,
+  and every read simply came back empty — present, unharmed and invisible, with
+  no signal that it had happened. `count_orphans` reports it and `adopt_orphans`
+  fixes it, idempotently. It moves the chunk vectors first and the rows second,
+  because a memory's namespace is written down twice and Qdrant cannot join the
+  Postgres transaction: doing it the other way round and dying in between would
+  leave lexical recall working and semantic recall answering *nothing*.
+- **Who a user is**: `full_name`, `email`, `department`, `position`.
+  `app_user.name` was doing two jobs — the handle a token resolves to and the
+  thing a person reads in `blame` — and being neither unique nor required, an
+  authorship line could come back as a bare uuid. History now carries the full
+  name and the email. `email` is unique when present (case-insensitively),
+  because it is the natural login for a web panel.
+- **The substring edit answers to three names.** `old_string`/`new_string` and
+  `old_str`/`new_str` are accepted alongside `replace_old`/`replace_new` and
+  folded to the canon before the both-or-neither guard runs. Two spellings of one
+  side carrying DIFFERENT text is refused rather than resolved — choosing one
+  silently would apply an edit nobody asked for.
+- **A warning when a body ends in what looks like your client's tool delimiter.**
+  An LLM client emits its call in a tag-like format; a closing tag generated
+  inside a value is already part of the string when it reaches us and lands in
+  the memory as text. It is reported, never cleaned and never refused: bodies
+  legitimately contain markup. The rule was measured on 88 live records —
+  "unbalanced closing tag with one of our parameter names" alone gave two false
+  positives (records *discussing* this failure); requiring it to sit at the very
+  end gave none.
+- **Partial reads**: `lines="40-80"` returns part of a long body. The answer is
+  marked `partial`, carries `total_lines`, and withholds `content_hash` — the
+  dangerous move with a slice is sending it back as a whole `body`.
 - **HTTP routes for six operations the service layer already offered** —
   `set_role`, `set_default_space`, `edit_namespace` and the three directory reads
   were reachable over MCP only, which left a web panel unable to do half the
@@ -140,13 +199,10 @@ patch = fixes).
   authenticator producing the same `Principal`, with no change to the core.
 
 ### Breaking
-- **A read that reaches several namespaces must now name one.** Previously it
-  fell back on the caller's default namespace; a write still does, because filing
-  something in your own drawer is a choice the user already made. A read cannot:
-  searching the default while three other reachable namespaces go unsearched
-  returns "nothing found", which reads as absence and is indistinguishable from an
-  answer. The error names the candidates and the `all` keyword. Only affects a
-  caller with a default *and* more than one reachable namespace.
+- **Reaching several namespaces and naming none is an error**, for reads and
+  writes alike — there is no default to fall back on any more. Exactly one
+  reachable namespace still resolves on its own, since there is nothing to
+  choose. The error names the candidates and, for a search, the `all` keyword.
 - **A user with no namespace and no right to create one is refused**, with an
   explanation, instead of silently getting a second namespace called `default`.
   This is the provisioning bug that made every freshly-provisioned account

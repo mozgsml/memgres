@@ -13,8 +13,9 @@ The rest of this document is about `open` and `managed`.
 
 ## The model
 
-- **user** — an account. Owns namespaces and holds tokens. Has one *default*
-  namespace used when a call doesn't name a space.
+- **user** — an account. Owns namespaces and holds tokens. Where its calls land
+  is never inferred: with one reachable namespace there is nothing to choose,
+  and beyond that it says which.
 - **namespace** — an isolation unit owned by a user. Memories in different
   namespaces are never co-searchable. A namespace carries a `description` and an
   `instruction` (free text telling an agent how to use it).
@@ -61,11 +62,39 @@ a convenience that resolves **only among your own** namespaces — so a name can
 never collide with a namespace someone shared with you (that one is reached by
 id). In practice:
 
-- your own space → pass `space="notes"` (a name; owner is implied by your token);
-- a shared space → pass `space_id="<uuid>"` (from `list_spaces`);
-- neither → your **default** namespace.
+- by **name** → `space="notes"`: your alias for a space, or any space you reach
+  that carries that name;
+- by **id** → `space_id="<uuid>"` (from `list_spaces`), always unambiguous;
+- **neither** → your token's scope, or your single reachable namespace. Reaching
+  several and naming none is an error, not a guess.
 
-Every read/write API takes optional `space` and `space_id`.
+Every read/write API takes optional `space` and `space_id`. **Nothing is created
+by being addressed**: a name that matches nothing is an error, so a typo is a
+mistake rather than a new, empty, plausible-looking space your write lands in.
+Ask for one with `POST /spaces` (`memory_create_space`), which needs the right to
+create namespaces.
+
+### When a name means two things
+
+A namespace's name is unique per owner, so two people may each own `notes` — and
+once one of them shares theirs with you, the bare name means two things in your
+account. That collision is made by *someone else's* act of sharing, after you had
+already named your own spaces, so it cannot be refused when a namespace is
+created without letting your names block other people from sharing. It is
+refused when you address it, with both candidates named, and you settle it with
+an **alias**:
+
+```bash
+curl -s $BASE/spaces/aliases -d '{"alias":"bobs-notes","space_id":"<uuid>"}'
+curl -s -X DELETE $BASE/spaces/aliases/bobs-notes
+```
+
+An alias is private to you and **grants nothing** — the space has to be reachable
+already. Two collisions are refused up front because they would be yours to
+cause: an alias that shadows a name that already works for you, and a namespace
+born with the name of one of your aliases. The one that remains — a stranger
+sharing a space named like your alias — resolves in favour of your alias, since
+a deliberate label of yours should not be broken by someone else's naming.
 
 ### Searching several spaces
 
@@ -81,13 +110,11 @@ curl -s "$BASE/recall?q=pricing&space=work&space_id=<uuid>"  # yours + a shared 
 
 Every hit says which namespace answered, via `space` and `space_id`.
 
-**If you reach more than one namespace, a search must name one.** This is the one
-place where a read is stricter than a write. A write with no address falls back on
-your default namespace, because filing something in your own drawer is a choice
-you already made. A read cannot: searching your default while three other
-reachable namespaces go unsearched answers "nothing found", and *nothing found*
-is indistinguishable from an answer. So the search says which namespaces it could
-have meant, and you pick — or say `all`.
+**If you reach more than one namespace, you must name one** — for a search as
+much as for a write. Searching one of them and answering "nothing found" is
+indistinguishable from an answer, and a write that guesses is a misfile. So you
+are told which namespaces were meant, and you pick — or, for a search, say
+`all`.
 
 (If you happen to own a namespace literally named `all`, the keyword is refused
 as ambiguous rather than guessed at; address that one by `space_id`.)
@@ -140,8 +167,9 @@ duplicate is impossible, since there is nothing left to duplicate.
 ## Getting a token
 
 **open mode — bring your own.** Generate one yourself (any `mgk_` + 43 url-safe
-chars) and just start using it; the user + a `default` namespace are created
-lazily on your **first write** (never on a read, so probing creates nothing).
+chars). The account materializes when you ask for your first namespace
+(`POST /spaces`) — never on a read, so probing creates nothing, and never as a
+side effect of a write that named a space you mistyped.
 
 ```python
 import secrets
@@ -161,7 +189,8 @@ Send the token as `Authorization: Bearer <token>` (or `X-Memgres-Token`).
 BASE=http://localhost:8080
 TOK="mgk_…"
 
-# write into a named space (created lazily the first time)
+# make the space, then write into it — nothing is created by being named
+curl -s $BASE/spaces -H "Authorization: Bearer $TOK" -d '{"name":"work"}'
 curl -s $BASE/memories -H "Authorization: Bearer $TOK" \
   -d '{"body":"first note\n","space":"work","tags":["seed"]}'
 
@@ -195,7 +224,9 @@ Tools:
   `memory_history` / `memory_blame` / `memory_forget` — all take `space` /
   `space_id`; the id-addressed ones also take `at` (a path);
 - `memory_whoami` — what this token may do, as capabilities;
-- `memory_list_spaces` — your reachable namespaces (id, name, permission, default);
+- `memory_list_spaces` — your reachable namespaces (id, name, permission, alias);
+- `memory_create_space` / `memory_set_alias` / `memory_drop_alias` — make one,
+  and give it a name of your own;
 - `memory_issue_token` — mint a token (rotate/delegate; secret returned once);
 - `memory_list_tokens` / `memory_revoke_token` — manage them;
 - `memory_admin_*` — the control plane (see below), where the caller has the
@@ -300,15 +331,6 @@ account that holds an admin role requires `superadmin` — without that rule, a
 `user_manager` could mint a token for a superadmin's account and become data-root
 in one request. The last superadmin also cannot be demoted or have their last
 token revoked, since that would leave the control plane with nobody in charge.
-
-### The default namespace is a preference, not a grant
-
-A user's default namespace says where their unqualified writes land. It is chosen
-from namespaces they can **already** reach: setting it requires that the caller
-administer the namespace and that the target be a member or owner. Resolving a
-default that is no longer reachable (namespace deleted, membership revoked) is
-treated as *unset* rather than fatal, so a stale pointer never bricks an account
-— and never grants one anything either.
 
 ### Creating namespaces
 
