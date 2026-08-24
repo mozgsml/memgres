@@ -723,27 +723,38 @@ class Store:
     # ─── list: enumerate a subtree (no query, no ranking) ───────────────────
     def list(self, token: Optional[str], *, path_prefix: Optional[str] = None,
              tags: Optional[Sequence[str]] = None, limit: int = 50,
-             offset: int = 0, space=None, space_id=None) -> List[dict]:
+             offset: int = 0, bodies: bool = False,
+             space=None, space_id=None) -> List[dict]:
         """Browse (enumerate) memories under a subtree — NOT a search: no FTS, no
         vectors, no scoring. Rows are ordered by path so a subtree reads in tree
         order, and across several namespaces by namespace first, so each tree
         still reads whole. ``build_filters`` scopes by namespace + not-expired +
-        tags + subtree, so this is multi-tenant safe by construction."""
+        tags + subtree, so this is multi-tenant safe by construction.
+
+        ``bodies=True`` returns whole bodies instead of previews — reading a
+        subtree in one call rather than a browse plus one fetch per row. It is
+        capped by ``MEMGRES_LIST_BODIES_MAX_BYTES`` in total: rows past the cap
+        still come back, with ``body`` None and ``body_omitted`` True, so a
+        truncated read announces itself instead of looking like a complete one.
+        """
         from .vector.base import build_filters
         ns, names = self._authorize_read(token, space=space, space_id=space_id)
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
         where, params = build_filters(ns, tags, path_prefix)
         cur = self._conn.cursor()
+        shown = ("body" if bodies
+                 else "left(split_part(body, E'\\n', 1), %s)")
+        head = [] if bodies else [self.cfg.list_preview_chars]
         cur.execute(
-            "SELECT id, path::text, tags, title, "
-            "left(split_part(body, E'\\n', 1), %s) AS preview, "
+            f"SELECT id, path::text, tags, title, {shown} AS shown, "
             "created_at, updated_at, namespace "
             f"FROM memory WHERE {where} ORDER BY namespace, path, id "
             "LIMIT %s OFFSET %s",
-            [self.cfg.list_preview_chars] + params + [limit, offset])
-        cols = ["id", "path", "tags", "title", "preview", "created_at",
+            head + params + [limit, offset])
+        cols = ["id", "path", "tags", "title", "shown", "created_at",
                 "updated_at", "space_id"]
+        budget = self.cfg.list_bodies_max_bytes
         rows = []
         for r in cur.fetchall():
             d = dict(zip(cols, r))
@@ -751,6 +762,20 @@ class Store:
             d["tags"] = list(d["tags"]) if d["tags"] is not None else []
             d["space_id"] = str(d["space_id"])
             d["space"] = names.get(d["space_id"])
+            text = d.pop("shown")
+            if not bodies:
+                d["preview"] = text
+            else:
+                # Once the cap is reached everything after it is omitted, rather
+                # than letting a later short body slip through — a patchy result
+                # is harder to reason about than a clean cutoff. The first row
+                # always comes back whole even if it alone exceeds the cap: a
+                # browse consisting only of omissions would tell you nothing.
+                size = byte_len(text or "")
+                fits = budget >= 0 and (not rows or size <= budget)
+                budget = budget - size if fits else -1
+                d["body"] = text if fits else None
+                d["body_omitted"] = not fits
             rows.append(d)
         return rows
 

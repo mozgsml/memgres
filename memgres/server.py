@@ -272,18 +272,20 @@ def create_app(cfg: Optional[Config] = None):
     @app.get("/memories")
     def list_memories(path: Optional[str] = None,
                       tags: Optional[str] = Query(None, description="comma-separated"),
-                      limit: int = 50, offset: int = 0,
+                      limit: int = 50, offset: int = 0, bodies: bool = False,
                       space: Optional[List[str]] = Query(
                           None, description="namespace name(s), or 'all'"),
                       space_id: Optional[List[str]] = Query(None),
                       tok: Optional[str] = Depends(token)):
         """Browse (enumerate) a subtree — not a search. Lists memories under
-        `path` ordered by path, each with a short first-line `preview`."""
+        `path` ordered by path, each with a short first-line `preview`, or with
+        whole bodies when `bodies=true` (capped in total; rows past the cap are
+        marked `body_omitted`)."""
         taglist = [t for t in (tags.split(",") if tags else []) if t]
         with pool.connection() as conn:
             return _guard(lambda: _store(conn).list(
                 tok, path_prefix=path, tags=taglist or None, limit=limit,
-                offset=offset, space=space, space_id=space_id))
+                offset=offset, bodies=bodies, space=space, space_id=space_id))
 
     @app.get("/info")
     def info():

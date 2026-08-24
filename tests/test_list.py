@@ -145,6 +145,36 @@ def test_list_isolated_between_tenants(managed):
     assert all("bob" not in r["preview"] for r in alice_rows)
     assert all("alice" not in r["preview"] for r in bob_rows)
 
+def test_bodies_reads_a_whole_subtree_in_one_call(store):
+    store.write(body="alpha body\nsecond line\n", path="decisions.a")
+    store.write(body="beta body\n", path="decisions.b")
+
+    rows = store.list(None, path_prefix="decisions", bodies=True)
+    assert [r["body"] for r in rows] == ["alpha body\nsecond line\n", "beta body\n"]
+    assert all(r["body_omitted"] is False for r in rows)
+    assert "preview" not in rows[0]        # one view of the text, never both
+
+
+def test_bodies_past_the_cap_are_announced_not_dropped(store, monkeypatch):
+    store.cfg = dataclasses.replace(store.cfg, list_bodies_max_bytes=20)
+    store.write(body="x" * 15 + "\n", path="t.a")
+    store.write(body="y" * 15 + "\n", path="t.b")
+    store.write(body="z" * 15 + "\n", path="t.c")
+
+    rows = store.list(None, path_prefix="t", bodies=True)
+    assert len(rows) == 3                          # every row still comes back
+    assert rows[0]["body"] is not None and rows[0]["body_omitted"] is False
+    assert [r["body_omitted"] for r in rows[1:]] == [True, True]
+    assert all(r["body"] is None for r in rows[1:])
+
+
+def test_a_first_body_larger_than_the_cap_still_comes_back(store):
+    store.cfg = dataclasses.replace(store.cfg, list_bodies_max_bytes=5)
+    store.write(body="a much longer body than the cap\n", path="t.a")
+
+    [row] = store.list(None, path_prefix="t", bodies=True)
+    assert row["body"].startswith("a much longer") and row["body_omitted"] is False
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -301,20 +301,24 @@ def build_server(cfg: Optional[Config] = None):
     @mcp.tool()
     def memory_list(path_prefix: Optional[str] = None,
                     tags: Optional[List[str]] = None, limit: int = 50,
-                    offset: int = 0, space: Spaces = None,
+                    offset: int = 0, bodies: bool = False, space: Spaces = None,
                     space_id: Spaces = None,
                     token: Optional[str] = None, ctx: Context = None) -> List[dict]:
         """BROWSE (enumerate) a subtree — NOT a search. Lists memories under
         `path_prefix` (e.g. survey all of 'decisions.*') ordered by path, with a
         short first-line `preview` of each. No query, no ranking; use
         `memory_recall` when you want relevance search. Optionally narrow by
-        `tags`; `limit`/`offset` paginate. `space`/`space_id` pick the
-        namespace(s) — a name, a list, or `"all"`; required when you reach
-        several. Rows carry `space`/`space_id`."""
+        `tags`; `limit`/`offset` paginate. `bodies=true` returns whole bodies
+        instead of previews — read a subtree in ONE call instead of a browse plus
+        a fetch per row; it is capped in total, and rows past the cap come back
+        with `body_omitted=true` rather than being silently dropped.
+        `space`/`space_id` pick the namespace(s) — a name, a list, or `"all"`;
+        required when you reach several. Rows carry `space`/`space_id`."""
         with pool.connection() as conn:
             return _store(conn).list(
                 _token(ctx, token), path_prefix=path_prefix, tags=tags,
-                limit=limit, offset=offset, space=space, space_id=space_id)
+                limit=limit, offset=offset, bodies=bodies,
+                space=space, space_id=space_id)
 
     @mcp.tool()
     def memory_find(query: str, k: int = 10, tags: Optional[List[str]] = None,
