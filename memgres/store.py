@@ -37,6 +37,11 @@ from .embeddings import Embedder, get_embedder
 from .vector import make_backend
 
 
+# The most rows any one call may return. Search and browse share it so a caller
+# cannot pick whichever path forgot to clamp.
+MAX_RESULTS = 500
+
+
 class Conflict(RuntimeError):
     """base_hash didn't match the current body — re-read and retry (HTTP 409)."""
 
@@ -255,6 +260,17 @@ class Store:
                     f"(token grants {perm})")
         ns_ids = [nsid for nsid, _ in resolved]
         return ns_ids, self._space_names(ns_ids)
+
+    @staticmethod
+    def _clamp_k(k: int) -> int:
+        """Bound how many hits one search may ask for.
+
+        `k` went straight into `LIMIT`, so a single call could ask for the whole
+        namespace — and with `full_body=true` be answered with it, plus a
+        `ts_headline` over every row. The browse path has always clamped; search
+        is the one an untrusted caller reaches most easily, so it clamps to the
+        same ceiling."""
+        return max(1, min(int(k), MAX_RESULTS))
 
     def _space_names(self, ns_ids: Sequence[str]) -> dict:
         """``{namespace_id: name}`` for the namespaces in play — one small query,
@@ -569,6 +585,17 @@ class Store:
         if path_changed:
             self._check_parent(cur, ns, new_path)
 
+        if path_changed:
+            # Moving onto an occupied address surfaced as a raw unique-index
+            # violation, which named neither the path nor its occupant — the
+            # same blind error creating there used to give.
+            cur.execute("SELECT id FROM memory "
+                        "WHERE namespace=%s AND path=%s::ltree AND id <> %s",
+                        (ns, new_path, id))
+            taken = cur.fetchone()
+            if taken is not None:
+                raise PathTaken(new_path, str(taken[0]))
+
         # a path change cascades to the whole subtree (keep ltree consistent)
         if path_changed and cur_path is not None:
             self._cascade_move(cur, ns, cur_path, new_path, id, author,
@@ -620,9 +647,15 @@ class Store:
         again for the history rows, where the two could disagree about which
         address a node just left.
         """
+        # FOR UPDATE: the moved node is already locked by `_load`, but its
+        # descendants were read unlocked, so a concurrent edit to one of them
+        # could bump `seq` between this SELECT and the history INSERT — colliding
+        # with UNIQUE (memory_id, seq) and aborting the move. Locking the subtree
+        # makes the two writers queue instead of one of them failing.
         cur.execute(
             "SELECT id, path::text, seq, content_hash FROM memory "
-            "WHERE namespace=%s AND path <@ %s::ltree AND id <> %s ORDER BY path",
+            "WHERE namespace=%s AND path <@ %s::ltree AND id <> %s ORDER BY path "
+            "FOR UPDATE",
             (ns, old_prefix, exclude_id))
         rows = cur.fetchall()
         if not rows:
@@ -701,6 +734,7 @@ class Store:
         """Search. ``space``/``space_id`` may name one namespace, several, or
         ``'all'`` — see :func:`identity.resolve_spaces`."""
         from .search import recall as _recall
+        k = self._clamp_k(k)
         ns, names = self._authorize_read(token, space=space, space_id=space_id)
         hits = _recall(self._conn, self.cfg, self.embedder, ns,
                        query, k=k, tags=tags, path_prefix=path_prefix, mode=mode,
@@ -719,6 +753,7 @@ class Store:
         search over titles + tags, never the body. Returns light rows; works
         without an embedder. Spans namespaces like ``recall``. See ``search.find``."""
         from .search import find as _find
+        k = self._clamp_k(k)
         ns, names = self._authorize_read(token, space=space, space_id=space_id)
         rows = _find(self._conn, self.cfg, ns, query, tags=tags,
                      path_prefix=path_prefix, k=k, match=match)
@@ -745,11 +780,17 @@ class Store:
         """
         from .vector.base import build_filters
         ns, names = self._authorize_read(token, space=space, space_id=space_id)
-        limit = max(1, min(int(limit), 500))
+        limit = max(1, min(int(limit), MAX_RESULTS))
         offset = max(0, int(offset))
         where, params = build_filters(ns, tags, path_prefix)
         cur = self._conn.cursor()
-        shown = ("body" if bodies
+        # The page itself never carries bodies: in `bodies` mode it carries each
+        # body's SIZE instead. Deciding what fits from the sizes means the bodies
+        # that don't fit are never transferred at all — the cap bounds the server
+        # and the wire, not just the answer. (Selecting the bodies and discarding
+        # them afterwards still moved every byte: 500 rows at the default body
+        # ceiling is 128 MB fetched to return 200 KB.)
+        shown = ("octet_length(body)" if bodies
                  else "left(split_part(body, E'\\n', 1), %s)")
         head = [] if bodies else [self.cfg.list_preview_chars]
         cur.execute(
@@ -761,28 +802,38 @@ class Store:
         cols = ["id", "path", "tags", "title", "shown", "created_at",
                 "updated_at", "space_id"]
         budget = self.cfg.list_bodies_max_bytes
-        rows = []
+        rows, wanted = [], []
         for r in cur.fetchall():
             d = dict(zip(cols, r))
             d["id"] = str(d["id"])
             d["tags"] = list(d["tags"]) if d["tags"] is not None else []
             d["space_id"] = str(d["space_id"])
             d["space"] = names.get(d["space_id"])
-            text = d.pop("shown")
+            shown_value = d.pop("shown")
             if not bodies:
-                d["preview"] = text
+                d["preview"] = shown_value
             else:
                 # Once the cap is reached everything after it is omitted, rather
                 # than letting a later short body slip through — a patchy result
                 # is harder to reason about than a clean cutoff. The first row
                 # always comes back whole even if it alone exceeds the cap: a
                 # browse consisting only of omissions would tell you nothing.
-                size = byte_len(text or "")
+                size = shown_value or 0
                 fits = budget >= 0 and (not rows or size <= budget)
                 budget = budget - size if fits else -1
-                d["body"] = text if fits else None
+                d["body"] = None
                 d["body_omitted"] = not fits
+                if fits:
+                    wanted.append(d["id"])
             rows.append(d)
+        if wanted:
+            cur.execute(
+                f"SELECT id, body FROM memory WHERE {where} AND id = ANY(%s)",
+                params + [wanted])
+            got = {str(i): b for i, b in cur.fetchall()}
+            for d in rows:
+                if not d["body_omitted"]:
+                    d["body"] = got.get(d["id"])
         return rows
 
     # ─── addressing by path ─────────────────────────────────────────────────

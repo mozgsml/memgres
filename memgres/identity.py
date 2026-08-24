@@ -321,7 +321,17 @@ def resolve_space(conn, principal: Principal, *, space_id: Optional[str] = None,
         cur.execute("SELECT default_namespace_id FROM app_user WHERE id=%s", (uid,))
         row = cur.fetchone()
         if row and row[0]:
-            return str(row[0]), perm_min("admin", ceiling)
+            # A default is a PREFERENCE among the namespaces you can reach, never
+            # a grant. Returning it unchecked made the pointer itself an
+            # authority: anyone who could set it — a user_manager provisioning a
+            # fresh account, say — could aim a user at any namespace on the
+            # deployment and hand them admin over data they have no membership
+            # in, erasure included. A default that no longer resolves (namespace
+            # deleted, membership revoked) is ignored rather than fatal, so a
+            # stale pointer degrades to "unset" instead of bricking the account.
+            perm = _reach(cur, uid, str(row[0]))
+            if perm is not None:
+                return str(row[0]), perm_min(perm, ceiling)
 
         # No default set. Strictness scales with how much there is to get wrong:
         # with one reachable namespace there is nothing to choose, so silence is

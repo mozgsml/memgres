@@ -429,7 +429,8 @@ def build_server(cfg: Optional[Config] = None):
         if expires_days:
             exp = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=expires_days)
         with pool.connection() as conn, conn.transaction():
-            uid = _admin_uid(conn, _token(ctx, token))
+            tok = _token(ctx, token)
+            uid = _admin_uid(conn, tok)
             nsid = space_id
             if nsid is not None:
                 # can only scope a new token to a namespace the caller can reach
@@ -438,7 +439,23 @@ def build_server(cfg: Optional[Config] = None):
                         raise identity.AuthError(
                             "cannot scope a token to an unreachable namespace")
             elif space is not None:
-                nsid = identity.create_namespace(conn, uid, space)
+                # Naming a namespace here used to CREATE it unconditionally,
+                # which walked straight past the right that governs creation
+                # everywhere else — so a user refused a namespace on the write
+                # path could mint one through the token tool and write there.
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM namespace "
+                                "WHERE owner_user_id=%s AND name=%s", (uid, space))
+                    row = cur.fetchone()
+                if row is not None:
+                    nsid = str(row[0])
+                else:
+                    principal = identity.resolve(conn, cfg, tok)
+                    if not identity.can_create_namespace(conn, principal):
+                        raise identity.AuthError(
+                            f"you own no namespace named '{space}' and may not "
+                            "create one — ask an admin to create it or share it")
+                    nsid = identity.create_namespace(conn, uid, space)
             secret, tid = identity.issue_token(
                 conn, uid, namespace_id=nsid, permission=permission,
                 label=label, expires_at=exp)

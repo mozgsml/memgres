@@ -275,3 +275,103 @@ def test_user_manager_cannot_reach_an_admin_account(managed_client):
     assert c.get(f"/admin/users/{u}/tokens", headers=Hm).status_code == 200
     assert c.post(f"/admin/tokens/{issued.json()['id']}/revoke",
                   headers=Hm).status_code == 200
+
+
+def test_a_weakened_token_does_not_open_the_control_plane(managed_client):
+    """A role says who someone IS; a token says what THIS credential may do.
+
+    The recommended way to give an agent a narrow credential is a read-only,
+    namespace-scoped token. If the control plane consults only the role behind
+    it, that narrowing is decorative: the weak token opens provisioning, issues
+    itself a strong one, and the pin is gone. The data plane already honoured the
+    token; this pins that the control plane does too.
+    """
+    c, admin_tok = managed_client
+    H = {"Authorization": f"Bearer {admin_tok}"}
+
+    with psycopg.connect(DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM app_user WHERE role='superadmin'")
+        root = str(cur.fetchone()[0])
+    ns = c.post("/admin/namespaces",
+                json={"owner_user_id": root, "name": "vault"},
+                headers=H).json()["id"]
+
+    # two deliberately-weakened credentials on the ROOT account itself
+    weak = c.post("/admin/tokens", json={"user_id": root, "permission": "read"},
+                  headers=H).json()["token"]
+    pinned = c.post("/admin/tokens",
+                    json={"user_id": root, "permission": "admin",
+                          "namespace_id": ns},
+                    headers=H).json()["token"]
+
+    for tok, why in ((weak, "read-only"), (pinned, "namespace-scoped")):
+        Hw = {"Authorization": f"Bearer {tok}"}
+        # the escalation this closes: minting a full credential for itself
+        assert c.post("/admin/tokens",
+                      json={"user_id": root, "permission": "admin"},
+                      headers=Hw).status_code == 403, why
+        assert c.post("/admin/users", json={"name": "mule"},
+                      headers=Hw).status_code == 403, why
+        assert c.post(f"/admin/users/{root}/grant-superadmin",
+                      headers=Hw).status_code == 403, why
+        # …while the identity itself still reads back fine
+        assert c.get("/whoami", headers=Hw).status_code == 200, why
+
+    # a scoped token may still administer the namespace it IS scoped to
+    Hp = {"Authorization": f"Bearer {pinned}"}
+    assert c.get(f"/spaces/{ns}/access-requests", headers=Hp).status_code == 200
+
+
+def test_a_default_namespace_is_a_preference_not_a_grant(managed_client):
+    """A user_manager hands out access without gaining it — so it must not be
+    able to point a fresh account at a namespace that account cannot reach.
+
+    Two things had to be true for this to be an escalation, and both were: the
+    pointer could be aimed anywhere, and resolving it granted `admin` without
+    checking membership. A manager could therefore mint a mule, aim it at any
+    namespace on the deployment, and read, write and irreversibly erase there.
+    """
+    c, admin_tok = managed_client
+    H = {"Authorization": f"Bearer {admin_tok}"}
+
+    with psycopg.connect(DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM app_user WHERE role='superadmin'")
+        root = str(cur.fetchone()[0])
+    vault = c.post("/admin/namespaces",
+                   json={"owner_user_id": root, "name": "vault"},
+                   headers=H).json()["id"]
+    c.post("/memories", json={"body": "launch codes\n", "space": "vault"},
+           headers=H)
+
+    mgr = c.post("/admin/users", json={"name": "mgr", "role": "user_manager"},
+                 headers=H).json()["id"]
+    mtok = c.post("/admin/tokens", json={"user_id": mgr, "permission": "admin"},
+                  headers=H).json()["token"]
+    Hm = {"Authorization": f"Bearer {mtok}"}
+
+    mule = c.post("/admin/users", json={"name": "mule"}, headers=Hm).json()["id"]
+    mule_tok = c.post("/admin/tokens",
+                      json={"user_id": mule, "permission": "admin"},
+                      headers=Hm).json()["token"]
+
+    # The aim is refused. 404 rather than 403 is deliberate: a namespace the
+    # caller cannot reach is not confirmed to exist.
+    assert c.post(f"/admin/users/{mule}/default-space",
+                  json={"namespace_id": vault},
+                  headers=Hm).status_code in (403, 404)
+
+    # …and even aimed straight at the pointer in the database, it grants nothing
+    with psycopg.connect(DSN, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE app_user SET default_namespace_id=%s WHERE id=%s",
+                    (vault, mule))
+    # The mule reaches no namespace at all, so the pointer buys it nothing: the
+    # read finds nowhere to look and the write finds nowhere to land, rather than
+    # both quietly resolving to the vault.
+    Hmule = {"Authorization": f"Bearer {mule_tok}"}
+    r = c.get("/recall", params={"q": "codes"}, headers=Hmule)
+    assert r.status_code != 200 or r.json() == []
+    assert c.post("/memories", json={"body": "pwned\n"},
+                  headers=Hmule).status_code in (401, 403, 404, 422)
+    # and the vault is untouched
+    assert len(c.get("/memories", params={"space": "vault"},
+                     headers=H).json()) == 1

@@ -176,5 +176,39 @@ def test_a_first_body_larger_than_the_cap_still_comes_back(store):
     assert row["body"].startswith("a much longer") and row["body_omitted"] is False
 
 
+def test_bodies_over_the_cap_are_never_fetched(store):
+    """The cap has to bound the SERVER, not just the answer. Selecting every
+    body and discarding the overflow afterwards still moves every byte — at the
+    default ceilings a 500-row page is 128 MB fetched to return 200 KB. So the
+    page carries sizes, and only the bodies that fit are asked for."""
+    store.cfg = dataclasses.replace(store.cfg, list_bodies_max_bytes=20)
+    for name in ("a", "b", "c"):
+        store.write(body=name * 15 + "\n", path=f"t.{name}")
+
+    seen = []
+    real_execute = store._conn.cursor
+
+    class _Spy:
+        def __init__(self, inner): self._inner = inner
+        def __getattr__(self, k): return getattr(self._inner, k)
+        def execute(self, sql, args=None):
+            seen.append((sql, args))
+            return self._inner.execute(sql, args)
+
+    store._conn.cursor = lambda *a, **kw: _Spy(real_execute(*a, **kw))
+    try:
+        rows = store.list(None, path_prefix="t", bodies=True)
+    finally:
+        store._conn.cursor = real_execute
+
+    assert [r["body_omitted"] for r in rows] == [False, True, True]
+    # the page query asks for sizes, not bodies
+    page = next(sql for sql, _ in seen if "octet_length(body)" in sql)
+    assert "left(split_part" not in page
+    # and exactly one id — the row that fits — has its body fetched
+    fetch = [a for sql, a in seen if "SELECT id, body FROM memory" in sql]
+    assert len(fetch) == 1 and fetch[0][-1] == [rows[0]["id"]]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -56,10 +56,35 @@ class Lockout(RuntimeError):
 # by any door, and both are pure — they raise or return, they never touch the
 # database.
 
+def _require_full_credential(p: Principal, action: str) -> None:
+    """The control plane needs a credential that has not been deliberately weakened.
+
+    A role says who someone IS; a token says what THIS credential may do — its
+    permission ceiling and, optionally, the single namespace it is pinned to.
+    The two are independent, and gating the control plane on the role alone made
+    the token's limits decorative: a read-only, namespace-scoped token minted for
+    an agent still opened the whole control plane, because the *account* behind
+    it happened to hold an admin role. From there the weak credential simply
+    issued itself a strong one, so pinning an agent to one namespace with a
+    read-only token — exactly what the docs recommend — protected nothing.
+
+    Deployment-wide acts therefore require an unscoped, admin-ceiling token. This
+    is the rule the self-service token tools already applied; the point of a
+    shared service layer is that the stricter door does not stay the exception.
+    """
+    if p.permission != "admin":
+        raise Forbidden(f"{action} requires an admin-ceiling token "
+                        f"(this one grants {p.permission})")
+    if p.scope_namespace_id is not None:
+        raise Forbidden(f"{action} requires an unscoped token — this one is "
+                        f"pinned to a single namespace")
+
+
 def require_manage_users(p: Principal) -> Principal:
     """Provisioning tier: user_manager, superadmin, or the env break-glass root."""
     if not identity.can_manage_users(p):
         raise Forbidden("user management requires user_manager or superadmin")
+    _require_full_credential(p, "user management")
     return p
 
 
@@ -67,6 +92,7 @@ def require_superadmin(p: Principal) -> Principal:
     """Root tier: cross-tenant access and handing out service roles."""
     if not p.is_admin:                       # superadmin user or env root
         raise Forbidden("superadmin required")
+    _require_full_credential(p, "this operation")
     return p
 
 
@@ -103,6 +129,12 @@ def require_namespace_admin(conn, p: Principal, namespace_id: str) -> Optional[s
     "read/write any namespace, grant any access" — was refused on a namespace it
     had just provisioned for someone else.
     """
+    # A scoped token is pinned to one namespace, and administering a DIFFERENT
+    # one is outside what it was issued for — including for a superadmin, whose
+    # role would otherwise make the pin meaningless.
+    if (p.scope_namespace_id is not None
+            and str(p.scope_namespace_id) != str(namespace_id)):
+        raise Forbidden("this token is scoped to a different namespace")
     if p.is_admin:
         return p.user_id
     if p.user_id is None:
@@ -259,9 +291,20 @@ def set_default_space(conn, p: Principal, *, user_id: str,
 
     Creating a user and creating a namespace do not connect the two, so without
     this a provisioned user's first write lands somewhere nobody chose.
+
+    Both halves are checked, because a default is a preference among namespaces
+    the user can already reach — not a way to give them one. The caller must
+    administer the namespace, and the target must already be able to reach it;
+    otherwise this becomes a grant that bypasses membership entirely.
     """
     require_manage_users(p)
     _require_target_is_plain_user(conn, p, user_id, "setting a default namespace")
+    require_namespace_admin(conn, p, namespace_id)
+    with conn.cursor() as cur:
+        if identity._reach(cur, user_id, namespace_id) is None:
+            raise Forbidden(
+                "that user cannot reach this namespace — share it with them "
+                "first; a default namespace is a preference, not a grant")
     identity.set_default_space(conn, user_id, namespace_id)
     return {"user_id": user_id, "default_namespace_id": namespace_id}
 

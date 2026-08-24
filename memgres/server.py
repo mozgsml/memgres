@@ -479,6 +479,61 @@ def create_app(cfg: Optional[Config] = None):
                 conn, p, namespace_id=space_id, user_id=req.user_id,
                 permission=req.permission))
 
+    class SetRole(BaseModel):
+        role: str
+
+    class DefaultSpace(BaseModel):
+        namespace_id: str
+
+    class EditNamespace(BaseModel):
+        description: Optional[str] = None
+        instruction: Optional[str] = None
+
+    # These exist so the HTTP surface offers what the service layer does. They
+    # were reachable over MCP only, which left a panel — the reason this API is
+    # public at all — unable to do half the provisioning it shows.
+    @app.get("/admin/users")
+    def admin_list_users(role: Optional[str] = None, limit: int = 100,
+                         offset: int = 0, p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.list_users(conn, p, role=role,
+                                                   limit=limit, offset=offset))
+
+    @app.post("/admin/users/{user_id}/role")
+    def admin_set_role(user_id: str, req: SetRole, p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.set_role(conn, p, user_id=user_id,
+                                                 role=req.role))
+
+    @app.post("/admin/users/{user_id}/default-space")
+    def admin_set_default_space(user_id: str, req: DefaultSpace,
+                                p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.set_default_space(
+                conn, p, user_id=user_id, namespace_id=req.namespace_id))
+
+    @app.get("/admin/namespaces")
+    def admin_list_namespaces(owner_user_id: Optional[str] = None,
+                              limit: int = 100, offset: int = 0,
+                              p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.list_namespaces(
+                conn, p, owner_user_id=owner_user_id, limit=limit, offset=offset))
+
+    @app.patch("/admin/namespaces/{space_id}")
+    def admin_edit_namespace(space_id: str, req: EditNamespace,
+                             p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.edit_namespace(
+                conn, p, namespace_id=space_id, description=req.description,
+                instruction=req.instruction))
+
+    @app.get("/admin/namespaces/{space_id}/members")
+    def admin_list_members(space_id: str, p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.list_members(conn, p,
+                                                     namespace_id=space_id))
+
     # ─── service-role management (superadmin only) ──────────────────────────
     @app.post("/admin/users/{user_id}/grant-superadmin")
     def admin_grant_superadmin(user_id: str, p=Depends(principal)):
