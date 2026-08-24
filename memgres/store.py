@@ -47,6 +47,37 @@ class NoParent(ValueError):
     """MEMGRES_REQUIRE_PARENT is on and the node's parent path doesn't exist."""
 
 
+class PathMoved(ValueError):
+    """The addressed path exists only in history — the memory moved away.
+
+    Carries where it went, because the useful answer to "there is nothing here"
+    is "it is over there now". Raised instead of quietly resolving to the moved
+    memory (a write meant for one address landing on another) or quietly creating
+    a second memory at the vacated one (the silent fork this guards).
+    """
+
+    def __init__(self, path: str, memory_id: str, moved_to: Optional[str],
+                 message: str):
+        super().__init__(message)
+        self.path = path
+        self.memory_id = memory_id
+        self.moved_to = moved_to
+
+
+class PathTaken(ValueError):
+    """Creating at a path another memory already occupies.
+
+    A path is unique within a namespace, so this was always refused — but by a
+    raw unique-index violation that named neither the path nor its occupant.
+    """
+
+    def __init__(self, path: str, memory_id: str):
+        super().__init__(f"'{path}' is already taken by memory {memory_id} — "
+                         f"edit it (`at='{path}'`) or choose another path")
+        self.path = path
+        self.memory_id = memory_id
+
+
 class ReplaceNotFound(ValueError):
     """A substring `replace`'s `old` text does not occur in the current body."""
 
@@ -87,6 +118,13 @@ class Memory:
     updated_at: object
     expires_at: object
     title: str = ""
+    # Set only when the caller needs telling something they didn't ask:
+    # `created` distinguishes a write that made a new memory from one that
+    # edited an existing one, and `moved_from` names the old address a request
+    # was resolved through, so a caller writing to a stale path learns of it
+    # from the answer instead of forking the memory.
+    created: Optional[bool] = None
+    moved_from: Optional[str] = None
 
     def to_dict(self, *, stringify_dates: bool = False) -> dict:
         """Serialize for an API layer. ``stringify_dates`` str()-coerces the
@@ -97,7 +135,8 @@ class Memory:
         return {"id": self.id, "content_hash": self.content_hash, "body": self.body,
                 "title": self.title, "tags": self.tags, "path": self.path,
                 "seq": self.seq, "created_at": d(self.created_at),
-                "updated_at": d(self.updated_at), "expires_at": d(self.expires_at)}
+                "updated_at": d(self.updated_at), "expires_at": d(self.expires_at),
+                "created": self.created, "moved_from": self.moved_from}
 
 
 def _sha(text: str) -> str:
@@ -253,6 +292,7 @@ class Store:
 
     # ─── write: create, replace, diff, move, retag (one entrypoint) ─────────
     def write(self, token: Optional[str] = None, *, id: Optional[str] = None,
+              at: Optional[str] = None, if_moved: str = "error",
               body: Optional[str] = None, diff: Optional[str] = None,
               base_hash: Optional[str] = None, path: Optional[str] = None,
               tags: Optional[Sequence[str]] = None, source: Optional[str] = None,
@@ -260,8 +300,25 @@ class Store:
               title: Optional[str] = None,
               replace: Optional[Sequence[str]] = None, replace_all: bool = False,
               space: Optional[str] = None, space_id: Optional[str] = None) -> Memory:
-        if replace is not None and id is None:
-            raise ValueError("replace edits an existing memory — pass its id")
+        """Create a memory, or edit one addressed by `id` or by `at` (its path).
+
+        `at` and `path` are different jobs and must not be confused: `at` FINDS
+        the memory to edit, `path` SETS where a memory lives. So `at='ops.x'`
+        edits whatever is at ops.x, while `path='ops.x'` files a new memory there
+        (or, alongside `at`, moves one). Keeping them apart is what lets a write
+        by address never risk overwriting a memory the caller didn't mean to
+        touch, without any flag saying which it meant.
+
+        `if_moved` governs an address that only exists in history — see
+        :meth:`_at_id`. Writes default to `'error'` rather than resolving
+        silently: a caller writing to a stale address is working from a stale
+        picture, and both quiet answers (edit the moved memory, or make a second
+        one at the vacated path) commit them to it.
+        """
+        if replace is not None and id is None and at is None:
+            raise ValueError("replace edits an existing memory — pass its id or `at`")
+        if if_moved not in ("error", "follow", "create"):
+            raise ValueError("if_moved must be 'error', 'follow' or 'create'")
         with self._conn.transaction():
             # authorize inside the tx so a lazily-created user/namespace commits
             # atomically with the write (or rolls back together on failure).
@@ -269,12 +326,59 @@ class Store:
                                          need="write", for_write=True)
             self._check_provenance_size(source, reason)
             self._check_title_size(title)
-            if id is None:
+            if id is None and at is None:
+                self._check_path_free(ns, path, if_moved)
                 return self._create(ns, author, body, path, tags, source, reason,
                                     ttl_days, title)
-            return self._update(ns, author, id, body, diff, base_hash, path, tags,
-                                source, reason, ttl_days, title=title,
-                                replace=replace, replace_all=replace_all)
+            id, moved_from = self._address(ns, id, at,
+                                           follow=if_moved == "follow")
+            m = self._update(ns, author, id, body, diff, base_hash, path, tags,
+                             source, reason, ttl_days, title=title,
+                             replace=replace, replace_all=replace_all)
+            m.moved_from = moved_from
+            return m
+
+    def _check_path_free(self, ns: str, path: Optional[str],
+                         if_moved: str) -> None:
+        """Refuse to create at an address that is taken, or that was vacated.
+
+        Taken is the easy half: the unique index refused it anyway, this just
+        says so in words that name the occupant. Vacated is the half that
+        matters. A caller creating at a path some memory moved away from is
+        almost always working from an outdated address and means to edit that
+        memory — and letting the create through gives them a SECOND memory on the
+        same subject while the first goes on living elsewhere. Nothing errors,
+        both turn up in recall, and the caller keeps writing to the wrong one.
+
+        So it is refused, and the refusal says where the memory went, which is
+        the fact that turns a blind retry into a decision. Genuinely reclaiming a
+        vacated name is `if_moved='create'` — a deliberate second call, made by
+        someone who has just been told what used to be there.
+        """
+        if not path:
+            return
+        cur = self._conn.cursor()
+        cur.execute("SELECT id FROM memory WHERE namespace=%s AND path=%s::ltree",
+                    (ns, path))
+        row = cur.fetchone()
+        if row is not None:
+            raise PathTaken(path, str(row[0]))
+        if if_moved == "create":
+            return
+        cur.execute(
+            "SELECT h.memory_id, m.path::text FROM memory_history h "
+            "JOIN memory m ON m.id = h.memory_id AND m.namespace = %s "
+            "WHERE h.op = 'move' AND h.path_before = %s "
+            "ORDER BY h.id DESC LIMIT 1",
+            (ns, path))
+        moved = cur.fetchone()
+        if moved is not None:
+            mid, now_at = str(moved[0]), moved[1]
+            raise PathMoved(
+                path, mid, now_at,
+                f"'{path}' is not free: the memory that was there moved to "
+                f"'{now_at}'. Edit it with at='{now_at}', or pass "
+                f"if_moved='create' to claim the old path for something new")
 
     def _check_write_size(self, payload: Optional[str]):
         if payload is not None and byte_len(payload) > self.cfg.max_write_bytes:
@@ -327,7 +431,7 @@ class Store:
             [ns, body, chash, tags, path, self.cfg.fts_language, body,
              title, self.cfg.fts_language, title, pending],
         )
-        mid, created, updated, expires = cur.fetchone()
+        mid, created_at, updated_at, expires_at = cur.fetchone()
         if pending:
             self._index_now(str(mid), body, ns, chash)   # inline unless async
         # store create as a diff-from-empty so the whole history is a self-contained
@@ -336,8 +440,8 @@ class Store:
         self._append_history(str(mid), 1, "create", make_diff("", body), None, chash,
                              None, path, None, tags, source, reason, author,
                              title_after=(title or None))
-        return Memory(str(mid), body, chash, tags, path, 1, created, updated,
-                      expires, title)
+        return Memory(str(mid), body, chash, tags, path, 1, created_at,
+                      updated_at, expires_at, title, created=True)
 
     def _load(self, cur, ns, id) -> tuple:
         cur.execute(
@@ -449,7 +553,9 @@ class Store:
                 cur.execute(
                     f"UPDATE memory SET updated_at=now(), expires_at={self._expiry_sql(ttl_days)} "
                     "WHERE id=%s", (id,))
-                return self.get(None, id, _ns=ns, renew=False)
+                touched = self.get(None, id, _ns=ns, renew=False)
+                touched.created = False
+                return touched
 
         if body_changed:
             self._check_body_size(new_body)
@@ -475,7 +581,7 @@ class Store:
              self.cfg.fts_language, new_body,
              new_title, self.cfg.fts_language, new_title,
              (body_changed and self._vectors is not None), id])
-        new_seq, created, updated, expires = cur.fetchone()
+        new_seq, created_at, updated_at, expires_at = cur.fetchone()
         if body_changed and self._vectors is not None:
             # only a body change re-chunks; path/tag/title edits leave vectors be.
             self._index_now(str(id), new_body, ns, new_hash)   # inline unless async
@@ -492,7 +598,7 @@ class Store:
                              title_before=cur_title if title_changed else None,
                              title_after=new_title if title_changed else None)
         return Memory(str(id), new_body, new_hash, new_tags, new_path, new_seq,
-                      created, updated, expires, new_title)
+                      created_at, updated_at, expires_at, new_title, created=False)
 
     def _cascade_move(self, cur, ns, old_prefix: str, new_prefix: str,
                       exclude_id, author, source, reason) -> None:
@@ -648,19 +754,91 @@ class Store:
             rows.append(d)
         return rows
 
+    # ─── addressing by path ─────────────────────────────────────────────────
+    def _at_id(self, ns: str, at: str, *, follow: bool) -> tuple:
+        """Resolve a path to ``(memory_id, moved_from)``.
+
+        A path is unique within a namespace (``memory_ns_path_uniq``), so it is a
+        real address — but a mutable one, which is the whole difficulty. Three
+        outcomes, and the middle one is the reason this exists:
+
+        * something lives there now → that memory, ``moved_from`` None;
+        * nothing lives there, but something MOVED away → that memory, if
+          ``follow``; otherwise :class:`PathMoved`, naming where it went;
+        * nothing, and nothing ever moved away → :class:`NotFound`.
+
+        The trail comes from ``memory_history``: a ``move`` row records the
+        address a memory left. No redirect table, and no chain to walk — the row
+        names the memory, and the memory's CURRENT path is authoritative however
+        many times it has moved since. Deletion is real (history cascades with the
+        row), so a deleted memory leaves no redirect and its path is simply free
+        again: exactly the addresses where a fork is impossible.
+        """
+        cur = self._conn.cursor()
+        cur.execute("SELECT id FROM memory WHERE namespace=%s AND path=%s::ltree",
+                    (ns, at))
+        row = cur.fetchone()
+        if row is not None:
+            return str(row[0]), None
+        # A live path always wins over a redirect: a vacated address may since
+        # have been claimed on purpose, and the thing that is there now is what
+        # the caller reached for.
+        cur.execute(
+            "SELECT h.memory_id, m.path::text FROM memory_history h "
+            "JOIN memory m ON m.id = h.memory_id AND m.namespace = %s "
+            "WHERE h.op = 'move' AND h.path_before = %s "
+            "ORDER BY h.id DESC LIMIT 1",     # the most recent departure wins
+            (ns, at))
+        moved = cur.fetchone()
+        if moved is None:
+            raise NotFound(f"no memory at path '{at}'")
+        mid, now_at = str(moved[0]), moved[1]
+        if follow:
+            return mid, at
+        raise PathMoved(
+            at, mid, now_at,
+            f"'{at}' moved to '{now_at}' — address it there, or pass "
+            f"if_moved='follow' to edit it where it is now")
+
+    def _address(self, ns: str, id: Optional[str], at: Optional[str], *,
+                 follow: bool) -> tuple:
+        """``(memory_id, moved_from)`` from whichever address the caller gave.
+
+        One definition for every id-addressed operation, so `at` behaves the same
+        on a read, an edit and a delete rather than being re-implemented per
+        method."""
+        if id is not None and at is not None:
+            raise ValueError("pass either `id` or `at` (a path), not both")
+        if id is not None:
+            return id, None
+        if at is None:
+            raise ValueError("need `id` or `at` (a path) to address a memory")
+        return self._at_id(ns, at, follow=follow)
+
     # ─── convenience: move ──────────────────────────────────────────────────
-    def move(self, token: Optional[str], id: str, new_path: str,
-             *, source: Optional[str] = None, reason: Optional[str] = None,
+    def move(self, token: Optional[str], id: Optional[str] = None,
+             new_path: Optional[str] = None, *, at: Optional[str] = None,
+             if_moved: str = "error",
+             source: Optional[str] = None, reason: Optional[str] = None,
              space: Optional[str] = None, space_id: Optional[str] = None) -> Memory:
-        return self.write(token, id=id, path=new_path, source=source, reason=reason,
+        return self.write(token, id=id, at=at, if_moved=if_moved, path=new_path,
+                          source=source, reason=reason,
                           space=space, space_id=space_id)
 
     # ─── read ───────────────────────────────────────────────────────────────
-    def get(self, token: Optional[str], id: str, *, renew: bool = True,
-            _ns: Optional[str] = None, space: Optional[str] = None,
-            space_id: Optional[str] = None) -> Memory:
+    def get(self, token: Optional[str], id: Optional[str] = None, *,
+            at: Optional[str] = None, if_moved: str = "follow",
+            renew: bool = True, _ns: Optional[str] = None,
+            space: Optional[str] = None, space_id: Optional[str] = None) -> Memory:
+        """Fetch one memory by `id`, or by `at` — the path it lives at.
+
+        A read follows a move by default: the memory that used to live at that
+        path is what the caller reached for, and it comes back with `moved_from`
+        set so they learn the address changed. Pass `if_moved='error'` to be told
+        instead of redirected."""
         ns = _ns if _ns is not None else self._authorize(
             token, space=space, space_id=space_id, need="read")[0]
+        id, moved_from = self._address(ns, id, at, follow=if_moved == "follow")
         cur = self._conn.cursor()
         cur.execute(
             "SELECT id, body, content_hash, tags, path::text, seq, created_at, "
@@ -675,11 +853,14 @@ class Store:
                     f"UPDATE memory SET expires_at={self._expiry_sql(None)} WHERE id=%s",
                     (id,))
         return Memory(str(row[0]), row[1], row[2], list(row[3]), row[4], row[5],
-                      row[6], row[7], row[8], row[9])
+                      row[6], row[7], row[8], row[9], moved_from=moved_from)
 
-    def history(self, token: Optional[str], id: str, *, space: Optional[str] = None,
+    def history(self, token: Optional[str], id: Optional[str] = None, *,
+                at: Optional[str] = None, if_moved: str = "follow",
+                space: Optional[str] = None,
                 space_id: Optional[str] = None) -> List[dict]:
         ns, _ = self._authorize(token, space=space, space_id=space_id, need="read")
+        id, _moved = self._address(ns, id, at, follow=if_moved == "follow")
         cur = self._conn.cursor()
         cur.execute("SELECT 1 FROM memory WHERE id=%s AND namespace=%s", (id, ns))
         if cur.fetchone() is None:
@@ -701,39 +882,50 @@ class Store:
                 "prev_row_hash", "row_hash", "created_at"]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
-    def annotate(self, token: Optional[str], id: str,
+    def annotate(self, token: Optional[str], id: Optional[str] = None,
                  upto_seq: Optional[int] = None,
                  lines: Optional[Sequence[int]] = None, *,
+                 at: Optional[str] = None,
                  space: Optional[str] = None, space_id: Optional[str] = None) -> List[dict]:
         """Blame: the body with each line tagged by who last changed it. Pass
         `lines` (1-based line numbers) to return only those lines."""
         from .blame import annotate as _annotate
-        return _annotate(self.history(token, id, space=space, space_id=space_id),
+        return _annotate(self.history(token, id, at=at, space=space,
+                                      space_id=space_id),
                          upto_seq, lines)
 
-    def annotate_grouped(self, token: Optional[str], id: str,
+    def annotate_grouped(self, token: Optional[str], id: Optional[str] = None,
                          upto_seq: Optional[int] = None,
                          include_text: bool = True, *,
+                         at: Optional[str] = None,
                          space: Optional[str] = None,
                          space_id: Optional[str] = None) -> List[dict]:
         """Blame as runs: consecutive same-author lines collapse into one block.
         `include_text=False` returns a pure ownership map (ranges, no body)."""
         from .blame import annotate_grouped as _grouped
-        return _grouped(self.history(token, id, space=space, space_id=space_id),
+        return _grouped(self.history(token, id, at=at, space=space,
+                                     space_id=space_id),
                         upto_seq, include_text)
 
-    def reconstruct(self, token: Optional[str], id: str,
-                    upto_seq: Optional[int] = None, *,
+    def reconstruct(self, token: Optional[str], id: Optional[str] = None,
+                    upto_seq: Optional[int] = None, *, at: Optional[str] = None,
                     space: Optional[str] = None, space_id: Optional[str] = None) -> str:
         """The exact body text at a past version (default current)."""
         from .blame import reconstruct as _reconstruct
-        return _reconstruct(self.history(token, id, space=space, space_id=space_id),
+        return _reconstruct(self.history(token, id, at=at, space=space,
+                                         space_id=space_id),
                             upto_seq)
 
-    def verify_history(self, token: Optional[str], id: str, *,
+    def verify_history(self, token: Optional[str], id: Optional[str] = None, *,
+                       at: Optional[str] = None,
                        space: Optional[str] = None,
                        space_id: Optional[str] = None) -> bool:
         """Recompute the chain; True if untampered."""
+        # resolved here rather than inside `history`, because the memory id is
+        # itself hashed into every row — verifying against the address the caller
+        # typed instead of the id it resolves to would fail every chain.
+        ns, _ = self._authorize(token, space=space, space_id=space_id, need="read")
+        id, _moved = self._address(ns, id, at, follow=True)
         rows = self.history(token, id, space=space, space_id=space_id)
         prev = None
         for r in rows:
