@@ -25,7 +25,7 @@ from typing import List, Optional
 
 import psycopg
 
-from . import identity
+from . import admin, identity
 from .config import Config, load
 from .diffing import DiffConflict
 from .embeddings import get_embedder
@@ -131,7 +131,7 @@ def create_app(cfg: Optional[Config] = None):
         return Store(cfg, embedder=embedder, conn=conn, backend=backend)
 
     def _guard(fn):
-        """Run a store call, mapping store exceptions to HTTP codes."""
+        """Run a store or admin call, mapping domain exceptions to HTTP codes."""
         try:
             return fn()
         except (NotFound, SpaceNotFound):
@@ -140,8 +140,12 @@ def create_app(cfg: Optional[Config] = None):
             raise HTTPException(409, str(e))
         except NoParent as e:
             raise HTTPException(409, str(e))
+        except admin.Lockout as e:           # would leave nobody in charge
+            raise HTTPException(409, str(e))
         except TooLarge as e:
             raise HTTPException(413, str(e))
+        except admin.Forbidden as e:         # before PermissionError — it is one
+            raise HTTPException(403, str(e))
         except PermissionError as e:
             raise HTTPException(401, str(e))
         except ValueError as e:
@@ -288,39 +292,14 @@ def create_app(cfg: Optional[Config] = None):
                 match=match, space=space, space_id=space_id))
 
     # ─── spaces: what this token can reach ──────────────────────────────────
-    def _me(conn, tok) -> str:
-        """The caller's user id, or 401 if the token has no owning user."""
-        p = identity.resolve(conn, cfg, tok)
-        if p.user_id is None:
-            raise HTTPException(401, "this token has no owning user")
-        return p.user_id
-
-    def _require_admin_on(conn, tok, space_id: str) -> str:
-        """Caller must hold effective admin (membership min token ceiling) on the
-        namespace. Returns the caller's user id."""
-        p = identity.resolve(conn, cfg, tok)
-        if p.user_id is None:
-            raise HTTPException(401, "this token has no owning user")
-        with conn.cursor() as cur:
-            membership = identity._reach(cur, p.user_id, space_id)
-        if membership is None:
-            raise HTTPException(404, "no such namespace")
-        if identity.perm_min(membership, p.permission) != "admin":
-            raise HTTPException(403, "admin on this namespace required")
-        return p.user_id
-
     @app.get("/spaces")
     def spaces(tok: Optional[str] = Depends(token)):
         """List the namespaces this token can reach (identity modes only)."""
         if cfg.key_mode == "single":
             return []
         with pool.connection() as conn:
-            def _list():
-                p = identity.resolve(conn, cfg, tok)
-                if p.user_id is None:      # admin or provisional → nothing to list
-                    return []
-                return identity.list_spaces(conn, p.user_id)
-            return _guard(_list)
+            return _guard(lambda: admin.list_spaces(
+                conn, identity.resolve(conn, cfg, tok)))
 
     # ─── request-access: ask to join a namespace, owner approves ────────────
     class RequestBody(BaseModel):
@@ -330,74 +309,45 @@ def create_app(cfg: Optional[Config] = None):
     def request_access(space_id: str, req: RequestBody,
                        tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
-            def _do():
-                uid = _me(conn, tok)
-                return {"id": identity.request_access(conn, uid, space_id,
-                                                      req.permission)}
-            return _guard(_do)
+            return {"id": _guard(lambda: admin.request_access(
+                conn, identity.resolve(conn, cfg, tok),
+                namespace_id=space_id, permission=req.permission))}
 
     @app.get("/spaces/{space_id}/access-requests")
     def list_access_requests(space_id: str, tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
-            def _do():
-                _require_admin_on(conn, tok, space_id)
-                return identity.list_requests(conn, space_id)
-            return _guard(_do)
-
-    def _decide_access(conn, tok, req_id: str, approve: bool):
-        with conn.cursor() as cur:
-            cur.execute("SELECT namespace_id FROM access_request WHERE id=%s",
-                        (req_id,))
-            row = cur.fetchone()
-        if row is None:
-            raise HTTPException(404, "no such request")
-        _require_admin_on(conn, tok, str(row[0]))
-        if approve:
-            identity.approve_request(conn, req_id)
-        else:
-            identity.deny_request(conn, req_id)
+            return _guard(lambda: admin.list_requests(
+                conn, identity.resolve(conn, cfg, tok), namespace_id=space_id))
 
     @app.post("/access-requests/{req_id}/approve")
     def approve_access(req_id: str, tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
-            _guard(lambda: _decide_access(conn, tok, req_id, True))
+            _guard(lambda: admin.decide_access(
+                conn, identity.resolve(conn, cfg, tok),
+                request_id=req_id, approve=True))
             return {"approved": req_id}
 
     @app.post("/access-requests/{req_id}/deny")
     def deny_access(req_id: str, tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
-            _guard(lambda: _decide_access(conn, tok, req_id, False))
+            _guard(lambda: admin.decide_access(
+                conn, identity.resolve(conn, cfg, tok),
+                request_id=req_id, approve=False))
             return {"denied": req_id}
 
     # ─── admin provisioning (service roles + env break-glass) ───────────────
-    # Provisioning is gated by the caller's service role, resolved from its
-    # token — not by a single shared secret. Two tiers:
-    #   require_manage_users — user_manager, superadmin, or the env break-glass
-    #     root: create users/namespaces, (re)issue & revoke tokens.
-    #   require_superadmin   — superadmin or env root only: cross-tenant access
-    #     (add_member) and granting/revoking the superadmin role.
-    def _admin_principal(authorization, x_memgres_token):
+    # The door only says WHO is calling; `admin` decides what they may do, so
+    # the same rules serve the MCP surface (and, later, a web session) without
+    # being restated here. Authentication failure is 403 rather than 401 on
+    # these routes — the credential was offered and rejected.
+    def principal(authorization: Optional[str] = Header(None),
+                  x_memgres_token: Optional[str] = Header(None)):
         tok = identity.bearer_token(authorization, x_memgres_token)
         with pool.connection() as conn:
             try:
                 return identity.resolve(conn, cfg, tok)
             except identity.AuthError as e:
                 raise HTTPException(403, str(e))
-
-    def require_manage_users(authorization: Optional[str] = Header(None),
-                             x_memgres_token: Optional[str] = Header(None)):
-        p = _admin_principal(authorization, x_memgres_token)
-        if not identity.can_manage_users(p):
-            raise HTTPException(403, "user management requires user_manager or "
-                                     "superadmin")
-        return p
-
-    def require_superadmin(authorization: Optional[str] = Header(None),
-                           x_memgres_token: Optional[str] = Header(None)):
-        p = _admin_principal(authorization, x_memgres_token)
-        if not p.is_admin:                       # superadmin user or env root
-            raise HTTPException(403, "superadmin required")
-        return p
 
     class NewUser(BaseModel):
         name: str = ""
@@ -422,83 +372,61 @@ def create_app(cfg: Optional[Config] = None):
         permission: str = "read"
 
     @app.post("/admin/users", status_code=201)
-    def admin_create_user(req: NewUser,
-                          p=Depends(require_manage_users)):
-        # minting an admin-role user is itself a superadmin act — a user_manager
-        # must not escalate anyone (nor itself, via a fresh admin user).
-        if req.role != "user" and not p.is_admin:
-            raise HTTPException(403, "granting an admin role requires superadmin")
+    def admin_create_user(req: NewUser, p=Depends(principal)):
         with pool.connection() as conn:
-            return {"id": _guard(lambda: identity.create_user(
-                conn, req.name, req.description, role=req.role))}
+            return {"id": _guard(lambda: admin.create_user(
+                conn, p, name=req.name, description=req.description,
+                role=req.role))}
 
-    @app.post("/admin/namespaces", status_code=201,
-              dependencies=[Depends(require_manage_users)])
-    def admin_create_namespace(req: NewNamespace):
+    @app.post("/admin/namespaces", status_code=201)
+    def admin_create_namespace(req: NewNamespace, p=Depends(principal)):
         with pool.connection() as conn:
-            return {"id": _guard(lambda: identity.create_namespace(
-                conn, req.owner_user_id, req.name, description=req.description,
-                instruction=req.instruction))}
+            return {"id": _guard(lambda: admin.create_namespace(
+                conn, p, owner_user_id=req.owner_user_id, name=req.name,
+                description=req.description, instruction=req.instruction))}
 
-    @app.post("/admin/tokens", status_code=201,
-              dependencies=[Depends(require_manage_users)])
-    def admin_issue_token(req: NewToken):
-        import datetime as dt
-        exp = None
-        if req.expires_days:
-            exp = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=req.expires_days)
+    @app.post("/admin/tokens", status_code=201)
+    def admin_issue_token(req: NewToken, p=Depends(principal)):
         with pool.connection() as conn:
-            secret, tid = _guard(lambda: identity.issue_token(
-                conn, req.user_id, namespace_id=req.namespace_id,
-                permission=req.permission, label=req.label, expires_at=exp))
-            return {"token": secret, "id": tid,
-                    "note": "store this now — it is not recoverable"}
+            return _guard(lambda: admin.issue_token(
+                conn, p, user_id=req.user_id, namespace_id=req.namespace_id,
+                permission=req.permission, label=req.label,
+                expires_days=req.expires_days))
 
-    @app.post("/admin/tokens/{token_id}/revoke",
-              dependencies=[Depends(require_manage_users)])
-    def admin_revoke_token(token_id: str):
+    @app.post("/admin/tokens/{token_id}/revoke")
+    def admin_revoke_token(token_id: str, p=Depends(principal)):
         with pool.connection() as conn:
-            return {"revoked": _guard(lambda: identity.revoke_token(conn, token_id))}
+            return {"revoked": _guard(lambda: admin.revoke_token(
+                conn, p, token_id=token_id))}
 
-    @app.get("/admin/users/{user_id}/tokens",
-             dependencies=[Depends(require_manage_users)])
-    def admin_list_tokens(user_id: str):
+    @app.get("/admin/users/{user_id}/tokens")
+    def admin_list_tokens(user_id: str, p=Depends(principal)):
         with pool.connection() as conn:
-            return _guard(lambda: identity.list_tokens(conn, user_id))
+            return _guard(lambda: admin.list_tokens(conn, p, user_id=user_id))
 
-    @app.post("/admin/namespaces/{space_id}/members", status_code=201,
-              dependencies=[Depends(require_superadmin)])
-    def admin_add_member(space_id: str, req: NewMember):
+    @app.post("/admin/namespaces/{space_id}/members", status_code=201)
+    def admin_add_member(space_id: str, req: NewMember, p=Depends(principal)):
         with pool.connection() as conn:
-            _guard(lambda: identity.add_member(
-                conn, space_id, req.user_id, req.permission))
-            return {"namespace_id": space_id, "user_id": req.user_id,
-                    "permission": req.permission}
+            return _guard(lambda: admin.add_member(
+                conn, p, namespace_id=space_id, user_id=req.user_id,
+                permission=req.permission))
 
     # ─── service-role management (superadmin only) ──────────────────────────
-    @app.post("/admin/users/{user_id}/grant-superadmin",
-              dependencies=[Depends(require_superadmin)])
-    def admin_grant_superadmin(user_id: str):
+    @app.post("/admin/users/{user_id}/grant-superadmin")
+    def admin_grant_superadmin(user_id: str, p=Depends(principal)):
         with pool.connection() as conn:
-            _guard(lambda: identity.grant_superadmin(conn, user_id))
-            return {"user_id": user_id, "role": "superadmin"}
+            return _guard(lambda: admin.grant_superadmin(
+                conn, p, user_id=user_id))
 
     class RevokeSuper(BaseModel):
         demote_to: str = "user"
 
-    @app.post("/admin/users/{user_id}/revoke-superadmin",
-              dependencies=[Depends(require_superadmin)])
-    def admin_revoke_superadmin(user_id: str, req: RevokeSuper):
+    @app.post("/admin/users/{user_id}/revoke-superadmin")
+    def admin_revoke_superadmin(user_id: str, req: RevokeSuper,
+                                p=Depends(principal)):
         with pool.connection() as conn:
-            try:
-                identity.revoke_superadmin(conn, user_id, demote_to=req.demote_to)
-            except identity.AuthError as e:      # anti-lockout: last superadmin
-                raise HTTPException(409, str(e))
-            except (identity.SpaceNotFound, KeyError):
-                raise HTTPException(404, "no such user")
-            except ValueError as e:
-                raise HTTPException(422, str(e))
-            return {"user_id": user_id, "role": req.demote_to}
+            return _guard(lambda: admin.revoke_superadmin(
+                conn, p, user_id=user_id, demote_to=req.demote_to))
 
     return app
 
