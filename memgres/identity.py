@@ -10,10 +10,12 @@ Two orthogonal axes (never conflate them):
 * **isolate** between accounts → the **namespace**.
 
 Addressing a space is **id-canonical**: ``namespace.id`` is the unambiguous
-address (memberships, ``memory.namespace`` all use it). A *name* is a convenience
-that resolves **only against the caller's own** namespaces (``UNIQUE(owner,
-name)`` ⇒ no ambiguity); a shared space is reached by id. See
-``resolve_space``.
+address (memberships, ``memory.namespace`` all use it). A *name* is a
+convenience that resolves against every namespace the caller can reach — their
+own and any shared with them — plus their own aliases. Since names are unique
+only per owner, two reachable spaces can carry one name; that is refused when
+addressed, and settled with an alias. See ``resolve_space`` and
+``_resolve_name``.
 
 This module is pure DB logic over a psycopg connection — no HTTP, no MCP. The
 :class:`~memgres.store.Store` (v0.2, phase 3) calls into it to authenticate and
@@ -231,7 +233,8 @@ def ensure_user_for_token(conn, principal: Principal) -> str:
     return principal.user_id
 
 
-# ─── space resolution (id-canonical; name = own-only convenience) ────────────
+# ─── space resolution (id-canonical; a name is a convenience, and may be an
+#     alias — see _resolve_name) ─────────────────────────────────────────────
 def _reach(cur, user_id: str, namespace_id: str) -> Optional[str]:
     """The caller's effective permission on a namespace, or None if unreachable."""
     cur.execute("SELECT owner_user_id FROM namespace WHERE id=%s", (namespace_id,))
@@ -401,11 +404,11 @@ def resolve_spaces(conn, principal: Principal, *, space=None,
     Returns ``[(namespace_id, effective_permission), …]`` — deduped, in the order
     the caller named them (or creation order for ``all``).
 
-    * ``space`` — an own-namespace name, a list of them, or the keyword ``"all"``
-      (every namespace the caller reaches).
-    * ``space_id`` — a reachable namespace id or a list of them. Shared namespaces
-      have no resolvable name (see :func:`resolve_space`), so this is the only way
-      to name one. ``space`` and ``space_id`` may be combined.
+    * ``space`` — a namespace name or your alias for one, a list of them, or the
+      keyword ``"all"`` (every namespace the caller reaches).
+    * ``space_id`` — a reachable namespace id or a list of them; always
+      unambiguous, and the only address left when one name means two spaces.
+      ``space`` and ``space_id`` may be combined.
     * neither — one reachable namespace is used silently; SEVERAL is an error.
 
     That last rule is the one difference from :func:`resolve_space`, and it is

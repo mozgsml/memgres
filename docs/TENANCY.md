@@ -58,9 +58,9 @@ A `superadmin`'s data access is capped by its token ceiling like anyone's; a
 ## Addressing a space
 
 A namespace **id** (a uuid) is the canonical, unambiguous address. A **name** is
-a convenience that resolves **only among your own** namespaces — so a name can
-never collide with a namespace someone shared with you (that one is reached by
-id). In practice:
+a convenience: it resolves against every namespace you can reach, plus your own
+aliases. Names are unique only per owner, so two reachable spaces can carry one
+name — see below. In practice:
 
 - by **name** → `space="notes"`: your alias for a space, or any space you reach
   that carries that name;

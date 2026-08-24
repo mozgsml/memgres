@@ -159,6 +159,34 @@ def test_a_line_range_past_the_end_returns_what_exists(store):
     assert store.get(None, m.id, lines="40-80").body == ""
 
 
+def test_an_absurd_line_range_costs_nothing(store):
+    """`lines="1-50000000"` on a ten-line memory used to build fifty million
+    integers before anything looked at the body: 4.3 GB and 3.4 seconds, from one
+    request, to return ten numbers. The range is clipped to the body BEFORE it is
+    expanded."""
+    import resource
+    import time
+
+    m = store.write(body="".join(f"line {i}\n" for i in range(1, 11)))
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    t = time.time()
+    part = store.get(None, m.id, lines="1-50000000")
+    assert part.total_lines == 10 and part.lines == [1, 10]
+    assert time.time() - t < 1.0
+    grew_mb = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before) / 1024
+    assert grew_mb < 100, f"grew {grew_mb:.0f}MB"
+
+
+def test_a_selector_too_large_to_clip_is_refused(store):
+    """Without a body to clip against — blame passes none — an impossible
+    selector is refused rather than trimmed to the first hundred thousand, which
+    would look like an answer."""
+    with pytest.raises(ValueError):
+        parse_line_spec("1-50000000")
+    with pytest.raises(ValueError):
+        parse_line_spec(",".join(str(i) for i in range(1, 100_003)))
+
+
 def test_the_line_parser_is_shared_and_forgiving():
     assert parse_line_spec(None) is None
     assert parse_line_spec("2") == [2]
