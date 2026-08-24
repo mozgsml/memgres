@@ -221,6 +221,25 @@ patch = fixes).
   — and it cannot be reconstructed: after several moves the current shape of the
   tree does not determine the addresses a node held before.
 
+- **A namespace cannot be created with a name one of the owner's aliases already
+  claims.** The rule existed on the self-service door and was missing from the
+  two admin-side ones, so an admin provisioning you a `private` namespace while
+  you had an alias of that name left every `space="private"` write landing in the
+  *aliased* space — which someone else can read — with a 200 and no warning. It
+  now lives at the single point all three funnel through.
+- **A read-only token cannot create a namespace**, and one account cannot own an
+  unbounded number of them. In `open` mode a never-registered token materializes
+  its own account, so the new `POST /spaces` was otherwise a free INSERT loop for
+  anyone able to generate tokens.
+- **A partial read reports the contiguous runs it actually returned**, not first
+  and last: `lines=1,5` reporting `[1, 5]` reads as "one through five". A
+  selection matching nothing is an error rather than an empty body wearing
+  `partial: true`.
+- `email` is unique but **not verified**: anyone who may provision users can set
+  any address on a plain-user account, so an address can be claimed before its
+  owner has one. Harmless while email is a label; whatever adds email login must
+  add ownership verification in the same change.
+
 ### Known, deliberately not changed here
 - **`space="all"` means "every namespace you are a member of"**, which for a
   *superadmin* — who reaches any namespace by id — is less than the credential
