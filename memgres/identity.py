@@ -246,18 +246,70 @@ def _reach(cur, user_id: str, namespace_id: str) -> Optional[str]:
     return m[0] if m else None
 
 
+def _resolve_name(cur, uid: str, name: str) -> str:
+    """A name to a namespace id, or an error explaining which name it was.
+
+    Names come from two places and are checked in that order:
+
+    * **your alias** — a label you set yourself;
+    * **any namespace you reach that carries this name** — your own, or one
+      shared with you.
+
+    The alias wins, and only ever against the second kind. Every collision you
+    could cause yourself is refused when you create it (see ``create_alias``),
+    so the one that survives is the one someone ELSE causes by sharing a
+    namespace whose name matches your alias — and there your own deliberate
+    label should not be broken by a stranger's act.
+
+    Two shared namespaces of the same name are genuinely ambiguous: nobody chose
+    that, so it is refused with both candidates named, and you settle it by
+    giving them aliases.
+    """
+    cur.execute("SELECT namespace_id FROM namespace_alias "
+                "WHERE user_id=%s AND alias=%s", (uid, name))
+    row = cur.fetchone()
+    if row is not None:
+        return str(row[0])
+
+    cur.execute(
+        "SELECT n.id, NULLIF(u.name, '') FROM namespace n "
+        "JOIN app_user u ON u.id = n.owner_user_id "
+        "LEFT JOIN namespace_member m ON m.namespace_id=n.id AND m.user_id=%(u)s "
+        "WHERE n.name=%(name)s AND (n.owner_user_id=%(u)s OR m.user_id=%(u)s)",
+        {"u": uid, "name": name})
+    rows = cur.fetchall()
+    if len(rows) == 1:
+        return str(rows[0][0])
+    if not rows:
+        raise SpaceNotFound(
+            f"you can reach no namespace named '{name}' — create one, ask for "
+            f"access to it, or address it by `space_id`")
+    owners = ", ".join(f"{nid} (owner: {owner or 'unnamed'})" for nid, owner in rows)
+    raise SpaceAmbiguous(
+        f"'{name}' means {len(rows)} different namespaces you can reach: "
+        f"{owners}. Give them aliases and use those, or address one by `space_id`")
+
+
 def resolve_space(conn, principal: Principal, *, space_id: Optional[str] = None,
                   space: Optional[str] = None,
                   for_write: bool = False) -> Tuple[str, str]:
     """Resolve an address to ``(namespace_id, effective_permission)``.
 
     * ``space_id`` — canonical; any reachable space (owned or shared).
-    * ``space`` (name) — resolved **only among the caller's own** namespaces.
-    * neither — the default namespace (token scope > user default > lazy).
+    * ``space`` — a name: your alias, or a namespace you reach that carries it
+      (see :func:`_resolve_name`).
+    * neither — your token's scope, or your single reachable namespace. Several
+      reachable and none named is an error.
 
-    ``for_write=True`` allows lazy creation (of the user, a named space, or the
-    default). Reads never create. The returned permission is the token ceiling
-    min the caller's membership; the caller enforces it against the op needed.
+    **Nothing is created here.** Addressing a namespace that does not exist used
+    to bring one into being — a name typed slightly wrong produced a new, empty,
+    plausible-looking space and the write landed in it. Creating a namespace is
+    now something you ask for (``create_own_namespace``), so a typo is an error
+    instead of a place. ``for_write`` still materializes an open-mode user on
+    first write; that is a user row, not a namespace.
+
+    The returned permission is the token ceiling min the caller's membership; the
+    caller enforces it against the op needed.
     """
     if principal.is_admin and principal.user_id is None:
         # env break-glass root: anonymous, addresses only by id
@@ -290,71 +342,35 @@ def resolve_space(conn, principal: Principal, *, space_id: Optional[str] = None,
                 raise SpaceNotFound(f"namespace {space_id} not reachable")
             return str(space_id), perm_min(perm, ceiling)
 
-        # 2) by name — own namespaces only (no ambiguity with shared ones)
+        # 2) by name — your alias, else any reachable namespace of that name
         if space is not None:
-            cur.execute("SELECT id FROM namespace WHERE owner_user_id=%s AND name=%s",
-                        (uid, space))
-            row = cur.fetchone()
-            if row is not None:
-                _scoped_ok(row[0])
-                return str(row[0]), perm_min("admin", ceiling)
-            if for_write:
-                if scope is not None:
-                    raise AuthError("a scoped token cannot create a new namespace")
-                if not can_create_namespace(conn, principal):
-                    raise AuthError(
-                        f"you own no namespace named '{space}' and may not "
-                        "create one — ask an admin to create it or share it")
-                nsid = create_namespace(conn, uid, space)
-                return nsid, perm_min("admin", ceiling)
-            raise SpaceNotFound(f"you own no namespace named '{space}'")
+            nsid = _resolve_name(cur, uid, space)
+            _scoped_ok(nsid)
+            perm = _reach(cur, uid, nsid)
+            if perm is None:                      # alias to something since lost
+                raise SpaceNotFound(f"'{space}' is no longer reachable")
+            return nsid, perm_min(perm, ceiling)
 
-        # 3) default resolution
+        # 3) nothing named. A scoped token has already said where it works; one
+        #    reachable namespace leaves nothing to choose. Beyond that, silence
+        #    is a guess, and a guess about where data goes is the expensive kind.
         if scope is not None:
-            # a scoped token resolves to its namespace — but only if the user can
-            # actually reach it. Never default an unreachable scope to "read"
-            # (that would leak a namespace the token was wrongly scoped to).
             perm = _reach(cur, uid, scope)
             if perm is None:
                 raise SpaceNotFound(f"token scope {scope} not reachable")
             return scope, perm_min(perm, ceiling)
-        cur.execute("SELECT default_namespace_id FROM app_user WHERE id=%s", (uid,))
-        row = cur.fetchone()
-        if row and row[0]:
-            # A default is a PREFERENCE among the namespaces you can reach, never
-            # a grant. Returning it unchecked made the pointer itself an
-            # authority: anyone who could set it — a user_manager provisioning a
-            # fresh account, say — could aim a user at any namespace on the
-            # deployment and hand them admin over data they have no membership
-            # in, erasure included. A default that no longer resolves (namespace
-            # deleted, membership revoked) is ignored rather than fatal, so a
-            # stale pointer degrades to "unset" instead of bricking the account.
-            perm = _reach(cur, uid, str(row[0]))
-            if perm is not None:
-                return str(row[0]), perm_min(perm, ceiling)
 
-        # No default set. Strictness scales with how much there is to get wrong:
-        # with one reachable namespace there is nothing to choose, so silence is
-        # safe. With several, a guess is a misfile — and once public and private
-        # spaces sit side by side, the wrong guess is the expensive one. So say
-        # so, and name the candidates rather than making the caller go looking.
-        reachable = list_spaces(conn, uid)
-        if len(reachable) == 1:
-            only = reachable[0]
-            return only["id"], perm_min(only["permission"], ceiling)
-        if len(reachable) > 1:
-            names = ", ".join(sorted(s["name"] for s in reachable))
-            raise SpaceAmbiguous(
-                f"you can reach {len(reachable)} namespaces ({names}) — name the "
-                "one you mean with `space`")
-        if for_write:
-            if not can_create_namespace(conn, principal):
-                raise AuthError(
-                    "you have no namespace and may not create one — ask an "
-                    "admin to create one for you or share theirs")
-            nsid = ensure_default_namespace(conn, uid)
-            return nsid, perm_min("admin", ceiling)
-        raise SpaceNotFound("user has no default namespace yet")
+    reachable = list_spaces(conn, uid)
+    if len(reachable) == 1:
+        only = reachable[0]
+        return only["id"], perm_min(only["permission"], ceiling)
+    if len(reachable) > 1:
+        names = ", ".join(sorted(s["name"] for s in reachable))
+        raise SpaceAmbiguous(
+            f"you can reach {len(reachable)} namespaces ({names}) — name the "
+            "one you mean with `space`")
+    raise SpaceNotFound(
+        "you can reach no namespaces yet — create one, or ask for access to one")
 
 
 ALL_SPACES = "all"
@@ -515,7 +531,7 @@ def list_users(conn, *, role: Optional[str] = None, limit: Optional[int] = None,
     """
     if role is not None and role not in SERVICE_ROLES:
         raise ValueError(f"bad role: {role}")
-    sql = ("SELECT id, name, description, role, default_namespace_id, "
+    sql = ("SELECT id, name, description, role, "
            "can_create_namespace, created_at FROM app_user")
     args: list = []
     if role is not None:
@@ -528,7 +544,7 @@ def list_users(conn, *, role: Optional[str] = None, limit: Optional[int] = None,
     if offset:
         sql += " OFFSET %s"
         args.append(offset)
-    cols = ["id", "name", "description", "role", "default_namespace_id",
+    cols = ["id", "name", "description", "role",
             "can_create_namespace", "created_at"]
     with conn.cursor() as cur:
         cur.execute(sql, args)
@@ -536,8 +552,6 @@ def list_users(conn, *, role: Optional[str] = None, limit: Optional[int] = None,
         for r in cur.fetchall():
             d = dict(zip(cols, r))
             d["id"] = str(d["id"])
-            d["default_namespace_id"] = (str(d["default_namespace_id"])
-                                         if d["default_namespace_id"] else None)
             out.append(d)
         return out
 
@@ -614,22 +628,88 @@ def create_namespace(conn, owner_user_id: str, name: str, *,
         return str(cur.fetchone()[0])
 
 
-def ensure_default_namespace(conn, user_id: str, name: str = "default") -> str:
-    """Return the user's default namespace, creating one named ``name`` if unset."""
+def create_alias(conn, user_id: str, alias: str, namespace_id: str) -> None:
+    """Give a namespace a name of your own.
+
+    Two guards, and each refuses a collision YOU would be creating:
+
+    * the target must already be reachable — otherwise an alias would be a grant
+      that walks past membership, which is exactly what the default namespace
+      turned out to be;
+    * the name must not already resolve for you — an alias that shadows a
+      working name silently changes where existing calls land.
+
+    The collision it cannot prevent is the one a stranger makes by sharing a
+    namespace named like your alias. That one resolves in your favour (see
+    ``_resolve_name``), because your deliberate label should outlive someone
+    else's naming.
+    """
     with conn.cursor() as cur:
-        cur.execute("SELECT default_namespace_id FROM app_user WHERE id=%s", (user_id,))
-        row = cur.fetchone()
-        if row and row[0]:
-            return str(row[0])
-    nsid = create_namespace(conn, user_id, name)
-    set_default_space(conn, user_id, nsid)
-    return nsid
+        if _reach(cur, user_id, namespace_id) is None:
+            raise SpaceNotFound(
+                f"namespace {namespace_id} is not reachable — an alias names a "
+                "space you already have, it does not grant one")
+        try:
+            existing = _resolve_name(cur, user_id, alias)
+        except (SpaceNotFound, SpaceAmbiguous):
+            existing = None
+        if existing is not None:
+            raise SpaceAmbiguous(
+                f"'{alias}' already resolves for you (namespace {existing}) — "
+                "pick another alias, or drop the existing one first")
+        cur.execute(
+            "INSERT INTO namespace_alias (user_id, alias, namespace_id) "
+            "VALUES (%s, %s, %s)", (user_id, alias, namespace_id))
 
 
-def set_default_space(conn, user_id: str, namespace_id: str) -> None:
+def drop_alias(conn, user_id: str, alias: str) -> bool:
     with conn.cursor() as cur:
-        cur.execute("UPDATE app_user SET default_namespace_id=%s WHERE id=%s",
-                    (namespace_id, user_id))
+        cur.execute("DELETE FROM namespace_alias WHERE user_id=%s AND alias=%s",
+                    (user_id, alias))
+        return cur.rowcount > 0
+
+
+def list_aliases(conn, user_id: str) -> dict:
+    """``{namespace_id: alias}`` for this user."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT namespace_id, alias FROM namespace_alias "
+                    "WHERE user_id=%s", (user_id,))
+        return {str(nid): a for nid, a in cur.fetchall()}
+
+
+def create_own_namespace(conn, principal: Principal, name: str, *,
+                         description: str = "", instruction: str = "") -> str:
+    """Create a namespace for the caller — the explicit door that replaced lazy
+    creation.
+
+    Addressing a namespace that did not exist used to create it, so a mistyped
+    name produced a new empty space and the write landed there, looking like it
+    had worked. Creation is now something you ask for, which makes a typo an
+    error rather than a place — and gives the `can_create_namespace` right a
+    single point to be enforced at.
+    """
+    if principal.user_id is None:
+        if not principal.provisional:
+            raise AuthError("this token has no owning user")
+        # open mode: a token that has never written has no user row yet, and
+        # this is now the FIRST thing such a caller does — lazy creation used to
+        # materialize them on the way past. Without this a fresh token could
+        # never create the namespace it is being told to create.
+        ensure_user_for_token(conn, principal)
+    if principal.scope_namespace_id is not None:
+        raise AuthError("a scoped token cannot create a namespace")
+    if not can_create_namespace(conn, principal):
+        raise AuthError("you may not create namespaces — ask an admin to create "
+                        "one for you or share theirs")
+    with conn.cursor() as cur:
+        cur.execute("SELECT namespace_id FROM namespace_alias "
+                    "WHERE user_id=%s AND alias=%s", (principal.user_id, name))
+        if cur.fetchone() is not None:
+            raise SpaceAmbiguous(
+                f"'{name}' is one of your aliases — the new namespace could not "
+                "be addressed by its own name. Drop the alias or choose another name")
+    return create_namespace(conn, principal.user_id, name,
+                            description=description, instruction=instruction)
 
 
 def add_member(conn, namespace_id: str, user_id: str, permission: str = "read") -> None:
@@ -659,10 +739,8 @@ def edit_namespace(conn, namespace_id: str, *, description: Optional[str] = None
 
 def list_spaces(conn, user_id: str) -> List[dict]:
     """Every namespace the user can reach: owned + shared, with flags."""
+    aliases = list_aliases(conn, user_id)
     with conn.cursor() as cur:
-        cur.execute("SELECT default_namespace_id FROM app_user WHERE id=%s", (user_id,))
-        r = cur.fetchone()
-        default = str(r[0]) if r and r[0] else None
         cur.execute(
             "SELECT n.id, n.name, n.description, n.instruction, n.owner_user_id, "
             "       CASE WHEN n.owner_user_id=%(u)s THEN 'admin' ELSE m.permission END "
@@ -676,7 +754,10 @@ def list_spaces(conn, user_id: str) -> List[dict]:
                 "id": str(nid), "name": name, "description": desc,
                 "instruction": instr, "permission": perm,
                 "mine": str(owner) == user_id,
-                "is_default": str(nid) == default,
+                # what to type for this space: your alias if you gave it one,
+                # else its name — which may not be unique among what you reach,
+                # hence the alias in the first place.
+                "alias": aliases.get(str(nid)),
             })
         return out
 

@@ -463,6 +463,8 @@ def test_default_token_from_config(monkeypatch):
     monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
     cfg = load(); conn = psycopg.connect(DSN); migrate(conn, cfg)
     s = Store(cfg, conn=conn)
+    from memgres import identity as ident
+    ident.create_own_namespace(conn, ident.resolve(conn, cfg, default_tok), "mine")
     # no token passed -> falls back to MEMGRES_TOKEN, so writes/reads work
     m = s.write(None, body="via default token\n")
     assert s.get(None, m.id).body == "via default token\n"

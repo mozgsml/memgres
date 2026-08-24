@@ -205,9 +205,15 @@ def test_identity_open_mode_over_http(monkeypatch):
     with TestClient(app) as client:
         # no token -> 401
         assert client.post("/memories", json={"body": "x\n"}).status_code == 401
-        # alice writes into a named space (lazily created)
         ha = {"Authorization": f"Bearer {alice}"}
         hb = {"Authorization": f"Bearer {bob}"}
+        # naming a space that does not exist is an error, not a new space
+        assert client.post("/memories",
+                           json={"body": "alice secret\n", "space": "vault"},
+                           headers=ha).status_code == 404
+        # so alice asks for it, then writes
+        assert client.post("/spaces", json={"name": "vault"},
+                           headers=ha).status_code == 201
         r = client.post("/memories", json={"body": "alice secret\n", "space": "vault"},
                         headers=ha)
         assert r.status_code == 201
@@ -220,7 +226,9 @@ def test_identity_open_mode_over_http(monkeypatch):
         # /spaces lists alice's vault
         spaces = client.get("/spaces", headers=ha).json()
         assert [s["name"] for s in spaces] == ["vault"]
-        # bob writes into his own default space
+        # bob makes his own space and writes there
+        assert client.post("/spaces", json={"name": "bobs"},
+                           headers=hb).status_code == 201
         assert client.post("/memories", json={"body": "bob note\n"},
                            headers=hb).status_code == 201
         # recall is scoped: bob sees his note but never alice's secret
@@ -314,6 +322,8 @@ def test_recall_over_several_namespaces(monkeypatch):
     h = {"Authorization": f"Bearer {tok}"}
     with TestClient(app) as client:
         for space in ("work", "home", "spare"):
+            assert client.post("/spaces", json={"name": space},
+                               headers=h).status_code == 201
             assert client.post("/memories",
                                json={"body": f"apple in {space}\n", "space": space},
                                headers=h).status_code == 201
@@ -407,3 +417,59 @@ def test_a_hyphenated_path_is_still_a_path(client):
     mid2 = client.post("/memories", json={"body": "unicode\n",
                                           "path": "ops.тариф"}).json()["id"]
     assert client.get("/memories/ops.тариф").json()["id"] == mid2
+
+
+def test_creating_spaces_and_aliasing_them_over_http(monkeypatch):
+    """The explicit door that replaced lazy creation, and the alias that settles
+    a name two people both used."""
+    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    for k in list(os.environ):
+        if k.startswith("MEMGRES_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
+    monkeypatch.setenv("MEMGRES_KEY_MODE", "open")
+    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
+    monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
+    from memgres import identity
+
+    app = create_app(load())
+    alice, bob = identity.new_token(), identity.new_token()
+    with TestClient(app) as client:
+        ha = {"Authorization": f"Bearer {alice}"}
+        hb = {"Authorization": f"Bearer {bob}"}
+        a_ns = client.post("/spaces", json={"name": "notes"},
+                           headers=ha).json()["id"]
+        b_ns = client.post("/spaces", json={"name": "notes"},
+                           headers=hb).json()["id"]
+        # each owns a 'notes'; unshared, the name is unambiguous for each
+        assert client.post("/memories", json={"body": "mine\n", "space": "notes"},
+                           headers=ha).status_code == 201
+
+        # bob shares his with alice, and now the bare name means two things
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            identity.add_member(conn, b_ns, _owner_of(a_ns), "read")
+        r = client.get("/recall", params={"q": "mine", "space": "notes"}, headers=ha)
+        assert r.status_code == 422 and a_ns in r.text and b_ns in r.text
+
+        # an alias settles it, and grants nothing that wasn't already reachable
+        assert client.post("/spaces/aliases",
+                           json={"alias": "bobs", "space_id": b_ns},
+                           headers=ha).status_code == 201
+        assert client.get("/recall", params={"q": "anything", "space": "bobs"},
+                          headers=ha).status_code == 200
+        # the alias shows up as what to type for that space
+        spaces = {s["id"]: s for s in client.get("/spaces", headers=ha).json()}
+        assert spaces[b_ns]["alias"] == "bobs" and spaces[a_ns]["alias"] is None
+
+        # dropping it puts the ambiguity back — the namespace itself is untouched
+        assert client.delete("/spaces/aliases/bobs", headers=ha).status_code == 204
+        assert client.get("/recall", params={"q": "mine", "space": "notes"},
+                          headers=ha).status_code == 422
+
+
+def _owner_of(namespace_id: str) -> str:
+    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("SELECT owner_user_id FROM namespace WHERE id=%s",
+                    (namespace_id,))
+        return str(cur.fetchone()[0])

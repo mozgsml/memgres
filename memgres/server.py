@@ -349,6 +349,43 @@ def create_app(cfg: Optional[Config] = None):
             return _guard(lambda: admin.list_spaces(
                 conn, identity.resolve(conn, cfg, tok)))
 
+    class NewSpace(BaseModel):
+        name: str
+        description: str = ""
+        instruction: str = ""
+
+    class NewAlias(BaseModel):
+        alias: str
+        space_id: str
+
+    @app.post("/spaces", status_code=201)
+    def create_space(req: NewSpace, tok: Optional[str] = Depends(token)):
+        """Create a namespace of your own. Nothing creates one implicitly, so a
+        mistyped `space` is an error rather than a new empty space a write
+        silently lands in."""
+        with pool.connection() as conn, conn.transaction():
+            nsid = _guard(lambda: identity.create_own_namespace(
+                conn, identity.resolve(conn, cfg, tok), req.name,
+                description=req.description, instruction=req.instruction))
+        return {"id": nsid, "name": req.name}
+
+    @app.post("/spaces/aliases", status_code=201)
+    def set_alias(req: NewAlias, tok: Optional[str] = Depends(token)):
+        """Name a reachable namespace for yourself, for when a bare name is
+        ambiguous. Private to you, and grants nothing."""
+        with pool.connection() as conn, conn.transaction():
+            p = identity.resolve(conn, cfg, tok)
+            _guard(lambda: identity.create_alias(
+                conn, p.user_id, req.alias, req.space_id))
+        return {"alias": req.alias, "space_id": req.space_id}
+
+    @app.delete("/spaces/aliases/{alias}", status_code=204)
+    def drop_alias(alias: str, tok: Optional[str] = Depends(token)):
+        with pool.connection() as conn, conn.transaction():
+            p = identity.resolve(conn, cfg, tok)
+            if not _guard(lambda: identity.drop_alias(conn, p.user_id, alias)):
+                raise HTTPException(404, "not found")
+
     # ─── request-access: ask to join a namespace, owner approves ────────────
     class RequestBody(BaseModel):
         permission: str = "read"
@@ -482,9 +519,6 @@ def create_app(cfg: Optional[Config] = None):
     class SetRole(BaseModel):
         role: str
 
-    class DefaultSpace(BaseModel):
-        namespace_id: str
-
     class EditNamespace(BaseModel):
         description: Optional[str] = None
         instruction: Optional[str] = None
@@ -504,13 +538,6 @@ def create_app(cfg: Optional[Config] = None):
         with pool.connection() as conn:
             return _guard(lambda: admin.set_role(conn, p, user_id=user_id,
                                                  role=req.role))
-
-    @app.post("/admin/users/{user_id}/default-space")
-    def admin_set_default_space(user_id: str, req: DefaultSpace,
-                                p=Depends(principal)):
-        with pool.connection() as conn:
-            return _guard(lambda: admin.set_default_space(
-                conn, p, user_id=user_id, namespace_id=req.namespace_id))
 
     @app.get("/admin/namespaces")
     def admin_list_namespaces(owner_user_id: Optional[str] = None,

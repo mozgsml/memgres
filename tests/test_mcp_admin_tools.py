@@ -107,14 +107,15 @@ def test_provisioning_end_to_end(box):
     uid = _call(mcp, "memory_admin_create_user", name="ada", token=root)["id"]
     nsid = _call(mcp, "memory_admin_create_namespace", name="sales",
                  owner_user_id=uid, instruction="deals only", token=root)["id"]
-    _call(mcp, "memory_admin_set_default_space", user_id=uid, space_id=nsid,
+    _call(mcp, "memory_admin_edit_namespace", space_id=nsid,
+          description="provisioned in this test",
           token=root)
     minted = _call(mcp, "memory_admin_issue_token", user_id=uid,
                    permission="write", label="agent", token=root)
 
     # the directory reflects all of it
     users = _call(mcp, "memory_admin_list_users", token=root)
-    assert [u for u in users if u["id"] == uid][0]["default_namespace_id"] == nsid
+    assert [u for u in users if u["id"] == uid][0]["name"] == "ada"
     assert [n["name"] for n in
             _call(mcp, "memory_admin_list_namespaces", token=root)] == ["sales"]
 
@@ -128,7 +129,8 @@ def test_provisioning_end_to_end(box):
           token=minted["token"])
     got = _call(mcp, "memory_list", path_prefix="deals", token=minted["token"])
     assert [m["path"] for m in got] == ["deals.acme"]
-    # it landed in the provisioned namespace, not in a lazily-created one
+    # it landed in the ONE namespace it was provisioned into — the write named
+    # no space, and with exactly one reachable there is nothing to choose
     assert [s["name"] for s in _call(mcp, "memory_list_spaces",
                                      token=minted["token"])] == ["sales"]
 
@@ -151,7 +153,6 @@ def _matrix(uid: str, nsid: str, token_id: str) -> dict:
         "memory_admin_list_namespaces": {},
         "memory_admin_create_namespace": {"name": "nope", "owner_user_id": uid},
         "memory_admin_edit_namespace": {"space_id": nsid, "description": "x"},
-        "memory_admin_set_default_space": {"user_id": uid, "space_id": nsid},
         "memory_admin_add_member": {"space_id": nsid, "user_id": uid},
         "memory_admin_list_members": {"space_id": nsid},
         "memory_admin_issue_token": {"user_id": uid},

@@ -5,8 +5,8 @@ past what they reach). This file covers the CONTRACT the honest caller sees:
 when naming a namespace is optional, when it is required, what `all` means, and
 what each hit says about where it came from.
 
-The rule under test, in one sentence: a write with no address may fall back on
-your declared default, but a read may not — searching one of your four
+The rule under test, in one sentence: exactly one reachable namespace resolves
+on its own, and beyond that you say which — because searching one of your four
 namespaces and reporting "nothing found" is a partial answer wearing the clothes
 of a complete one.
 """
@@ -100,21 +100,6 @@ def test_several_namespaces_require_an_address(env):
             call()
 
 
-def test_a_declared_default_does_not_silence_a_search(env):
-    """A default namespace answers "where do I file this", not "where should I
-    look" — the search still has to be told, or it would quietly skip the rest."""
-    setup, s = env
-    uid, tok, ids = _owner(setup, "defaulted", "work", "home")
-    ident.set_default_space(setup, uid, ids[0])
-
-    # the write happily uses the default …
-    s.write(tok, body="filed by default\n")
-    assert len(s.list(tok, space="work")) == 1
-    # … the read does not
-    with pytest.raises(SpaceAmbiguous):
-        s.recall(tok, "filed")
-
-
 # ─── naming them ─────────────────────────────────────────────────────────────
 def test_all_covers_every_reachable_namespace(env):
     setup, s = env
@@ -138,8 +123,9 @@ def test_a_list_of_names_covers_exactly_those(env):
 
 
 def test_a_shared_namespace_joins_by_id(env):
-    """Names resolve against your OWN namespaces only, so a namespace shared
-    with you is addressed by id — and the two forms combine in one search."""
+    """A shared namespace can be addressed by id, and the two forms combine in
+    one search. (It answers to its NAME too, unless that name is ambiguous for
+    you — which is what aliases are for; covered in test_identity_integration.)"""
     setup, s = env
     _, mine_tok, _ = _owner(setup, "me", "mine")
     other_uid, other_tok, other_ids = _owner(setup, "them", "theirs")

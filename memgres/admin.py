@@ -285,30 +285,6 @@ def edit_namespace(conn, p: Principal, *, namespace_id: str,
     return {"namespace_id": namespace_id}
 
 
-def set_default_space(conn, p: Principal, *, user_id: str,
-                      namespace_id: str) -> dict:
-    """Point a user at the namespace their unqualified reads and writes land in.
-
-    Creating a user and creating a namespace do not connect the two, so without
-    this a provisioned user's first write lands somewhere nobody chose.
-
-    Both halves are checked, because a default is a preference among namespaces
-    the user can already reach — not a way to give them one. The caller must
-    administer the namespace, and the target must already be able to reach it;
-    otherwise this becomes a grant that bypasses membership entirely.
-    """
-    require_manage_users(p)
-    _require_target_is_plain_user(conn, p, user_id, "setting a default namespace")
-    require_namespace_admin(conn, p, namespace_id)
-    with conn.cursor() as cur:
-        if identity._reach(cur, user_id, namespace_id) is None:
-            raise Forbidden(
-                "that user cannot reach this namespace — share it with them "
-                "first; a default namespace is a preference, not a grant")
-    identity.set_default_space(conn, user_id, namespace_id)
-    return {"user_id": user_id, "default_namespace_id": namespace_id}
-
-
 def add_member(conn, p: Principal, *, namespace_id: str, user_id: str,
                permission: str = "read") -> dict:
     """Share a namespace with another user — cross-tenant, so superadmin only."""

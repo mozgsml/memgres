@@ -34,10 +34,20 @@ CREATE TABLE IF NOT EXISTS namespace (
 CREATE INDEX IF NOT EXISTS namespace_owner_idx ON namespace (owner_user_id);
 
 -- default_namespace_id → namespace(id); SET NULL if that namespace is deleted.
+--
+-- Guarded on the column still being there, because 0011 drops it: every
+-- migration is re-applied on every start (idempotency comes from IF NOT EXISTS,
+-- not from a version ledger), so on an already-migrated database this block runs
+-- again after the column is gone. Without the guard the whole migration chain
+-- fails on the second start — which is to say, on every restart after upgrading.
 DO $$ BEGIN
-    ALTER TABLE app_user
-        ADD CONSTRAINT app_user_default_ns_fk
-        FOREIGN KEY (default_namespace_id) REFERENCES namespace(id) ON DELETE SET NULL;
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'app_user'
+                 AND column_name = 'default_namespace_id') THEN
+        ALTER TABLE app_user
+            ADD CONSTRAINT app_user_default_ns_fk
+            FOREIGN KEY (default_namespace_id) REFERENCES namespace(id) ON DELETE SET NULL;
+    END IF;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 

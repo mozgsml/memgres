@@ -410,11 +410,49 @@ def build_server(cfg: Optional[Config] = None):
     def memory_list_spaces(token: Optional[str] = None,
                            ctx: Context = None) -> List[dict]:
         """List the namespaces you can reach — your own plus any shared with you —
-        with each one's id, name, description, permission and whether it's your
-        default. Use a returned `id` as `space_id` to target a shared space; use
-        your own space's `name` as `space`."""
+        with each one's id, name, description, permission, and your `alias` for it
+        if you set one. To address one, pass its `alias` (or `name`, when that
+        name is unambiguous for you) as `space`, or its `id` as `space_id`."""
         with pool.connection() as conn, conn.transaction():
             return identity.list_spaces(conn, _uid(conn, _token(ctx, token)))
+
+    @mcp.tool()
+    def memory_create_space(name: str, description: str = "",
+                            instruction: str = "",
+                            token: Optional[str] = None,
+                            ctx: Context = None) -> dict:
+        """Create a namespace of your own. Nothing creates one implicitly, so a
+        mistyped `space` is an error rather than a new empty space your write
+        silently lands in. `description` says what belongs here and `instruction`
+        tells an agent how to use it. Needs the right to create namespaces."""
+        with pool.connection() as conn, conn.transaction():
+            nsid = identity.create_own_namespace(
+                conn, _principal(conn, _token(ctx, token)), name,
+                description=description, instruction=instruction)
+        return {"id": nsid, "name": name}
+
+    @mcp.tool()
+    def memory_set_alias(alias: str, space_id: str,
+                         token: Optional[str] = None,
+                         ctx: Context = None) -> dict:
+        """Give a namespace a name of your own, for when a bare name is ambiguous
+        — two people can each own a 'notes', and once one is shared with you the
+        name means two things. An alias is private to you and grants nothing: the
+        space must already be reachable. It is refused if the name already
+        resolves for you."""
+        with pool.connection() as conn, conn.transaction():
+            uid = _uid(conn, _token(ctx, token))
+            identity.create_alias(conn, uid, alias, space_id)
+        return {"alias": alias, "space_id": space_id}
+
+    @mcp.tool()
+    def memory_drop_alias(alias: str, token: Optional[str] = None,
+                          ctx: Context = None) -> dict:
+        """Remove one of your namespace aliases. The namespace itself is
+        untouched — an alias is only a name."""
+        with pool.connection() as conn, conn.transaction():
+            uid = _uid(conn, _token(ctx, token))
+            return {"dropped": identity.drop_alias(conn, uid, alias)}
 
     @mcp.tool()
     def memory_issue_token(permission: str = "write", space: Optional[str] = None,
@@ -588,18 +626,6 @@ def build_server(cfg: Optional[Config] = None):
                     conn, _principal(conn, _token(ctx, token)),
                     namespace_id=space_id, description=description,
                     instruction=instruction)
-
-        @mcp.tool()
-        def memory_admin_set_default_space(user_id: str, space_id: str,
-                                           token: Optional[str] = None,
-                                           ctx: Context = None) -> dict:
-            """Point a user at the namespace their unqualified reads and writes
-            land in. Creating a user and creating a namespace do not connect the
-            two — without this their first write lands nowhere you chose."""
-            with pool.connection() as conn, conn.transaction():
-                return admin.set_default_space(
-                    conn, _principal(conn, _token(ctx, token)),
-                    user_id=user_id, namespace_id=space_id)
 
         @mcp.tool()
         def memory_admin_add_member(space_id: str, user_id: str,

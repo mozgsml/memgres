@@ -208,7 +208,11 @@ def _cross_tenant_semantic_isolation(store):
     conn = store._conn
     migrate(conn, cfg)
     s = Store(cfg, embedder=store.embedder, conn=conn, backend=store._vectors)
+    from memgres import identity as ident
+
     ta, tb = new_token(), new_token()
+    for t in (ta, tb):       # open mode: each token asks for its own space
+        ident.create_own_namespace(conn, ident.resolve(conn, cfg, t), "mine")
     a = s.write(ta, body="apple secret belonging to tenant A.\n")
     b = s.write(tb, body="apple secret belonging to tenant B.\n")
     assert s._authorize(ta, need="read")[0] != s._authorize(tb, need="read")[0]
