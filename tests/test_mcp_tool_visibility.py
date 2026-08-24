@@ -138,10 +138,19 @@ def _env(monkeypatch, **extra):
 
 
 def _listed(mcp):
-    """The tool names a client actually receives, through the real handler."""
-    handler = mcp._mcp_server.request_handlers[mcp_types.ListToolsRequest]
-    result = asyncio.run(handler(None))
-    return [t.name for t in result.root.tools]
+    """The tool names a client actually receives, through the REAL handler.
+
+    Not `mcp.list_tools()` blindly: on mcp 1.x the low-level server captured the
+    bound method at construction, so calling the attribute would bypass the
+    filter and this would test nothing. Each generation is walked the way its
+    own request path walks it — which is the difference that let the feature
+    ship dead on 2.x while every local test passed on 1.x.
+    """
+    if hasattr(mcp, "_mcp_server"):                          # mcp 1.x
+        handler = mcp._mcp_server.request_handlers[mcp_types.ListToolsRequest]
+        result = asyncio.run(handler(None))
+        return [t.name for t in result.root.tools]
+    return [t.name for t in asyncio.run(mcp.list_tools())]   # mcp 2.x
 
 
 @pytest.fixture
@@ -303,6 +312,22 @@ def test_visibility_can_be_turned_off(deployment, monkeypatch):
     _env(monkeypatch, MEMGRES_ADMIN_TOKEN=root_tok, MEMGRES_ADMIN_ROLE="superadmin",
          MEMGRES_TOKEN=reader, MEMGRES_MCP_TOOL_VISIBILITY="off")
     assert "memory_write" in _listed(build_server(load()))
+
+
+def test_this_sdk_still_exposes_a_hook_the_filter_can_attach_to(deployment,
+                                                               monkeypatch):
+    """The canary for the failure that actually happened: the filter was
+    installed inside a bare `except Exception: pass`, so on an SDK that had
+    moved its internals it attached to NOTHING — every client saw every tool,
+    with no error and a green local suite (the local SDK was a generation
+    behind). An SDK that offers neither hook must be loud, not silent."""
+    root_tok, _, _ = deployment
+    _env(monkeypatch, MEMGRES_ADMIN_TOKEN=root_tok, MEMGRES_ADMIN_ROLE="superadmin",
+         MEMGRES_TOKEN=root_tok)
+    mcp = build_server(load())
+    assert hasattr(mcp, "_handle_list_tools") or hasattr(mcp, "_mcp_server"), (
+        "neither known list-tools hook is present — the visibility filter has "
+        "nothing to attach to on this SDK")
 
 
 def test_every_registered_tool_has_a_visibility_entry(deployment, monkeypatch):

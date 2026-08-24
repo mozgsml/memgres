@@ -9,6 +9,17 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Both mcp SDK generations, because they are both in the wild and their
+    # internals differ where memgres has to reach in (the tool-list hook moved
+    # between them). Running only the newest let a feature ship DEAD on 2.x:
+    # a developer machine a generation behind was green, and the guard around
+    # the hook turned "attached to nothing" into silence. `latest` is what a
+    # fresh install gets; `<2` is what an existing one is pinned to.
+    strategy:
+      fail-fast: false
+      matrix:
+        mcp: ['latest', '<2']
+    name: test (mcp ${{ matrix.mcp }})
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -32,7 +43,12 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install (no heavy local-embeddings extra)
-        run: pip install -e ".[server,mcp,qdrant]" pytest httpx
+        run: |
+          pip install -e ".[server,mcp,qdrant]" pytest httpx
+          if [ "${{ matrix.mcp }}" != "latest" ]; then
+            pip install "mcp${{ matrix.mcp }}"
+          fi
+          python -c "from importlib.metadata import version; print('mcp', version('mcp'))"
       - name: Wait for Qdrant
         run: |
           for i in $(seq 1 30); do

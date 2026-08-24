@@ -898,19 +898,45 @@ def build_server(cfg: Optional[Config] = None):
                     return None
                 return admin.capabilities(conn, p)
 
-        async def _list_visible_tools():
-            tools = await mcp.list_tools()
+        def _keep(tools):
             allowed = set(visible_tools([t.name for t in tools],
                                         _caps_for_caller(), _identity_on))
             return [t for t in tools if t.name in allowed]
 
-        # Registering over the SDK's own handler. Guarded like the schema
-        # pruning below: if a future SDK moves this, the server keeps serving
-        # the full list rather than failing to start.
-        try:
+        # Where the filter attaches differs by SDK generation, so both are
+        # written out rather than guessed at:
+        #
+        #   2.x — `_handle_list_tools` calls `self.list_tools()` when the
+        #         request arrives, so replacing that attribute is what the
+        #         request actually runs.
+        #   1.x — the low-level server captured the bound `list_tools` at
+        #         construction, so the attribute is already spoken for and the
+        #         handler has to be re-registered instead.
+        #
+        # 🔴 This used to be one `try: … except Exception: pass`. That is how the
+        # feature came to be silently DEAD on mcp 2.x — installed on nothing,
+        # every client still seeing every tool, no error anywhere. A guard that
+        # turns "this build cannot do what you configured" into silence is worse
+        # than the crash it prevents, so an unrecognised SDK now says so.
+        if hasattr(mcp, "_handle_list_tools"):              # mcp 2.x
+            _unfiltered = mcp.list_tools
+
+            async def _list_visible_tools():
+                return _keep(await _unfiltered())
+
+            mcp.list_tools = _list_visible_tools
+        elif hasattr(mcp, "_mcp_server"):                   # mcp 1.x
+            async def _list_visible_tools():
+                return _keep(await mcp.list_tools())
+
             mcp._mcp_server.list_tools()(_list_visible_tools)
-        except Exception:                                   # pragma: no cover
-            pass
+        else:                                               # pragma: no cover
+            raise RuntimeError(
+                "MEMGRES_MCP_TOOL_VISIBILITY is on, but this mcp SDK exposes "
+                "neither hook memgres knows how to filter the tool list with — "
+                "so every client would see every tool while the configuration "
+                "said otherwise. Set MEMGRES_MCP_TOOL_VISIBILITY=off to accept "
+                "that deliberately, or upgrade memgres")
 
     # Best-effort: on a pinned/single endpoint drop the (now unused) `token` arg
     # from each tool's advertised schema so the model doesn't even see it. Purely
