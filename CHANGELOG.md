@@ -49,9 +49,10 @@ patch = fixes).
   `decisions.pricing` had to search for a uuid first. `at` now takes a path
   anywhere an `id` is taken (get, write, move, forget, history, blame,
   reconstruct, verify). Over HTTP the URL segment takes either:
-  `/memories/{uuid}` or `/memories/decisions.pricing`. The two can never be
-  confused — an ltree label is `[A-Za-z0-9_]`, so a path has none of the dashes a
-  uuid always has.
+  `/memories/{uuid}` or `/memories/decisions.pricing`. The segment is read as an
+  id when it parses as a uuid and as a path otherwise — note that modern ltree
+  labels accept hyphens and non-ASCII, so `ops.rate-limits` is an ordinary path
+  and any "looks like it has a dash" shortcut would misread it.
 - **`at` and `path` are separate parameters doing separate jobs**: `at` FINDS the
   memory to act on, `path` SETS where a memory lives. Folded into one parameter,
   `write(path=P, body=B)` would have meant either "file a new memory at P" or

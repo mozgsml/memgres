@@ -344,8 +344,8 @@ def test_recall_over_several_namespaces(monkeypatch):
 
 
 def test_a_memory_is_addressable_by_path_over_http(client):
-    """The URL segment takes either address. They can't be confused: an ltree
-    label is [A-Za-z0-9_], so a path never has the dashes a uuid always has."""
+    """The URL segment takes either address, told apart by whether it parses
+    as a uuid."""
     r = client.post("/memories", json={"body": "one\n", "path": "ops.postgres"})
     assert r.status_code == 201 and r.json()["created"] is True
     mid = r.json()["id"]

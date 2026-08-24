@@ -97,8 +97,8 @@ as ambiguous rather than guessed at; address that one by `space_id`.)
 Within a namespace a memory has two addresses: its **id** (a uuid) and its
 **path** (the tree address, unique per namespace). `at` takes the path anywhere
 an `id` is taken — get, write, move, forget, history, blame. Over HTTP the URL
-segment takes either, and they cannot be confused, since an ltree label is
-`[A-Za-z0-9_]` and so a path never carries the dashes a uuid always has:
+segment takes either: it is read as an id when it parses as a uuid, and as a
+path otherwise — so hyphenated and non-ASCII paths address fine:
 
 ```bash
 curl -s $BASE/memories/decisions.pricing          # by path

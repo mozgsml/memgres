@@ -217,8 +217,9 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `GET` | `/healthz` | liveness |
 
 **`{id}` may be a memory's uuid or its tree path** (`/memories/decisions.pricing`)
-— an ltree label is `[A-Za-z0-9_]`, so a path never carries the dashes a uuid
-always has. A path that a memory has since moved away from is followed on a read
+— the segment is read as an id when it parses as a uuid, and as a path
+otherwise, so hyphenated and non-ASCII paths (`ops.rate-limits`) address fine.
+A path that a memory has since moved away from is followed on a read
 (the answer sets `moved_from`) and refused on a write, which is what stops an
 edit meant for one memory from quietly becoming a second memory beside it.
 
