@@ -70,6 +70,28 @@ def require_superadmin(p: Principal) -> Principal:
     return p
 
 
+def _require_target_is_plain_user(conn, p: Principal, user_id: Optional[str],
+                                  action: str) -> None:
+    """A user_manager may only act on accounts that carry no authority.
+
+    Provisioning is gated on the caller's role but was not gated on the
+    *target's*: a user_manager could mint itself a token for the superadmin's
+    account (instant full data root), revoke the last superadmin's token
+    (control-plane lockout, recoverable only from the database), or read an
+    admin's token metadata. The whole point of the middle tier is that it hands
+    out access without gaining it, so touching an admin account is a superadmin
+    act.
+
+    An unknown `user_id` is deliberately not an error here — it falls through to
+    the primitive, which fails on the foreign key exactly as it did before. This
+    check adds a refusal; it does not change what a bad id does.
+    """
+    if p.is_admin:
+        return
+    if identity.get_role(conn, user_id) in identity.ADMIN_ROLES:
+        raise Forbidden(f"{action} for an admin-role account requires superadmin")
+
+
 def require_namespace_admin(conn, p: Principal, namespace_id: str) -> str:
     """Per-namespace admin: effective permission (membership ∧ token ceiling).
 
@@ -160,6 +182,7 @@ def issue_token(conn, p: Principal, *, user_id: str,
     way, so the conversion belongs here.
     """
     require_manage_users(p)
+    _require_target_is_plain_user(conn, p, user_id, "issuing a token")
     expires_at = None
     if expires_days:
         expires_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=expires_days)
@@ -171,14 +194,20 @@ def issue_token(conn, p: Principal, *, user_id: str,
 
 
 def revoke_token(conn, p: Principal, *, token_id: str) -> bool:
-    """Revoke a token. False if it was already revoked or never existed."""
+    """Revoke a token. False if it was already revoked or never existed.
+
+    Addressed by token, so the target account is whoever owns it.
+    """
     require_manage_users(p)
+    _require_target_is_plain_user(conn, p, identity.token_owner(conn, token_id),
+                                  "revoking a token")
     return identity.revoke_token(conn, token_id)
 
 
 def list_tokens(conn, p: Principal, *, user_id: str) -> List[dict]:
     """A user's tokens — metadata only, never the secret."""
     require_manage_users(p)
+    _require_target_is_plain_user(conn, p, user_id, "listing tokens")
     return identity.list_tokens(conn, user_id)
 
 

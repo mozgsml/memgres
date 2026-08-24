@@ -56,7 +56,7 @@ _RANK = {"read": 1, "write": 2, "admin": 3}
 #   superadmin   — full root: read/write any namespace, grant any access,
 #                  grant/revoke roles. Principal.is_admin derives from this.
 SERVICE_ROLES = ("user", "user_manager", "superadmin")
-_ADMIN_ROLES = ("user_manager", "superadmin")
+ADMIN_ROLES = ("user_manager", "superadmin")   # roles that carry any authority
 
 
 class AuthError(PermissionError):
@@ -110,7 +110,7 @@ class Principal:
 def can_manage_users(p: "Principal") -> bool:
     """May this principal provision users / (re)issue tokens? True for a
     user_manager, a superadmin, or the env break-glass root."""
-    return p.is_admin or p.role in _ADMIN_ROLES
+    return p.is_admin or p.role in ADMIN_ROLES
 
 
 # ─── authentication ──────────────────────────────────────────────────────────
@@ -481,6 +481,18 @@ def revoke_token(conn, token_id: str) -> bool:
         cur.execute("UPDATE token SET revoked_at=now() "
                     "WHERE id=%s AND revoked_at IS NULL", (token_id,))
         return cur.rowcount > 0
+
+
+def token_owner(conn, token_id: str) -> Optional[str]:
+    """Which user a token belongs to, or None if there is no such token.
+
+    Needed to authorize an action addressed by *token* rather than by user: the
+    caller's right to touch it follows from whose token it is.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT user_id FROM token WHERE id=%s", (token_id,))
+        row = cur.fetchone()
+    return str(row[0]) if row else None
 
 
 def list_tokens(conn, user_id: str) -> List[dict]:

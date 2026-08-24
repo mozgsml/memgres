@@ -234,3 +234,44 @@ def test_rest_role_gating(managed_client):
 
     # no auth at all → 403
     assert c.post("/admin/users", json={"name": "z"}).status_code == 403
+
+
+def test_user_manager_cannot_reach_an_admin_account(managed_client):
+    """The escalation the service layer was extracted to close.
+
+    A user_manager hands out access without gaining it. Provisioning was gated
+    on the caller's role but never on the *target's*, and every one of these
+    routes takes the target as a parameter — so a manager could mint itself a
+    token for the superadmin's account and be root in one request.
+    """
+    c, admin_tok = managed_client
+    H = {"Authorization": f"Bearer {admin_tok}"}
+
+    mgr = c.post("/admin/users", json={"name": "mgr", "role": "user_manager"},
+                 headers=H).json()["id"]
+    mtok = c.post("/admin/tokens", json={"user_id": mgr, "permission": "admin"},
+                  headers=H).json()["token"]
+    Hm = {"Authorization": f"Bearer {mtok}"}
+
+    with psycopg.connect(DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM app_user WHERE role='superadmin'")
+        root = str(cur.fetchone()[0])
+    root_tokens = c.get(f"/admin/users/{root}/tokens", headers=H).json()
+
+    # the escalation: a fresh credential on the root account
+    assert c.post("/admin/tokens", json={"user_id": root, "permission": "admin"},
+                  headers=Hm).status_code == 403
+    # the lockout: destroying the only credential that can undo any of this
+    assert c.post(f"/admin/tokens/{root_tokens[0]['id']}/revoke",
+                  headers=Hm).status_code == 403
+    # not even reconnaissance
+    assert c.get(f"/admin/users/{root}/tokens", headers=Hm).status_code == 403
+
+    # plain users stay fully manageable — the refusal is targeted, not a ban on
+    # the tier, or a user_manager could no longer do its job.
+    u = c.post("/admin/users", json={"name": "u"}, headers=Hm).json()["id"]
+    issued = c.post("/admin/tokens", json={"user_id": u}, headers=Hm)
+    assert issued.status_code == 201
+    assert c.get(f"/admin/users/{u}/tokens", headers=Hm).status_code == 200
+    assert c.post(f"/admin/tokens/{issued.json()['id']}/revoke",
+                  headers=Hm).status_code == 200
