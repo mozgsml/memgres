@@ -5,6 +5,131 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.6.0] — 2026-08-24
+
+### Security
+- **A `user_manager` could mint itself a superadmin token.** `POST /admin/tokens`
+  was gated on "may manage users", but the `user_id` in the body was arbitrary and
+  token issuance never looked at the target account's role — so one request
+  against a superadmin's account returned a working data-root token. Verified
+  against the shipped code: with the new guard removed the call answers
+  `201 Created`. Two neighbours on the same gate had the same shape: `revoke_token`
+  would revoke *any* token (including the last superadmin's, locking the control
+  plane out), and `list_tokens` enumerated other people's. The rule is now written
+  once, in the service layer, and covers issue/revoke/list on both transports: a
+  `user_manager` acts only on accounts holding the plain `user` role; anything
+  touching an admin-role account requires superadmin. Not exploitable in a
+  single-user deployment; live from the first account anyone provisions.
+
+### Added
+- **The control plane is reachable over MCP.** Twelve `memory_admin_*` tools plus
+  `memory_whoami`, over the same service layer the HTTP admin routes use — so an
+  operator working through an MCP client is no longer forced onto curl. Three
+  operations had no door at all before this and now do: `set_role` (the
+  `user_manager` role was unreachable — it could be neither granted nor taken
+  away), `edit_namespace` (namespace creation is an upsert that does nothing on
+  conflict, so a typo in a namespace's `instruction` could not be corrected), and
+  `set_default_space`. Registration follows `MEMGRES_MCP_ADMIN_TOOLS=on|off|auto`;
+  `auto` registers them wherever there are identities to administer, i.e.
+  everything but `single` mode. Turning them off shortens an agent-facing tool
+  list — it is a context economy, not a security boundary, since every tool
+  authorizes when called.
+- **`whoami` reports capabilities, not a role name** (`GET /whoami`,
+  `memory_whoami`): `can_manage_users`, `can_create_namespace`, `is_admin`, the
+  token's ceiling and scope. A UI that reads a role name has to re-implement the
+  permission rules in its own code to decide what to show, and those copies drift.
+- **Searching several namespaces at once.** `space` takes a namespace name, a
+  list of names, or the keyword `"all"`; `space_id` takes ids, which remains the
+  only way to name a namespace shared *with* you, since names resolve against
+  your own. Over HTTP they are repeated query parameters (`?space=a&space=b`); a
+  single `?space=a` means exactly what it did. Every hit, `find` row and `list`
+  row now carries `space`/`space_id` saying which namespace answered.
+- **Addressing a memory by its path.** A path is unique within a namespace, so it
+  was always an address — but nothing accepted one, and callers who knew
+  `decisions.pricing` had to search for a uuid first. `at` now takes a path
+  anywhere an `id` is taken (get, write, move, forget, history, blame,
+  reconstruct, verify). Over HTTP the URL segment takes either:
+  `/memories/{uuid}` or `/memories/decisions.pricing`. The two can never be
+  confused — an ltree label is `[A-Za-z0-9_]`, so a path has none of the dashes a
+  uuid always has.
+- **`at` and `path` are separate parameters doing separate jobs**: `at` FINDS the
+  memory to act on, `path` SETS where a memory lives. Folded into one parameter,
+  `write(path=P, body=B)` would have meant either "file a new memory at P" or
+  "replace whatever is at P", distinguishable only by a flag — and the wrong
+  reading silently overwrites a memory nobody meant to touch.
+- **A write to an address a memory has moved away from is refused**, and the
+  refusal says where it went (`if_moved`, default `error`). A caller writing to a
+  stale address is working from a stale picture, and both quiet answers commit
+  them to it: edit the moved memory and the write lands somewhere they did not
+  name; create at the vacated path and they now hold two memories on one subject,
+  the second of which they will keep writing to while the first lives on
+  elsewhere — with no error at any point. `if_moved="follow"` edits it at its new
+  address; `if_moved="create"` claims the vacated path for something new. Reads
+  follow by default and set `moved_from`, because the moved memory is what the
+  reader reached for. Deletes never follow: deleting on the strength of a stale
+  address is the one mistake here that cannot be undone.
+- **`write` reports `created`** — whether the call made a new memory or edited an
+  existing one. That is the distinction a silent duplicate hides behind.
+- **`bodies=true` on a browse** returns whole bodies instead of previews, so a
+  subtree reads in one call rather than a browse plus a fetch per row. Capped in
+  total by `MEMGRES_LIST_BODIES_MAX_BYTES` (default 200 KB, reported by `/info`);
+  rows past the cap come back marked `body_omitted` rather than being dropped.
+- **Creating a namespace is a right** (`app_user.can_create_namespace`), so an
+  ordinary member can organize their own corner without also being able to
+  provision people. Existing accounts are backfilled to `true` — they had the
+  ability, and taking it away silently would break their writes.
+- Directory reads for the control plane: `list_users` (paginated, filterable by
+  role), `list_namespaces`, `list_members`, `token_owner`.
+
+### Changed
+- **A subtree move is now recorded on every node it moves.** Moving a node
+  re-addresses its whole subtree, but only the node itself got a history row:
+  every descendant's path changed silently, its `seq` never advanced, and
+  afterwards nothing could say where its old address had gone. Each descendant now
+  gets a real `move` row on its own hash chain. Consequences, all deliberate: a
+  descendant's `seq` advances and `updated_at` moves. Optimistic concurrency is
+  unaffected — it is keyed on the body's content hash, which a move does not
+  change — and no body is re-embedded.
+- Creating at an occupied path raises `PathTaken`, naming path and occupant,
+  instead of a raw unique-index violation that named neither.
+- `PathMoved` and `PathTaken` are HTTP 409, not the 422 they would inherit as
+  `ValueError`s: the request is well formed; what is stale is the caller's picture
+  of where things live.
+- The control plane moved into a service layer (`memgres/admin.py`). Both
+  transports are now adapters over it and contain no permission logic of their
+  own — which is what let the escalation above be fixed in one place rather than
+  two. HTTP keeps mapping domain errors to status codes; MCP gained that mapping
+  for free, having previously handed clients raw Postgres error text.
+- `admin.py` takes a `Principal`, never a token: authentication belongs to the
+  transport, authorization to the service. A future web login is then one more
+  authenticator producing the same `Principal`, with no change to the core.
+
+### Breaking
+- **A read that reaches several namespaces must now name one.** Previously it
+  fell back on the caller's default namespace; a write still does, because filing
+  something in your own drawer is a choice the user already made. A read cannot:
+  searching the default while three other reachable namespaces go unsearched
+  returns "nothing found", which reads as absence and is indistinguishable from an
+  answer. The error names the candidates and the `all` keyword. Only affects a
+  caller with a default *and* more than one reachable namespace.
+- **A user with no namespace and no right to create one is refused**, with an
+  explanation, instead of silently getting a second namespace called `default`.
+  This is the provisioning bug that made every freshly-provisioned account
+  unusable: `create_user` + `create_namespace` never set `default_namespace_id`,
+  so the account's first read failed and its first write quietly created a
+  namespace nobody had asked for. In `open` mode, where accounts materialize
+  themselves and there is no admin to ask, the right is granted on creation.
+- **An admin-ceiling token is no longer accepted unscoped** on either transport,
+  symmetrically. (The idea of making MCP stricter than HTTP was dropped: it was
+  argued from a private-network topology that is our deployment, not a rule.)
+- Recall hits, `find` rows and `list` rows carry two new keys (`space`,
+  `space_id`); `list` rows in `bodies` mode carry `body`/`body_omitted` in place
+  of `preview`. Anything asserting an exact key set will notice.
+- Redirect resolution only knows about moves recorded from this version on.
+  Subtrees moved by an earlier version left no trail — the bulk update wrote none
+  — and it cannot be reconstructed: after several moves the current shape of the
+  tree does not determine the addresses a node held before.
+
 ## [0.5.2] — 2026-08-24
 
 ### Fixed

@@ -184,6 +184,8 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_FULL_BODY` | `false` | force the whole body on every hit (off = auto: short whole, long sliced); `full_body` per call overrides |
 | `MEMGRES_FULL_BODY_MAX_CHARS` | `500` | a body this short is returned whole (`kind="full"`) instead of sliced |
 | `MEMGRES_LIST_PREVIEW_CHARS` | `120` | first-line preview length returned by `memory_list` |
+| `MEMGRES_LIST_BODIES_MAX_BYTES` | `200000` | total body bytes one `bodies=true` browse returns; rows past the cap come back marked `body_omitted`, never dropped |
+| `MEMGRES_MCP_ADMIN_TOOLS` | `auto` | register the `memory_admin_*` control-plane tools over MCP; `auto` = every mode but `single`. A context economy, not a security boundary — each tool authorizes on call |
 | `MEMGRES_INSTRUCTION` | — | server-side MCP instructions emitted at `initialize` (a client like Claude Code loads it once at connect); unset = omitted; capped at 2 KB |
 | `MEMGRES_VECTOR_BACKEND` | `pgvector` | `pgvector` (same DB) or `qdrant` (set `QDRANT_URL`, `QDRANT_API_KEY`, `MEMGRES_QDRANT_COLLECTION`) |
 | `MEMGRES_EMBED_PROVIDER` | `none` | `none` / `local` / `openai` / `jina` / `openai-compatible` (LM Studio, Ollama, vLLM, TEI…) |
@@ -208,13 +210,22 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `GET` | `/memories/{id}/blame` | line attribution; `?group`, `?text`, `?lines=1,3-5` |
 | `GET` | `/memories/{id}/at/{seq}` | body reconstructed at a version |
 | `GET` | `/recall` | `?q=&k=&mode=&tags=&path_prefix=&match=&snippet=&full_body=` |
-| `GET` | `/memories` | list a subtree, no query: `?path_prefix=&tags=&limit=&offset=` |
+| `GET` | `/memories` | list a subtree, no query: `?path_prefix=&tags=&limit=&offset=&bodies=` |
+| `GET` | `/whoami` | what this token may do, as capabilities |
 | `GET` | `/spaces` | namespaces this token can reach (identity modes) |
 | `GET` | `/info` | effective config: limits, embed provider/model/dim, recall modes, backend |
 | `GET` | `/healthz` | liveness |
 
+**`{id}` may be a memory's uuid or its tree path** (`/memories/decisions.pricing`)
+— an ltree label is `[A-Za-z0-9_]`, so a path never carries the dashes a uuid
+always has. A path that a memory has since moved away from is followed on a read
+(the answer sets `moved_from`) and refused on a write, which is what stops an
+edit meant for one memory from quietly becoming a second memory beside it.
+
 Every memory/recall route also takes optional `space` (one of your namespaces by
-name) and `space_id` (canonical id, for shared spaces). In `open`/`managed` mode
+name) and `space_id` (canonical id, for shared spaces); a search takes a list of
+either, or `space=all`, and each hit says which namespace answered. In
+`open`/`managed` mode
 the token goes in `Authorization: Bearer <token>` or `X-Memgres-Token`; there are
 also request-access and `/admin/*` provisioning routes — see
 [docs/TENANCY.md](docs/TENANCY.md). OpenAPI/Swagger is at `/docs`. Store errors

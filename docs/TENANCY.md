@@ -67,6 +67,70 @@ id). In practice:
 
 Every read/write API takes optional `space` and `space_id`.
 
+### Searching several spaces
+
+A search (`recall`, `find`, the `list` browse) may span namespaces. `space` takes
+a name, a list of names, or the keyword `"all"`; `space_id` takes ids, and the
+two combine. Over HTTP they are repeated query parameters:
+
+```bash
+curl -s "$BASE/recall?q=pricing&space=work&space=notes"   # two of yours
+curl -s "$BASE/recall?q=pricing&space=all"                 # everything you reach
+curl -s "$BASE/recall?q=pricing&space=work&space_id=<uuid>"  # yours + a shared one
+```
+
+Every hit says which namespace answered, via `space` and `space_id`.
+
+**If you reach more than one namespace, a search must name one.** This is the one
+place where a read is stricter than a write. A write with no address falls back on
+your default namespace, because filing something in your own drawer is a choice
+you already made. A read cannot: searching your default while three other
+reachable namespaces go unsearched answers "nothing found", and *nothing found*
+is indistinguishable from an answer. So the search says which namespaces it could
+have meant, and you pick — or say `all`.
+
+(If you happen to own a namespace literally named `all`, the keyword is refused
+as ambiguous rather than guessed at; address that one by `space_id`.)
+
+## Addressing a memory
+
+Within a namespace a memory has two addresses: its **id** (a uuid) and its
+**path** (the tree address, unique per namespace). `at` takes the path anywhere
+an `id` is taken — get, write, move, forget, history, blame. Over HTTP the URL
+segment takes either, and they cannot be confused, since an ltree label is
+`[A-Za-z0-9_]` and so a path never carries the dashes a uuid always has:
+
+```bash
+curl -s $BASE/memories/decisions.pricing          # by path
+curl -s $BASE/memories/018f…-…                    # by id
+curl -s -X PATCH $BASE/memories/decisions.pricing -d '{"body":"…"}'
+```
+
+`at` and `path` are different jobs: **`at` finds a memory, `path` says where a
+memory lives.** So `at="ops.x"` edits whatever is at that address, while
+`path="ops.x"` files a new memory there (and the two together move one).
+
+### When the address has moved
+
+A memory that moves records the address it left, so an old path still resolves.
+What happens then depends on what you are doing:
+
+- **reads follow it** and set `moved_from` in the answer — the memory that used
+  to live there is what you reached for, and now you know its address changed;
+- **writes refuse**, and say where it went. Writing to a stale address means your
+  picture is out of date, and both quiet answers commit you to it: edit the moved
+  memory and your write lands somewhere you did not name; create at the vacated
+  path and you now have two memories on one subject, the second of which you will
+  keep writing to while the first lives on elsewhere — with no error at any point.
+  `if_moved="follow"` edits it where it is now; `if_moved="create"` claims the
+  vacated path for something genuinely new;
+- **deletes never follow.** Deleting on the strength of a stale address is the
+  one mistake here you cannot undo.
+
+A *deleted* memory leaves no redirect at all — erasure is real, history goes with
+the row — so its path is simply free again. That is exactly the case where a
+duplicate is impossible, since there is nothing left to duplicate.
+
 ## Getting a token
 
 **open mode — bring your own.** Generate one yourself (any `mgk_` + 43 url-safe
@@ -123,10 +187,13 @@ Tools:
 
 - `memory_write` / `memory_get` / `memory_recall` / `memory_move` /
   `memory_history` / `memory_blame` / `memory_forget` — all take `space` /
-  `space_id`;
+  `space_id`; the id-addressed ones also take `at` (a path);
+- `memory_whoami` — what this token may do, as capabilities;
 - `memory_list_spaces` — your reachable namespaces (id, name, permission, default);
 - `memory_issue_token` — mint a token (rotate/delegate; secret returned once);
-- `memory_list_tokens` / `memory_revoke_token` — manage them.
+- `memory_list_tokens` / `memory_revoke_token` — manage them;
+- `memory_admin_*` — the control plane (see below), where the caller has the
+  authority for it.
 
 Only a genuinely multi-tenant endpoint (`open`/`managed`, **no** pinned token)
 exposes a `token` argument for the model to supply; force it either way with
@@ -203,6 +270,36 @@ curl -s $BASE/admin/tokens/<token_id>/revoke $A
 # service-role management (superadmin only)
 curl -s $BASE/admin/users/$UID/grant-superadmin $A
 curl -s $BASE/admin/users/$UID/revoke-superadmin -d '{"demote_to":"user"}' $A
+```
+
+The same operations are available over MCP as `memory_admin_*` tools, over the
+same service layer — so an operator working through an MCP client is not pushed
+onto curl. `MEMGRES_MCP_ADMIN_TOOLS=on|off|auto` controls whether they are
+registered; `auto` registers them wherever there are identities to administer,
+which is every mode but `single`. Turning them off shortens an agent-facing tool
+list — it is a context economy, **not** a security boundary, since every tool
+authorizes when it is called.
+
+### Who may act on whom
+
+A `user_manager` provisions ordinary accounts: it may act on accounts holding the
+plain `user` role, and nothing else. Issuing, revoking or listing tokens for an
+account that holds an admin role requires `superadmin` — without that rule, a
+`user_manager` could mint a token for a superadmin's account and become data-root
+in one request. The last superadmin also cannot be demoted or have their last
+token revoked, since that would leave the control plane with nobody in charge.
+
+### Creating namespaces
+
+Bringing a namespace into existence is a right (`can_create_namespace`), separate
+from provisioning people: an ordinary member can be trusted to organize their own
+corner without also being able to create users. Admin roles always have it. A
+user who has no namespace and no right to create one gets an explanation telling
+them to ask for one — not a silently-created namespace nobody asked for.
+
+```bash
+curl -s $BASE/admin/users/$UID/can-create-namespace -d '{"allowed":true}' $A
+curl -s $BASE/whoami -H "Authorization: Bearer $TOKEN"   # capabilities, not a role name
 ```
 
 ## Anti-garbage
