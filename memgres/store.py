@@ -9,9 +9,11 @@ Every state change appends one hash-chained row to ``memory_history`` with
 `source`/`reason` provenance. ``forget`` hard-deletes the row and (by cascade)
 its whole history — real erasure, not a tombstone.
 
-Tree moves cascade: changing a node's `path` rewrites every descendant's path in
-one ``ltree`` update, so the subtree stays consistent. Search lives in
-``search.py``; this module owns mutation and retrieval-by-id.
+Tree moves cascade: changing a node's `path` re-addresses its whole subtree, and
+each descendant records that move in its OWN history — a node's address changing
+is a change to that node, and it is what lets an old path still be resolved
+later. Search lives in ``search.py``; this module owns mutation and
+retrieval-by-id.
 """
 
 from __future__ import annotations
@@ -457,10 +459,8 @@ class Store:
 
         # a path change cascades to the whole subtree (keep ltree consistent)
         if path_changed and cur_path is not None:
-            cur.execute(
-                "UPDATE memory SET path = %s::ltree || subpath(path, nlevel(%s::ltree)) "
-                "WHERE namespace=%s AND path <@ %s::ltree AND id <> %s",
-                (new_path, cur_path, ns, cur_path, id))
+            self._cascade_move(cur, ns, cur_path, new_path, id, author,
+                               source, reason)
 
         cur.execute(
             f"""UPDATE memory SET body=%s, content_hash=%s, tags=%s, path=%s::ltree,
@@ -493,6 +493,66 @@ class Store:
                              title_after=new_title if title_changed else None)
         return Memory(str(id), new_body, new_hash, new_tags, new_path, new_seq,
                       created, updated, expires, new_title)
+
+    def _cascade_move(self, cur, ns, old_prefix: str, new_prefix: str,
+                      exclude_id, author, source, reason) -> None:
+        """Re-address every descendant when a node moves — and RECORD it.
+
+        This used to be one bulk UPDATE with no history: a descendant's address
+        changed with nothing in `history` or `blame` to say so, and afterwards
+        nothing could say where its old path had gone. A subtree move is a real
+        change to a real memory, so each descendant gets a real `move` row.
+
+        The rewrite rule lives HERE, in Python, and the UPDATE stores what it is
+        told — rather than the rule being written once in SQL for the update and
+        again for the history rows, where the two could disagree about which
+        address a node just left.
+        """
+        cur.execute(
+            "SELECT id, path::text, seq, content_hash FROM memory "
+            "WHERE namespace=%s AND path <@ %s::ltree AND id <> %s ORDER BY path",
+            (ns, old_prefix, exclude_id))
+        rows = cur.fetchall()
+        if not rows:
+            return
+        # `path <@ old_prefix` matches the prefix itself or `prefix.<rest>`, so
+        # swapping the prefix is the whole rule.
+        moves = [(str(mid), old, new_prefix + old[len(old_prefix):], seq + 1, chash)
+                 for (mid, old, seq, chash) in rows]
+        cur.executemany(
+            "UPDATE memory SET path=%s::ltree, seq=%s, updated_at=now() WHERE id=%s",
+            [(after, seq, mid) for (mid, _b, after, seq, _c) in moves])
+        self._append_move_history(cur, moves, author, source, reason)
+
+    def _append_move_history(self, cur, moves, author, source, reason) -> None:
+        """One `move` row per descendant, each chained onto ITS OWN last row.
+
+        The hash chain is per memory, so appending to many at once is still N
+        independent chains — but the previous hashes are read in one query rather
+        than one per node, and the rows go in as one batch. Bodies don't change on
+        a move, hence hash_before == hash_after and no diff."""
+        author_user_id, author_token_id = author or (None, None)
+        ids = [m[0] for m in moves]
+        cur.execute(
+            "SELECT DISTINCT ON (memory_id) memory_id, row_hash FROM memory_history "
+            "WHERE memory_id = ANY(%s) ORDER BY memory_id, seq DESC", (ids,))
+        prev = {str(r[0]): r[1] for r in cur.fetchall()}
+        params = []
+        for (mid, before, after, seq, chash) in moves:
+            prev_hash = prev.get(mid)
+            rhash = _row_hash(prev_hash, mid, seq, "move", None, chash, after,
+                              None, source, reason, author_user_id, author_token_id,
+                              None, None)
+            params.append((mid, seq, "move", None, chash, chash, before, after,
+                           None, None, source, reason, author_user_id,
+                           author_token_id, None, None, prev_hash, rhash))
+        cur.executemany(
+            """INSERT INTO memory_history (memory_id, seq, op, diff, hash_before,
+                   hash_after, path_before, path_after, tags_before, tags_after,
+                   source, reason, author_user_id, author_token_id,
+                   title_before, title_after, prev_row_hash, row_hash)
+               VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            params)
 
     def _append_history(self, memory_id, seq, op, diff, hash_before, hash_after,
                         path_before, path_after, tags_before, tags_after,

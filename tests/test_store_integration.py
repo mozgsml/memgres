@@ -360,6 +360,43 @@ def test_move_cascades_subtree(store):
     assert store.history(None, root.id)[-1]["op"] == "move"
 
 
+def test_a_cascaded_move_is_recorded_on_every_descendant(store):
+    """A descendant's address changes too, so its own history must say so —
+    otherwise `history`/`blame` show a node that silently teleported, and nothing
+    can answer "where did the old path go?" for anything but the moved node."""
+    root = store.write(body="root\n", path="a")
+    child = store.write(body="child\n", path="a.b")
+    grand = store.write(body="grand\n", path="a.b.c")
+    store.move(None, root.id, "z", source="reorg", reason="tidy up")
+
+    for mem, before, after in ((child, "a.b", "z.b"), (grand, "a.b.c", "z.b.c")):
+        last = store.history(None, mem.id)[-1]
+        assert last["op"] == "move"
+        assert last["path_before"] == before and last["path_after"] == after
+        assert last["diff"] is None                      # the body did not change
+        assert last["hash_before"] == last["hash_after"]
+        assert last["source"] == "reorg" and last["reason"] == "tidy up"
+        # the row is a real revision of that memory, not a footnote
+        assert last["seq"] == store.get(None, mem.id).seq
+        # …and it extends that memory's own hash chain
+        assert store.verify_history(None, mem.id)
+
+
+def test_a_cascaded_move_does_not_touch_bodies_or_neighbours(store):
+    store.write(body="root\n", path="a")
+    child = store.write(body="child\n", path="a.b")
+    outsider = store.write(body="outsider\n", path="b.x")
+    before = store.get(None, outsider.id)
+
+    root_id = store.list(None, path_prefix="a")[0]["id"]
+    store.move(None, root_id, "z")
+
+    assert store.get(None, child.id).body == "child\n"
+    after = store.get(None, outsider.id)
+    assert (after.path, after.seq) == (before.path, before.seq)
+    assert [r["op"] for r in store.history(None, outsider.id)] == ["create"]
+
+
 def test_hash_chain_verifies(store):
     m = store.write(body="1\n", source="s")
     store.write(id=m.id, body="2\n", reason="r2")
@@ -437,3 +474,39 @@ def test_default_token_from_config(monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_cascaded_move_rows_carry_the_author_and_still_verify(monkeypatch):
+    """The chain folds the author in only when there IS one, so a cascaded row
+    written with identity on is the case where compute and verify could disagree
+    — and a mismatch shows up only when someone verifies."""
+    from memgres import identity
+
+    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    for k in list(os.environ):
+        if k.startswith("MEMGRES_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
+    monkeypatch.setenv("MEMGRES_KEY_MODE", "managed")
+    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
+    monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
+    cfg = load(); conn = psycopg.connect(DSN); migrate(conn, cfg)
+    with conn.transaction():
+        uid = identity.create_user(conn, name="mover")
+        nsid = identity.create_namespace(conn, uid, "ns")
+        tok, tid = identity.issue_token(conn, uid, namespace_id=nsid,
+                                        permission="write")
+    s = Store(cfg, conn=conn)
+    try:
+        root = s.write(tok, body="root\n", path="a", space_id=nsid)
+        child = s.write(tok, body="child\n", path="a.b", space_id=nsid)
+        s.move(tok, root.id, "z", space_id=nsid)
+
+        last = s.history(tok, child.id, space_id=nsid)[-1]
+        assert last["op"] == "move" and last["path_after"] == "z.b"
+        assert last["author_user_id"] == uid and last["author_token_id"] == tid
+        assert last["author_name"] == "mover"
+        assert s.verify_history(tok, child.id, space_id=nsid)
+    finally:
+        conn.close()
