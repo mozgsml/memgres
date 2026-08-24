@@ -116,7 +116,7 @@ def require_namespace_admin(conn, p: Principal, namespace_id: str) -> Optional[s
     return p.user_id
 
 
-def whoami(p: Principal) -> dict:
+def whoami(conn, p: Principal) -> dict:
     """Who the caller is and what they may do — capabilities, not just a role.
 
     A caller has to decide what to attempt: an agent whether to try a tool, a
@@ -136,6 +136,7 @@ def whoami(p: Principal) -> dict:
         "capabilities": {
             "is_admin": p.is_admin,
             "can_manage_users": identity.can_manage_users(p),
+            "can_create_namespace": identity.can_create_namespace(conn, p),
         },
     }
 
@@ -143,17 +144,31 @@ def whoami(p: Principal) -> dict:
 # ─── users ───────────────────────────────────────────────────────────────────
 
 def create_user(conn, p: Principal, *, name: str = "", description: str = "",
-                role: str = "user") -> str:
+                role: str = "user", can_create_namespace: bool = False) -> str:
     """Create a user and return its id.
 
     Minting an admin-role user is itself a superadmin act: a user_manager must
     not escalate anyone — nor itself, by way of a fresh admin user it then
     issues a token for.
+
+    The new user owns nothing. Give it a namespace, share one with it, or let it
+    make its own — deciding that here, rather than creating one automatically,
+    is what keeps a provisioned account from quietly acquiring a second store.
     """
     require_manage_users(p)
     if role != "user" and not p.is_admin:
         raise Forbidden("granting an admin role requires superadmin")
-    return identity.create_user(conn, name, description, role=role)
+    return identity.create_user(conn, name, description, role=role,
+                                can_create_namespace=can_create_namespace)
+
+
+def set_can_create_namespace(conn, p: Principal, *, user_id: str,
+                             allowed: bool) -> dict:
+    """Grant or withdraw a user's right to create namespaces."""
+    require_manage_users(p)
+    _require_target_is_plain_user(conn, p, user_id, "changing namespace rights")
+    identity.set_can_create_namespace(conn, user_id, allowed)
+    return {"user_id": user_id, "can_create_namespace": allowed}
 
 
 def list_users(conn, p: Principal, *, role: Optional[str] = None,

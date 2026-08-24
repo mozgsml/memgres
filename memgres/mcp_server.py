@@ -414,7 +414,7 @@ def build_server(cfg: Optional[Config] = None):
         capabilities that follow from them. Check here before assuming an admin
         tool will refuse you — or explaining to someone why it did."""
         with pool.connection() as conn:
-            return admin.whoami(_principal(conn, _token(ctx, token)))
+            return admin.whoami(conn, _principal(conn, _token(ctx, token)))
 
     # ─── control plane: provisioning (authorized in `admin`, not here) ───────
     if admin_surface:
@@ -433,17 +433,31 @@ def build_server(cfg: Optional[Config] = None):
         @mcp.tool()
         def memory_admin_create_user(name: str = "", description: str = "",
                                      role: str = "user",
+                                     can_create_namespace: bool = False,
                                      token: Optional[str] = None,
                                      ctx: Context = None) -> dict:
             """Create a user and return its id. A new user owns nothing yet —
-            give it a namespace with `memory_admin_create_namespace` or share one
-            with `memory_admin_add_member`, then mint it a token. Minting an
-            admin-role user requires superadmin."""
+            give it a namespace with `memory_admin_create_namespace`, share one
+            with `memory_admin_add_member`, or set `can_create_namespace` so it
+            can make its own. Minting an admin-role user requires superadmin."""
             with pool.connection() as conn, conn.transaction():
                 uid = admin.create_user(conn, _principal(conn, _token(ctx, token)),
                                         name=name, description=description,
-                                        role=role)
+                                        role=role,
+                                        can_create_namespace=can_create_namespace)
             return {"id": uid}
+
+        @mcp.tool()
+        def memory_admin_set_can_create_namespace(user_id: str, allowed: bool,
+                                                  token: Optional[str] = None,
+                                                  ctx: Context = None) -> dict:
+            """Grant or withdraw a user's right to create namespaces. Without it
+            they must be given a namespace or shared into one; writing to a name
+            that does not exist is refused instead of silently making it."""
+            with pool.connection() as conn, conn.transaction():
+                return admin.set_can_create_namespace(
+                    conn, _principal(conn, _token(ctx, token)),
+                    user_id=user_id, allowed=allowed)
 
         @mcp.tool()
         def memory_admin_set_role(user_id: str, role: str,

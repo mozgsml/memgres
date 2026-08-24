@@ -121,7 +121,8 @@ def test_provisioning_end_to_end(box):
     # and the new credential is real: it writes, reads back, and knows itself
     who = _call(mcp, "memory_whoami", token=minted["token"])
     assert who["user_id"] == uid and who["permission"] == "write"
-    assert who["capabilities"] == {"is_admin": False, "can_manage_users": False}
+    assert who["capabilities"] == {"is_admin": False, "can_manage_users": False,
+                                   "can_create_namespace": False}
 
     _call(mcp, "memory_write", body="a deal closed", path="deals.acme",
           token=minted["token"])
@@ -145,6 +146,7 @@ def _matrix(uid: str, nsid: str, token_id: str) -> dict:
     return {
         "memory_admin_list_users": {},
         "memory_admin_create_user": {"name": "x"},
+        "memory_admin_set_can_create_namespace": {"user_id": uid, "allowed": True},
         "memory_admin_set_role": {"user_id": uid, "role": "user_manager"},
         "memory_admin_list_namespaces": {},
         "memory_admin_create_namespace": {"name": "nope", "owner_user_id": uid},

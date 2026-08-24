@@ -353,6 +353,10 @@ def create_app(cfg: Optional[Config] = None):
         name: str = ""
         description: str = ""
         role: str = "user"
+        can_create_namespace: bool = False
+
+    class NamespaceRight(BaseModel):
+        allowed: bool
 
     class NewNamespace(BaseModel):
         owner_user_id: str
@@ -376,7 +380,23 @@ def create_app(cfg: Optional[Config] = None):
         with pool.connection() as conn:
             return {"id": _guard(lambda: admin.create_user(
                 conn, p, name=req.name, description=req.description,
-                role=req.role))}
+                role=req.role,
+                can_create_namespace=req.can_create_namespace))}
+
+    @app.post("/admin/users/{user_id}/can-create-namespace")
+    def admin_set_create_right(user_id: str, req: NamespaceRight,
+                               p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.set_can_create_namespace(
+                conn, p, user_id=user_id, allowed=req.allowed))
+
+    @app.get("/whoami")
+    def whoami(tok: Optional[str] = Depends(token)):
+        """Who this credential is and what it may do — the same capabilities the
+        MCP surface reports, so a panel need not re-derive the rules."""
+        with pool.connection() as conn:
+            return _guard(lambda: admin.whoami(
+                conn, identity.resolve(conn, cfg, tok)))
 
     @app.post("/admin/namespaces", status_code=201)
     def admin_create_namespace(req: NewNamespace, p=Depends(principal)):

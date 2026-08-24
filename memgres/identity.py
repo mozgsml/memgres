@@ -67,6 +67,16 @@ class SpaceNotFound(KeyError):
     """No namespace the caller can reach for the given address."""
 
 
+class SpaceAmbiguous(ValueError):
+    """The caller reaches several namespaces and named none of them.
+
+    Deliberately not a `SpaceNotFound`: that maps to "no such thing", and this
+    is the opposite — there are too many, so the request is under-specified and
+    the caller must choose. Being a ValueError it already surfaces as a 422 and
+    carries the candidates in its message, which is the only useful answer.
+    """
+
+
 def new_token() -> str:
     """A fresh server-generated secret: ``mgk_`` + 43 url-safe chars."""
     return "mgk_" + secrets.token_urlsafe(32)
@@ -111,6 +121,24 @@ def can_manage_users(p: "Principal") -> bool:
     """May this principal provision users / (re)issue tokens? True for a
     user_manager, a superadmin, or the env break-glass root."""
     return p.is_admin or p.role in ADMIN_ROLES
+
+
+def can_create_namespace(conn, p: "Principal") -> bool:
+    """May this principal bring a new namespace into existence?
+
+    An admin role always may — it provisions for others by definition. Everyone
+    else carries the right individually, so an ordinary member can be trusted to
+    organize their own corner without also being able to provision people.
+    """
+    if can_manage_users(p):
+        return True
+    if p.user_id is None:                    # provisional: nothing to consult yet
+        return True
+    with conn.cursor() as cur:
+        cur.execute("SELECT can_create_namespace FROM app_user WHERE id=%s",
+                    (p.user_id,))
+        row = cur.fetchone()
+    return bool(row and row[0])
 
 
 # ─── authentication ──────────────────────────────────────────────────────────
@@ -176,7 +204,11 @@ def ensure_user_for_token(conn, principal: Principal) -> str:
     if not principal.token_hash:
         raise AuthError("cannot materialize a user without a token")
     with conn.cursor() as cur:
-        cur.execute("INSERT INTO app_user DEFAULT VALUES RETURNING id")
+        # Open mode is self-service: nobody provisions these accounts, so there
+        # is no admin to ask for the right to make a namespace. Withholding it
+        # here would leave a materialized user unable to write anywhere.
+        cur.execute("INSERT INTO app_user (can_create_namespace) VALUES (true) "
+                    "RETURNING id")
         uid = str(cur.fetchone()[0])
         cur.execute(
             "INSERT INTO token (token_hash, user_id, permission) "
@@ -269,6 +301,10 @@ def resolve_space(conn, principal: Principal, *, space_id: Optional[str] = None,
             if for_write:
                 if scope is not None:
                     raise AuthError("a scoped token cannot create a new namespace")
+                if not can_create_namespace(conn, principal):
+                    raise AuthError(
+                        f"you own no namespace named '{space}' and may not "
+                        "create one — ask an admin to create it or share it")
                 nsid = create_namespace(conn, uid, space)
                 return nsid, perm_min("admin", ceiling)
             raise SpaceNotFound(f"you own no namespace named '{space}'")
@@ -286,7 +322,26 @@ def resolve_space(conn, principal: Principal, *, space_id: Optional[str] = None,
         row = cur.fetchone()
         if row and row[0]:
             return str(row[0]), perm_min("admin", ceiling)
+
+        # No default set. Strictness scales with how much there is to get wrong:
+        # with one reachable namespace there is nothing to choose, so silence is
+        # safe. With several, a guess is a misfile — and once public and private
+        # spaces sit side by side, the wrong guess is the expensive one. So say
+        # so, and name the candidates rather than making the caller go looking.
+        reachable = list_spaces(conn, uid)
+        if len(reachable) == 1:
+            only = reachable[0]
+            return only["id"], perm_min(only["permission"], ceiling)
+        if len(reachable) > 1:
+            names = ", ".join(sorted(s["name"] for s in reachable))
+            raise SpaceAmbiguous(
+                f"you can reach {len(reachable)} namespaces ({names}) — name the "
+                "one you mean with `space`")
         if for_write:
+            if not can_create_namespace(conn, principal):
+                raise AuthError(
+                    "you have no namespace and may not create one — ask an "
+                    "admin to create one for you or share theirs")
             nsid = ensure_default_namespace(conn, uid)
             return nsid, perm_min("admin", ceiling)
         raise SpaceNotFound("user has no default namespace yet")
@@ -294,13 +349,26 @@ def resolve_space(conn, principal: Principal, *, space_id: Optional[str] = None,
 
 # ─── management: users / namespaces / members ────────────────────────────────
 def create_user(conn, name: str = "", description: str = "",
-                role: str = "user") -> str:
+                role: str = "user", *,
+                can_create_namespace: bool = False) -> str:
+    """Create a user. It owns nothing yet: give it a namespace, share one with
+    it, or grant `can_create_namespace` so it can make its own."""
     if role not in SERVICE_ROLES:
         raise ValueError(f"bad role: {role}")
     with conn.cursor() as cur:
-        cur.execute("INSERT INTO app_user (name, description, role) "
-                    "VALUES (%s, %s, %s) RETURNING id", (name, description, role))
+        cur.execute("INSERT INTO app_user (name, description, role, "
+                    "can_create_namespace) VALUES (%s, %s, %s, %s) RETURNING id",
+                    (name, description, role, can_create_namespace))
         return str(cur.fetchone()[0])
+
+
+def set_can_create_namespace(conn, user_id: str, allowed: bool) -> None:
+    """Grant or withdraw the right to create namespaces."""
+    with conn.cursor() as cur:
+        cur.execute("UPDATE app_user SET can_create_namespace=%s WHERE id=%s",
+                    (allowed, user_id))
+        if cur.rowcount == 0:
+            raise SpaceNotFound(f"no such user {user_id}")
 
 
 def list_users(conn, *, role: Optional[str] = None, limit: Optional[int] = None,
@@ -314,8 +382,8 @@ def list_users(conn, *, role: Optional[str] = None, limit: Optional[int] = None,
     """
     if role is not None and role not in SERVICE_ROLES:
         raise ValueError(f"bad role: {role}")
-    sql = ("SELECT id, name, description, role, default_namespace_id, created_at "
-           "FROM app_user")
+    sql = ("SELECT id, name, description, role, default_namespace_id, "
+           "can_create_namespace, created_at FROM app_user")
     args: list = []
     if role is not None:
         sql += " WHERE role=%s"                # backed by app_user_role_idx
@@ -328,7 +396,7 @@ def list_users(conn, *, role: Optional[str] = None, limit: Optional[int] = None,
         sql += " OFFSET %s"
         args.append(offset)
     cols = ["id", "name", "description", "role", "default_namespace_id",
-            "created_at"]
+            "can_create_namespace", "created_at"]
     with conn.cursor() as cur:
         cur.execute(sql, args)
         out = []

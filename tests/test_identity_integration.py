@@ -134,7 +134,7 @@ def test_bring_your_own_token_open_mode(conn):
 
 # ─── space resolution: by name (own only) ────────────────────────────────────
 def test_name_resolves_own_and_lazy_creates_on_write(conn):
-    uid = ident.create_user(conn)
+    uid = ident.create_user(conn, can_create_namespace=True)
     secret, _ = ident.issue_token(conn, uid, permission="write")
     p = ident.resolve(conn, cfg(conn), secret)
 
@@ -149,7 +149,7 @@ def test_name_resolves_own_and_lazy_creates_on_write(conn):
 
 
 def test_default_namespace_resolution_and_set(conn):
-    uid = ident.create_user(conn)
+    uid = ident.create_user(conn, can_create_namespace=True)
     secret, _ = ident.issue_token(conn, uid, permission="write")
     p = ident.resolve(conn, cfg(conn), secret)
     # no space arg, no default yet → read fails, write lazily creates default
@@ -300,7 +300,7 @@ def test_store_managed_rejects_unknown_token(conn):
 
 
 def test_store_named_spaces_same_token(conn):
-    uid = ident.create_user(conn)
+    uid = ident.create_user(conn, can_create_namespace=True)
     tok, _ = ident.issue_token(conn, uid, permission="write")   # unscoped
     s = _store(conn, key_mode="managed")
     a = s.write(tok, body="in a\n", space="a")
@@ -381,3 +381,69 @@ def test_token_owner_resolves_and_misses_cleanly(conn):
     _, tid = ident.issue_token(conn, uid)
     assert ident.token_owner(conn, tid) == uid
     assert ident.token_owner(conn, "00000000-0000-0000-0000-000000000000") is None
+
+
+# ─── the right to create a namespace, and choosing between several ───────────
+def test_without_the_right_a_write_is_refused_not_silently_created(conn):
+    """The old behaviour: any unscoped write token could conjure a namespace by
+    naming one. On a shared deployment that turns a typo into a second store
+    nobody is looking at."""
+    uid = ident.create_user(conn)                       # no right by default
+    secret, _ = ident.issue_token(conn, uid, permission="write")
+    p = ident.resolve(conn, cfg(conn), secret)
+
+    with pytest.raises(ident.AuthError, match="may not create"):
+        ident.resolve_space(conn, p, space="proj", for_write=True)
+    with pytest.raises(ident.AuthError, match="may not create"):
+        ident.resolve_space(conn, p, for_write=True)    # nor a lazy default
+    assert ident.list_namespaces(conn) == []            # nothing was created
+
+    # granting it makes the same call work
+    ident.set_can_create_namespace(conn, uid, True)
+    nsid, _ = ident.resolve_space(conn, p, space="proj", for_write=True)
+    assert [n["id"] for n in ident.list_namespaces(conn)] == [nsid]
+
+
+def test_a_single_reachable_namespace_needs_no_naming(conn):
+    """Strictness scales with what there is to get wrong: with one namespace
+    there is no choice to make, so an unqualified write still lands."""
+    owner = ident.create_user(conn)
+    ns = ident.create_namespace(conn, owner, "only")
+    secret, _ = ident.issue_token(conn, owner, permission="write")
+    p = ident.resolve(conn, cfg(conn), secret)
+
+    assert ident.resolve_space(conn, p)[0] == ns        # read, no default set
+    assert ident.resolve_space(conn, p, for_write=True)[0] == ns
+
+
+def test_several_reachable_namespaces_force_a_choice(conn):
+    """With more than one, guessing is a misfile — and once public and private
+    sit side by side the wrong guess is the expensive one."""
+    owner = ident.create_user(conn)
+    ident.create_namespace(conn, owner, "public")
+    ident.create_namespace(conn, owner, "private")
+    secret, _ = ident.issue_token(conn, owner, permission="write")
+    p = ident.resolve(conn, cfg(conn), secret)
+
+    with pytest.raises(ident.SpaceAmbiguous) as e:
+        ident.resolve_space(conn, p, for_write=True)
+    assert "private" in str(e.value) and "public" in str(e.value)  # names the options
+
+    # naming one resolves it; so does having a default
+    assert ident.resolve_space(conn, p, space="public")[0] is not None
+    ident.set_default_space(conn, owner, ident.list_spaces(conn, owner)[0]["id"])
+    assert ident.resolve_space(conn, ident.resolve(conn, cfg(conn), secret))[0]
+
+
+def test_a_shared_namespace_counts_as_reachable(conn):
+    """Reachability, not ownership: a member with exactly one shared namespace
+    should not have to name it either."""
+    owner = ident.create_user(conn)
+    guest = ident.create_user(conn)
+    ns = ident.create_namespace(conn, owner, "team")
+    ident.add_member(conn, ns, guest, "write")
+    secret, _ = ident.issue_token(conn, guest, permission="write")
+    p = ident.resolve(conn, cfg(conn), secret)
+
+    nsid, perm = ident.resolve_space(conn, p, for_write=True)
+    assert nsid == ns and perm == "write"               # membership, not admin
