@@ -303,6 +303,44 @@ def create_user(conn, name: str = "", description: str = "",
         return str(cur.fetchone()[0])
 
 
+def list_users(conn, *, role: Optional[str] = None, limit: Optional[int] = None,
+               offset: int = 0) -> List[dict]:
+    """Users with their service role — control-plane metadata, never a secret.
+
+    Paginated because the result lands in an LLM's context on one door and in a
+    web page on the other, and because on a shared deployment an unbounded user
+    list is an enumeration surface. ``limit=None`` returns everything, for the
+    CLI. Ordered by ``created_at, id`` so paging is stable.
+    """
+    if role is not None and role not in SERVICE_ROLES:
+        raise ValueError(f"bad role: {role}")
+    sql = ("SELECT id, name, description, role, default_namespace_id, created_at "
+           "FROM app_user")
+    args: list = []
+    if role is not None:
+        sql += " WHERE role=%s"                # backed by app_user_role_idx
+        args.append(role)
+    sql += " ORDER BY created_at, id"
+    if limit is not None:
+        sql += " LIMIT %s"
+        args.append(limit)
+    if offset:
+        sql += " OFFSET %s"
+        args.append(offset)
+    cols = ["id", "name", "description", "role", "default_namespace_id",
+            "created_at"]
+    with conn.cursor() as cur:
+        cur.execute(sql, args)
+        out = []
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            d["id"] = str(d["id"])
+            d["default_namespace_id"] = (str(d["default_namespace_id"])
+                                         if d["default_namespace_id"] else None)
+            out.append(d)
+        return out
+
+
 # ─── service roles (control plane; see SERVICE_ROLES) ────────────────────────
 def count_service_admins(conn) -> int:
     """How many users hold an admin role (user_manager or superadmin). Zero ⇒ a
@@ -439,6 +477,64 @@ def list_spaces(conn, user_id: str) -> List[dict]:
                 "mine": str(owner) == user_id,
                 "is_default": str(nid) == default,
             })
+        return out
+
+
+def list_namespaces(conn, *, owner_user_id: Optional[str] = None,
+                    limit: Optional[int] = None, offset: int = 0) -> List[dict]:
+    """Every namespace on the deployment — the operator's inventory.
+
+    `list_spaces` answers "what can *I* reach" and is caller-relative; there was
+    no way to ask "what exists". After a dozen namespaces are provisioned, an
+    admin otherwise has to remember uuids to administer them.
+    """
+    sql = ("SELECT id, name, description, instruction, owner_user_id, created_at "
+           "FROM namespace")
+    args: list = []
+    if owner_user_id is not None:
+        sql += " WHERE owner_user_id=%s"
+        args.append(owner_user_id)
+    sql += " ORDER BY created_at, id"
+    if limit is not None:
+        sql += " LIMIT %s"
+        args.append(limit)
+    if offset:
+        sql += " OFFSET %s"
+        args.append(offset)
+    cols = ["id", "name", "description", "instruction", "owner_user_id",
+            "created_at"]
+    with conn.cursor() as cur:
+        cur.execute(sql, args)
+        out = []
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            d["id"] = str(d["id"])
+            d["owner_user_id"] = str(d["owner_user_id"])
+            out.append(d)
+        return out
+
+
+def list_members(conn, namespace_id: str) -> List[dict]:
+    """Who can reach a namespace: its owner, then everyone shared in.
+
+    The owner is synthesized rather than stored in `namespace_member`, so a
+    caller reading membership sees the whole picture — "who can see this?" is
+    the question a public/private split raises, and a list that silently omits
+    the owner answers it wrongly.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT owner_user_id FROM namespace WHERE id=%s",
+                    (namespace_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise SpaceNotFound(f"no such namespace {namespace_id}")
+        out = [{"user_id": str(row[0]), "permission": "admin", "owner": True,
+                "created_at": None}]
+        cur.execute("SELECT user_id, permission, created_at FROM namespace_member "
+                    "WHERE namespace_id=%s ORDER BY created_at", (namespace_id,))
+        for uid, perm, created in cur.fetchall():
+            out.append({"user_id": str(uid), "permission": perm,
+                        "owner": False, "created_at": created})
         return out
 
 

@@ -92,12 +92,19 @@ def _require_target_is_plain_user(conn, p: Principal, user_id: Optional[str],
         raise Forbidden(f"{action} for an admin-role account requires superadmin")
 
 
-def require_namespace_admin(conn, p: Principal, namespace_id: str) -> str:
+def require_namespace_admin(conn, p: Principal, namespace_id: str) -> Optional[str]:
     """Per-namespace admin: effective permission (membership ∧ token ceiling).
 
     A third tier, orthogonal to the two above: it is about one namespace, not
-    about the deployment. Returns the caller's user id.
+    about the deployment. Returns the caller's user id (None for the env root).
+
+    A superadmin passes without membership. `identity._reach` only knows about
+    ownership and the member table, so without this a superadmin — defined as
+    "read/write any namespace, grant any access" — was refused on a namespace it
+    had just provisioned for someone else.
     """
+    if p.is_admin:
+        return p.user_id
     if p.user_id is None:
         raise identity.AuthError("this token has no owning user")
     with conn.cursor() as cur:
@@ -123,6 +130,13 @@ def create_user(conn, p: Principal, *, name: str = "", description: str = "",
     if role != "user" and not p.is_admin:
         raise Forbidden("granting an admin role requires superadmin")
     return identity.create_user(conn, name, description, role=role)
+
+
+def list_users(conn, p: Principal, *, role: Optional[str] = None,
+               limit: Optional[int] = None, offset: int = 0) -> List[dict]:
+    """The user directory — needed to address anyone by id at all."""
+    require_manage_users(p)
+    return identity.list_users(conn, role=role, limit=limit, offset=offset)
 
 
 def grant_superadmin(conn, p: Principal, *, user_id: str) -> dict:
@@ -161,6 +175,27 @@ def add_member(conn, p: Principal, *, namespace_id: str, user_id: str,
     identity.add_member(conn, namespace_id, user_id, permission)
     return {"namespace_id": namespace_id, "user_id": user_id,
             "permission": permission}
+
+
+def list_namespaces(conn, p: Principal, *, owner_user_id: Optional[str] = None,
+                    limit: Optional[int] = None, offset: int = 0) -> List[dict]:
+    """Deployment-wide namespace inventory.
+
+    Provisioning tier rather than superadmin: scoping a token to a namespace
+    needs its id, so a user_manager cannot do its job without this. It returns
+    namespace *metadata* — names and routing hints — never the memories inside,
+    which stay behind the data-plane check.
+    """
+    require_manage_users(p)
+    return identity.list_namespaces(conn, owner_user_id=owner_user_id,
+                                    limit=limit, offset=offset)
+
+
+def list_members(conn, p: Principal, *, namespace_id: str) -> List[dict]:
+    """Who can reach a namespace. Authorized per-namespace, not deployment-wide:
+    its own admin is exactly who should be able to audit access to it."""
+    require_namespace_admin(conn, p, namespace_id)
+    return identity.list_members(conn, namespace_id)
 
 
 def list_spaces(conn, p: Principal) -> List[dict]:

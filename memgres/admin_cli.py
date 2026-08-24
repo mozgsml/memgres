@@ -47,17 +47,18 @@ def _resolve_user(conn, args) -> str:
 
 
 def _list_users(conn) -> None:
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, role, name, description FROM app_user "
-                    "ORDER BY role DESC, created_at")
-        rows = cur.fetchall()
+    """Print the directory. The query itself lives in `identity.list_users`, so
+    the CLI and both servers cannot disagree about what a user record is."""
+    rows = identity.list_users(conn)
     if not rows:
         print("(no users yet)")
         return
+    # Authority first, then oldest — the operator is here to find an admin.
+    rows.sort(key=lambda u: (u["role"] == "user", u["role"] != "superadmin"))
     print(f"{'id':36}  {'role':12}  name / description")
-    for uid, role, name, desc in rows:
-        label = name or desc or ""
-        print(f"{str(uid):36}  {role:12}  {label}")
+    for u in rows:
+        label = u["name"] or u["description"] or ""
+        print(f"{u['id']:36}  {u['role']:12}  {label}")
 
 
 def main(argv=None) -> None:  # pragma: no cover - thin entrypoint

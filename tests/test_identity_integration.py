@@ -323,3 +323,61 @@ def test_list_spaces_flags(conn):
     assert spaces["mine"]["mine"] and spaces["mine"]["is_default"]
     assert spaces["mine"]["permission"] == "admin"
     assert not spaces["theirs"]["mine"] and spaces["theirs"]["permission"] == "read"
+
+
+# ─── directory reads: users / namespaces / members ───────────────────────────
+def test_list_users_filters_and_pages(conn):
+    a = ident.create_user(conn, name="alice")
+    ident.create_user(conn, name="bob", role="user_manager")
+    root = ident.create_user(conn, name="root", role="superadmin")
+
+    everyone = ident.list_users(conn)
+    assert [u["name"] for u in everyone] == ["alice", "bob", "root"]  # created_at
+    assert {u["id"] for u in everyone} == {a, everyone[1]["id"], root}
+    assert all(u["default_namespace_id"] is None for u in everyone)
+
+    assert [u["name"] for u in ident.list_users(conn, role="superadmin")] == ["root"]
+    assert [u["name"] for u in ident.list_users(conn, limit=2)] == ["alice", "bob"]
+    assert [u["name"] for u in ident.list_users(conn, limit=2, offset=2)] == ["root"]
+
+    with pytest.raises(ValueError):
+        ident.list_users(conn, role="wizard")
+
+
+def test_list_namespaces_is_deployment_wide(conn):
+    """`list_spaces` is caller-relative; this answers what exists at all."""
+    a = ident.create_user(conn, name="a")
+    b = ident.create_user(conn, name="b")
+    ns_a = ident.create_namespace(conn, a, "sales", instruction="deals only")
+    ns_b = ident.create_namespace(conn, b, "hr")
+
+    everything = ident.list_namespaces(conn)
+    assert {n["id"] for n in everything} == {ns_a, ns_b}
+    assert [n for n in everything if n["id"] == ns_a][0]["instruction"] == "deals only"
+    # a's own view sees only a's namespace, which is exactly the difference
+    assert [n["id"] for n in ident.list_namespaces(conn, owner_user_id=a)] == [ns_a]
+    assert [s["id"] for s in ident.list_spaces(conn, a)] == [ns_a]
+
+
+def test_list_members_includes_the_owner(conn):
+    """The owner is not a row in namespace_member, but omitting it would answer
+    "who can see this?" wrongly — the question a public/private split raises."""
+    owner = ident.create_user(conn, name="owner")
+    guest = ident.create_user(conn, name="guest")
+    ns = ident.create_namespace(conn, owner, "kb")
+    ident.add_member(conn, ns, guest, "read")
+
+    members = ident.list_members(conn, ns)
+    assert [(m["user_id"], m["permission"], m["owner"]) for m in members] == [
+        (owner, "admin", True), (guest, "read", False)]
+
+    with pytest.raises(ident.SpaceNotFound):
+        ident.list_members(conn, "00000000-0000-0000-0000-000000000000")
+
+
+def test_token_owner_resolves_and_misses_cleanly(conn):
+    """Authorizing an action addressed by token needs to know whose it is."""
+    uid = ident.create_user(conn, name="u")
+    _, tid = ident.issue_token(conn, uid)
+    assert ident.token_owner(conn, tid) == uid
+    assert ident.token_owner(conn, "00000000-0000-0000-0000-000000000000") is None
