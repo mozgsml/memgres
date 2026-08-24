@@ -128,6 +128,15 @@ def require_namespace_admin(conn, p: Principal, namespace_id: str) -> Optional[s
     ownership and the member table, so without this a superadmin — defined as
     "read/write any namespace, grant any access" — was refused on a namespace it
     had just provisioned for someone else.
+
+    It still needs an admin-CEILING token. The superadmin branch used to return
+    before any ceiling check, so a deliberately weakened credential — a
+    *read-only* superadmin token, the shape the docs recommend handing an agent
+    — could rewrite any namespace's `instruction` (the routing hint other agents
+    read to decide where memories land) and approve access requests, granting
+    strangers write membership anywhere. Neither is a read. The check for
+    everyone else was already there, in `perm_min(membership, ceiling)`; the
+    role was skipping past it.
     """
     # A scoped token is pinned to one namespace, and administering a DIFFERENT
     # one is outside what it was issued for — including for a superadmin, whose
@@ -136,6 +145,10 @@ def require_namespace_admin(conn, p: Principal, namespace_id: str) -> Optional[s
             and str(p.scope_namespace_id) != str(namespace_id)):
         raise Forbidden("this token is scoped to a different namespace")
     if p.is_admin:
+        if p.permission != "admin":
+            raise Forbidden(
+                f"administering a namespace requires an admin-ceiling token "
+                f"(this one grants {p.permission})")
         return p.user_id
     if p.user_id is None:
         raise identity.AuthError("this token has no owning user")
@@ -172,9 +185,19 @@ def capabilities(conn, p: Principal) -> dict:
         "can_manage_users": (identity.can_manage_users(p)
                              and _has_full_credential(p)),
         "can_administer_deployment": p.is_admin and _has_full_credential(p),
-        "can_create_namespace": identity.can_create_namespace(conn, p),
+        # Mirrors every condition `create_own_namespace` enforces, not just the
+        # right itself: a read-only or scoped token, and a credential with no
+        # owning user, are all refused there, and saying otherwise here would
+        # advertise a door that always closes.
+        "can_create_namespace": (
+            (p.user_id is not None or p.provisional)
+            and p.scope_namespace_id is None
+            and identity.perm_at_least(p.permission, "write")
+            and identity.can_create_namespace(conn, p)),
         "can_write": identity.perm_at_least(p.permission, "write"),
-        "can_manage_own_tokens": _has_full_credential(p),
+        # The env break-glass root owns no account, so it has no tokens to
+        # manage however unscoped and admin-ceiling it is.
+        "can_manage_own_tokens": _has_full_credential(p) and p.user_id is not None,
         # Administering ONE namespace (edit it, list its members) needs an
         # admin-ceiling credential but not an unscoped one — a token pinned to
         # the namespace it administers is exactly the right shape. Whether the
@@ -481,6 +504,10 @@ def request_access(conn, p: Principal, *, namespace_id: str,
 
     Already reaching it is reported plainly: that is the caller's own access,
     which `list_spaces` shows them anyway.
+
+    The two indistinguishable cases run the same code — one reachability query,
+    one upsert — because answers that match while the work differs leave the
+    difference in the response TIME. See `identity.request_access`.
     """
     if p.user_id is None:
         raise identity.AuthError("this token has no owning user")

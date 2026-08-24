@@ -144,7 +144,7 @@ def can_create_namespace(conn, p: "Principal") -> bool:
 
 
 # ─── authentication ──────────────────────────────────────────────────────────
-def resolve(conn, cfg, secret: Optional[str]) -> Principal:
+def resolve(conn, cfg, secret: Optional[str], *, touch: bool = True) -> Principal:
     """Authenticate a bearer secret into a :class:`Principal`.
 
     * known token → its user/ceiling/scope/role (rejects revoked/expired). A
@@ -156,6 +156,12 @@ def resolve(conn, cfg, secret: Optional[str]) -> Principal:
       user; reachable before the first seed, or in modes bootstrap skips.
     * unknown but well-formed token in ``open`` mode → *provisional* principal
       (user materialized on first write); in ``managed`` mode → rejected.
+
+    ``touch=False`` skips stamping ``last_used_at``. It is for callers that are
+    not acting on the credential's behalf but merely asking about it — the MCP
+    tool-list filter runs on every ``tools/list``, and counting that as "used"
+    would both turn a listing into a write transaction and make the column mean
+    "last connected" instead of "last did something".
     """
     if not secret:
         raise AuthError("a token is required")
@@ -177,7 +183,9 @@ def resolve(conn, cfg, secret: Optional[str]) -> Principal:
                     raise AuthError("token revoked")
                 if expired:
                     raise AuthError("token expired")
-                cur.execute("UPDATE token SET last_used_at=now() WHERE id=%s", (tid,))
+                if touch:
+                    cur.execute("UPDATE token SET last_used_at=now() WHERE id=%s",
+                                (tid,))
                 return Principal(user_id=str(uid), permission=perm,
                                  scope_namespace_id=str(nsid) if nsid else None,
                                  token_id=str(tid), token_hash=h, role=role,
@@ -236,17 +244,25 @@ def ensure_user_for_token(conn, principal: Principal) -> str:
 # ─── space resolution (id-canonical; a name is a convenience, and may be an
 #     alias — see _resolve_name) ─────────────────────────────────────────────
 def _reach(cur, user_id: str, namespace_id: str) -> Optional[str]:
-    """The caller's effective permission on a namespace, or None if unreachable."""
-    cur.execute("SELECT owner_user_id FROM namespace WHERE id=%s", (namespace_id,))
+    """The caller's effective permission on a namespace, or None if unreachable.
+
+    One query rather than two, and not only to save a round trip: the two-query
+    form did strictly less work when the namespace did not exist than when it
+    existed but was unreachable, and `request_access` — whose whole point is
+    that those two cases must be indistinguishable — runs through here. Making
+    the answers identical while the work differs just moves an oracle into the
+    clock.
+    """
+    cur.execute(
+        "SELECT CASE WHEN n.owner_user_id = %(u)s THEN 'admin' "
+        "            ELSE m.permission END "
+        "FROM namespace n "
+        "LEFT JOIN namespace_member m "
+        "       ON m.namespace_id = n.id AND m.user_id = %(u)s "
+        "WHERE n.id = %(ns)s",
+        {"u": user_id, "ns": namespace_id})
     row = cur.fetchone()
-    if row is None:
-        return None
-    if str(row[0]) == user_id:
-        return "admin"
-    cur.execute("SELECT permission FROM namespace_member "
-                "WHERE namespace_id=%s AND user_id=%s", (namespace_id, user_id))
-    m = cur.fetchone()
-    return m[0] if m else None
+    return row[0] if row else None
 
 
 def _resolve_name(cur, uid: str, name: str) -> str:
@@ -425,8 +441,8 @@ def resolve_spaces(conn, principal: Principal, *, space=None,
     the caller named them (or creation order for ``all``).
 
     * ``space`` — a namespace name or your alias for one, a list of them, or one
-      of the set keywords: ``"all"``/``"mine"`` (every namespace you belong to)
-      or ``"*"`` (every namespace in the deployment, superadmin only).
+      of the set keywords: ``"all"`` (every namespace you belong to) or ``"*"``
+      (every namespace in the deployment, superadmin only).
     * ``space_id`` — a reachable namespace id or a list of them; always
       unambiguous, and the only address left when one name means two spaces.
       ``space`` and ``space_id`` may be combined.
@@ -452,7 +468,7 @@ def resolve_spaces(conn, principal: Principal, *, space=None,
                 "— drop `space_id`, or list the namespaces you want explicitly")
         if _wants(space, EVERY_SPACE):
             return _every_namespace(conn, principal)
-        _refuse_ambiguous_all(conn, principal)
+        _refuse_ambiguous_all(conn, principal, ALL_SPACES)
         return _all_reachable(conn, principal)
 
     if not names and not ids:
@@ -507,27 +523,33 @@ def _unreached_count(conn, principal: Principal) -> int:
         return int(cur.fetchone()[0])
 
 
-def _refuse_ambiguous_all(conn, principal: Principal) -> None:
-    """`all` from a superadmin, when it would answer less than it can read.
+def _refuse_ambiguous_all(conn, principal: Principal,
+                          said: Optional[str] = None) -> None:
+    """A superadmin read that would answer with less than the role can read.
 
     For every other caller `all` IS everything, and the word stays untouched.
     For a superadmin it is two different questions, and the narrow answer looks
     exactly like the wide one — a search returning nothing reads as "there is
-    nothing", not as "not where I looked". So the word is refused, both explicit
-    words are named, and it is refused only while the two answers differ: a
-    superadmin whose memberships already cover the deployment sees no change.
+    nothing", not as "not where I looked". So it is refused, the wide word is
+    named, and it is refused only while the two answers differ: a superadmin
+    whose memberships already cover the deployment sees no change.
+
+    ``said`` is the word the caller used, or None when they named no namespace
+    at all — the same trap, reached by saying nothing.
     """
     outside = _unreached_count(conn, principal)
     if not outside:
         return
     own = [s["name"] for s in list_spaces(conn, principal.user_id)]
     listed = ", ".join(repr(n) for n in sorted(own)) or "none"
+    opening = (f"'{said}' is ambiguous here" if said
+               else "naming no namespace would answer too narrowly here")
     raise SpaceAmbiguous(
-        f"you are a superadmin, so '{ALL_SPACES}' is ambiguous here: you belong "
-        f"to {len(own)} namespace(s) ({listed}), and {outside} more exist that "
-        f"your role can also read. Say `space='{EVERY_SPACE}'` for every "
-        f"namespace in this deployment, or name the ones you mean with "
-        f"`space=[…]` / `space_id=[…]`")
+        f"you are a superadmin, so {opening}: you belong to {len(own)} "
+        f"namespace(s) ({listed}), and {outside} more exist that your role can "
+        f"also read. Say `space='{EVERY_SPACE}'` for every namespace in this "
+        f"deployment, or name the ones you mean with `space=[…]` / "
+        f"`space_id=[…]`")
 
 
 def _all_reachable(conn, principal: Principal,
@@ -560,6 +582,21 @@ def _every_namespace(conn, principal: Principal) -> List[Tuple[str, str]]:
     that role one namespace at a time, so it adds no authority — only a way to
     spend it in one call instead of N.
     """
+    # The name check comes FIRST, and against the caller's OWN reachable set.
+    # Two reasons, both learned the hard way:
+    #   * a caller who owns a namespace literally named `*` most likely means
+    #     that one, and telling them the keyword is superadmin-only would be an
+    #     answer to a question they did not ask;
+    #   * checking the whole `namespace` table instead — which this did — let
+    #     any tenant disable the keyword for the superadmin, deployment-wide,
+    #     by creating a namespace named `*`. In `open` mode a self-minted token
+    #     can do that unprompted, and the two refusals then point at each other
+    #     ("use `*`" ↔ "address it by id"), leaving the operator enumerating
+    #     uuids. A stranger's choice of name must not reach into what this
+    #     caller's words mean.
+    if principal.user_id is not None:
+        _no_such_name([s["name"] for s in list_spaces(conn, principal.user_id)],
+                      EVERY_SPACE)
     if not principal.is_admin:
         raise AuthError(
             f"`space='{EVERY_SPACE}'` means every namespace in this deployment "
@@ -575,12 +612,21 @@ def _every_namespace(conn, principal: Principal) -> List[Tuple[str, str]]:
         rows = cur.fetchall()
     if not rows:
         raise SpaceNotFound("this deployment has no namespaces yet")
-    _no_such_name([r[1] for r in rows], EVERY_SPACE)
     return [(r[0], perm_min("admin", ceiling)) for r in rows]
 
 
 def _sole_reachable(conn, principal: Principal) -> Tuple[str, str]:
-    """The caller's only namespace, or an error naming the candidates."""
+    """The caller's only namespace, or an error naming the candidates.
+
+    This is the READ path — a search that named no namespace at all. It carries
+    the same superadmin refusal as `all`, and for the same reason: with one
+    membership and other namespaces on the deployment, "your only namespace"
+    silently answers a narrower question than the caller asked, and an empty
+    result reads as "there is nothing". (The WRITE path deliberately keeps
+    resolving to the single membership: a write has to land somewhere, the one
+    namespace you belong to is the only sane target, and nothing is silently
+    left out of an answer.)
+    """
     if principal.user_id is None:
         if principal.is_admin:            # env break-glass root owns nothing
             raise AuthError("global admin must address a space by id")
@@ -588,6 +634,7 @@ def _sole_reachable(conn, principal: Principal) -> Tuple[str, str]:
     if principal.scope_namespace_id is not None:
         return resolve_space(conn, principal,
                              space_id=principal.scope_namespace_id)
+    _refuse_ambiguous_all(conn, principal)
     reachable = list_spaces(conn, principal.user_id)
     if len(reachable) == 1:
         only = reachable[0]
@@ -1076,9 +1123,13 @@ def reaches(conn, user_id: str, namespace_id: str) -> Optional[str]:
     """The user's effective permission on a namespace, or None. The public form
     of :func:`_reach`, for callers outside this module that must ask about
     reachability without going through an address resolver that raises."""
-    _as_uuid(namespace_id)
+    # The NORMALIZED value is what goes to Postgres. `uuid.UUID` accepts forms
+    # Postgres does not (`urn:uuid:…`), so passing the raw string through would
+    # still produce the driver fault — and abort the caller's transaction —
+    # that this check exists to prevent.
+    namespace_id = _as_uuid(namespace_id)
     with conn.cursor() as cur:
-        return _reach(cur, user_id, str(namespace_id))
+        return _reach(cur, user_id, namespace_id)
 
 
 def _as_uuid(value: str) -> str:
@@ -1095,26 +1146,47 @@ def _as_uuid(value: str) -> str:
         raise ValueError(f"not a namespace id: {value!r}")
 
 
-def request_access(conn, requester_user_id: str, namespace_id: str,
-                   permission: str = "read") -> Optional[str]:
-    """Record a request to join a namespace; the id of the request, or None if
-    no such namespace exists.
+# How many open requests one account may have outstanding. The row is recorded
+# whether or not the namespace exists (see below), so without a cap an account
+# could grow the table one guessed uuid at a time.
+MAX_PENDING_REQUESTS_PER_USER = 100
 
-    **A missing namespace is not an error here, and that is deliberate.** The
-    insert used to be attempted regardless: an existing namespace the requester
-    cannot reach produced a request, a namespace id that names nothing produced
-    a foreign-key violation. The difference in the two answers told an outsider
-    which uuids are real — a membership-blind existence oracle. Both cases now
-    return the same thing to the caller (see :func:`admin.request_access`), so
-    the only way to learn a namespace exists is to be able to reach it.
+
+def request_access(conn, requester_user_id: str, namespace_id: str,
+                   permission: str = "read") -> str:
+    """Record a request to join a namespace, and return the request's id.
+
+    **The row is written whether or not the namespace exists, and that is the
+    whole point.** The insert used to be conditional: a real namespace the
+    requester cannot reach produced a request, a uuid naming nothing produced a
+    foreign-key violation. That difference was a membership-blind existence
+    oracle. Answering identically was the first fix — but a check-then-write
+    still *runs* differently in the two cases, and the measured gap was ~8× with
+    no overlap, so the oracle simply moved into the clock. Two answers are only
+    the same when the same work produces them.
+
+    So `access_request.namespace_id` no longer carries a foreign key (migration
+    0014) and every request is upserted. A row pointing at nothing is inert:
+    `list_requests` selects by namespace, so no one can ever see it, and
+    `decide_access` resolves the namespace and refuses. What remains is a table
+    an account could grow by guessing — hence the cap above, which also bounds
+    the request spam that was always possible against real namespaces.
+
+    The caller is `admin.request_access`, which returns a receipt WITHOUT this
+    id: the requester has no use for it, and handing one back would restore the
+    difference this removes.
     """
     if permission not in _RANK:
         raise ValueError(f"bad permission: {permission}")
     namespace_id = _as_uuid(namespace_id)
     with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM namespace WHERE id=%s", (namespace_id,))
-        if cur.fetchone() is None:
-            return None
+        cur.execute("SELECT count(*) FROM access_request "
+                    "WHERE requester_user_id=%s AND status='pending'",
+                    (requester_user_id,))
+        if cur.fetchone()[0] >= MAX_PENDING_REQUESTS_PER_USER:
+            raise ValueError(
+                f"you already have {MAX_PENDING_REQUESTS_PER_USER} requests "
+                "waiting to be decided, which is the cap")
         cur.execute(
             "INSERT INTO access_request (requester_user_id, namespace_id, "
             "requested_permission) VALUES (%s, %s, %s) "

@@ -18,7 +18,7 @@ from pathlib import Path
 from .config import Config
 
 # The version this build migrates the database TO (the latest migration it carries).
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # The compatibility FLOOR: the schema version of the most recent backward-
 # INCOMPATIBLE migration — one that changed the shape/semantics old code relied on
@@ -37,7 +37,19 @@ SCHEMA_VERSION = 14
 #   v10 (0009): added app_user.can_create_namespace → additive, floor stays 6.
 #     Older clients ignore the column and keep creating namespaces freely, which
 #     is exactly what they did before; the restriction is enforced by new code.
-SCHEMA_BREAKING_VERSION = 6
+#   v11 (0010): added the namespace_alias table → additive, floor stays 6.
+#   v12 (0011): DROPPED app_user.default_namespace_id → BREAKING. Every 0.5.x
+#     read path selects that column and fails outright without it.
+#   v13 (0012): added the user profile columns → additive.
+#   v14 (0013): added memory_history.hash_version → additive in SQL, BREAKING in
+#     MEANING: it changed what a stored `row_hash` says. A pre-0013 client
+#     recomputes every row with the v1 recipe and reports an untampered v2 chain
+#     as TAMPERED — a wrong answer from the one function whose entire job is to
+#     be trusted, and a silent one. Writing stays compatible in both directions
+#     (an old client writes v1 rows, which the column defaults to), so this is
+#     the floor purely because of what verification would claim.
+#   v15 (0014): dropped a foreign key → nothing old code reads changes.
+SCHEMA_BREAKING_VERSION = 14
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are
 # shipped inside the package (see pyproject) and this still resolves.

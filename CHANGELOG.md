@@ -63,10 +63,32 @@ patch = fixes).
   verified against that one. A chain spanning the upgrade verifies end to end,
   and relabelling a row to dodge the stronger recipe fails, because the two
   place the tags differently. The `source`/`reason` case was never affected.
-- **`request_access` was a namespace existence oracle.** An unreachable
-  namespace produced a request and a nonexistent one a foreign-key error, so the
-  difference told an outsider which uuids are real — independent of any access
-  they had. Both answers are now identical.
+- **`request_access` was a namespace existence oracle**, twice over. An
+  unreachable namespace produced a request and a nonexistent one a foreign-key
+  error, so the difference told an outsider which uuids are real — independent
+  of any access they had. Making the two answers identical was the first half.
+  The second: while the insert stayed *conditional*, the two cases still did
+  different amounts of work, and the gap was measured at ~8× (0.13 ms against
+  1.08 ms, no overlap in 40 paired trials) — the same oracle, moved into the
+  clock. Two answers are only the same when the same work produces them, so the
+  request is now recorded either way (`access_request.namespace_id` is no longer
+  a foreign key, migration 0014) and `identity._reach` resolves reachability in
+  one query instead of doing strictly less work for a namespace that does not
+  exist. Re-measured after the fix: 0.99×, 23/60 paired trials. A row pointing
+  at nothing is inert — `list_requests` selects by namespace and `decide_access`
+  refuses — and `MAX_PENDING_REQUESTS_PER_USER` (100) bounds the table an
+  account could grow by guessing, which also caps request spam at real
+  namespaces. 🔴 The dropped constraint carried `ON DELETE CASCADE`: whatever
+  adds `delete_namespace` must delete that namespace's requests itself.
+- **A read-only superadmin token could administer any namespace.** A role says
+  who someone IS; a token says what THIS credential may do — and
+  `require_namespace_admin` returned on the role before it ever looked at the
+  ceiling. So the credential the docs recommend handing an agent, a read-only
+  superadmin token, could rewrite any namespace's `instruction` (the routing
+  hint other agents read to decide where memories land) and approve access
+  requests, granting strangers write membership anywhere. Neither is a read.
+  Every other caller was already held to it by `perm_min(membership, ceiling)`;
+  the role was skipping past the check, not passing it.
 
 ### Removed
 - **The default namespace.** `app_user.default_namespace_id` answered "where does
@@ -299,7 +321,26 @@ patch = fixes).
   route an existence oracle. `already_reachable` is still reported: that is the
   caller's own access, which `list_spaces` shows them anyway.
 - **`whoami` capabilities gained keys and changed meaning** (see Changed).
-  Anything asserting the exact three-key dict will notice.
+  Anything asserting the exact three-key dict will notice. `can_create_namespace`
+  now mirrors every condition `create_own_namespace` enforces — a read-only or
+  scoped credential, or one with no owning user, reports `false` — rather than
+  the bare right, which advertised a door that always closed.
+- **A superadmin read that names no namespace at all is refused too**, on the
+  same terms as `all`: with one membership and other namespaces on the
+  deployment, "your only namespace" answers a narrower question than was asked.
+  The write path is deliberately unchanged — a write has to land somewhere, the
+  namespace you belong to is the only sane target, and nothing is left out of an
+  answer.
+- **The compatibility floor moves to schema v14**, so a client older than this
+  release refuses to run against a database this release has touched. Two
+  reasons, and the second is why it is stated as a floor rather than a note:
+  0011 dropped `app_user.default_namespace_id`, which every 0.5.x read path
+  selects; and 0013 changed what a stored `row_hash` means, so a pre-0013 client
+  recomputes v2 rows with the v1 recipe and reports an untampered chain as
+  **tampered** — a silent wrong answer from the one function whose whole job is
+  to be trusted. **Upgrade every client of a shared database together.**
+  A version this build does not recognise is now an error naming the version,
+  not a "tampered" verdict: an unknown recipe means the row is newer, not bad.
 
 ### Known, deliberately not changed here
 - `email` is unique but **not verified** — see the note under Breaking. Whatever

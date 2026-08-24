@@ -254,8 +254,15 @@ def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
     # fold is unconditional (an empty tag set folds too), so a v2 row recomputed
     # under v1 — or a v1 row under v2 — cannot come out the same. That is what
     # keeps `hash_version` a selector rather than a claim the recipe must trust.
-    if version >= 2:
+    if version == 2:
         h = _fold(h, "memgres.tags.v2", *tags)
+    elif version > 2:
+        # A version this build does not know is not the same thing as a broken
+        # chain, and must not be reported as one: it means the row was written
+        # by something newer. Say that instead of returning "tampered".
+        raise ValueError(
+            f"history row uses hash recipe v{version}, and this build knows up "
+            f"to v{HASH_VERSION} — upgrade to verify it")
     # Each optional dimension folds in ONLY when it was touched on this row. A row
     # that touched neither title nor author — which includes EVERY row written
     # before those features — returns the base digest unchanged and still

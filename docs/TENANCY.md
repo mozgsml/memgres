@@ -122,12 +122,20 @@ role one namespace at a time. A token scoped to a single namespace stays scoped
 under either word. For everyone else `all` is unchanged, because for them it is
 genuinely everything.
 
+The same refusal covers a search that names **no** namespace at all, which is
+the same trap reached by saying nothing. (A *write* still resolves to your one
+membership: it has to land somewhere, and nothing is being left out of an
+answer.)
+
 There is deliberately no keyword for "the namespaces I belong to". Namespace
 names are free text and the obvious candidates are names people use — the first
 draft of this shadowed a namespace literally called `mine` in the test suite.
 `*` survives that objection, and the collision is still checked rather than
-assumed away: if a namespace in play really is named `*`, the keyword is refused
-as ambiguous and you address that one by id.
+assumed away: if a namespace **you reach** is named `*`, the keyword is refused
+as ambiguous and you address that one by id. The check is deliberately scoped to
+what you reach — checking every name in the deployment let any tenant disable
+the keyword for the superadmin by naming a namespace `*`, and a stranger's
+choice of name must not reach into what your words mean.
 
 **If you reach more than one namespace, you must name one** — for a search as
 much as for a write. Searching one of them and answering "nothing found" is
@@ -301,8 +309,15 @@ The requester's receipt says only that the request was submitted. It carries no
 request id — deciding belongs to whoever administers the namespace, who reads
 ids from the listing — and a namespace that does not exist answers exactly like
 one the requester cannot reach, so the route cannot be used to find out which
-uuids are real. Already reaching it is reported plainly (`already_reachable`):
-that is the caller's own access, which `/spaces` shows them anyway.
+uuids are real. That holds for the *timing* too, which is why the request is
+recorded either way: while the write was conditional the two cases were ~8×
+apart on the clock, which tells an outsider exactly what the identical wording
+withheld. A request pointing at nothing is inert — nobody can list it, and
+deciding it is refused — and each account may have 100 open requests, which
+bounds both the table and request spam.
+
+Already reaching it is reported plainly (`already_reachable`): that is the
+caller's own access, which `/spaces` shows them anyway.
 
 ## First admin — bootstrap (managed mode)
 

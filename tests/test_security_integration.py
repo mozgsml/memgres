@@ -394,3 +394,165 @@ def test_request_access_tells_you_about_your_own_access(env):
     assert admin.request_access(setup, p, namespace_id=ns) == {
         "status": "already_reachable", "permission": "admin"}
     assert ident.list_requests(setup, ns) == []
+
+
+def test_a_read_only_superadmin_token_cannot_administer_a_namespace(env):
+    """A role says who you ARE; a token says what THIS credential may do. The
+    superadmin branch returned before any ceiling check, so the credential the
+    docs recommend handing an agent — read-only — could rewrite any namespace's
+    `instruction` (the routing hint other agents read to decide where memories
+    land) and approve access requests, granting strangers write membership
+    anywhere. Neither of those is a read."""
+    from memgres import admin
+
+    setup, make_store = env
+    make_store("managed")
+    cfg = dataclasses.replace(load(), key_mode="managed")
+
+    root = ident.create_user(setup, name="root", role="superadmin")
+    victim = ident.create_user(setup, name="victim")
+    ns = ident.create_namespace(setup, victim, "theirs", instruction="ask victim")
+    outsider = ident.create_user(setup, name="outsider")
+    ident.request_access(setup, outsider, ns, "write")
+    [req] = ident.list_requests(setup, ns)
+
+    weak, _ = ident.issue_token(setup, root, permission="read")
+    p = ident.resolve(setup, cfg, weak)
+    assert p.is_admin and p.permission == "read"
+
+    with pytest.raises(DENIED):
+        admin.edit_namespace(setup, p, namespace_id=ns, instruction="PWNED")
+    with pytest.raises(DENIED):
+        admin.decide_access(setup, p, request_id=req["id"], approve=True)
+    with pytest.raises(DENIED):
+        admin.list_requests(setup, p, namespace_id=ns)
+    assert ident.reaches(setup, outsider, ns) is None       # nothing was granted
+
+    # the same account WITH an admin-ceiling token is allowed, as before
+    strong, _ = ident.issue_token(setup, root, permission="admin")
+    admin.edit_namespace(setup, ident.resolve(setup, cfg, strong),
+                         namespace_id=ns, instruction="fixed")
+    # …and the capability report agrees with both answers
+    assert admin.capabilities(setup, p)["has_admin_ceiling"] is False
+    assert admin.capabilities(
+        setup, ident.resolve(setup, cfg, strong))["has_admin_ceiling"] is True
+
+
+def test_a_request_for_a_nonexistent_namespace_is_recorded_like_any_other(env):
+    """Uniformity has to hold in the WORK, not just the words. While the insert
+    was conditional, a nonexistent id returned after one SELECT and a real one
+    after a SELECT plus a committed upsert — identical answers, an ~8x tell on
+    the clock. Both cases now take the same path, which is observable as: the
+    row exists either way."""
+    import uuid
+
+    from memgres import admin
+
+    setup, make_store = env
+    make_store("managed")
+    victim = ident.create_user(setup, name="victim")
+    hidden = ident.create_namespace(setup, victim, "private")
+    outsider = ident.create_user(setup, name="outsider")
+    tok, _ = ident.issue_token(setup, outsider)
+    p = ident.resolve(setup, dataclasses.replace(load(), key_mode="managed"), tok)
+
+    ghost = str(uuid.uuid4())
+    assert admin.request_access(setup, p, namespace_id=hidden) == {
+        "status": "submitted"}
+    assert admin.request_access(setup, p, namespace_id=ghost) == {
+        "status": "submitted"}
+
+    with setup.cursor() as cur:
+        cur.execute("SELECT namespace_id::text FROM access_request "
+                    "WHERE requester_user_id=%s", (outsider,))
+        recorded = {r[0] for r in cur.fetchall()}
+    assert recorded == {hidden, ghost}          # the ghost row was written too
+
+    # …and it is inert: nobody can list it, and deciding it is refused
+    assert ident.list_requests(setup, ghost) != []      # only by knowing the id
+    assert len(ident.list_requests(setup, hidden)) == 1
+    [ghost_req] = ident.list_requests(setup, ghost)
+    owner_p = ident.resolve(setup, dataclasses.replace(load(), key_mode="managed"),
+                            ident.issue_token(setup, victim, permission="admin")[0])
+    with pytest.raises(DENIED):
+        admin.decide_access(setup, owner_p, request_id=ghost_req["id"],
+                            approve=True)
+
+
+def test_requests_are_capped_per_account(env):
+    """The row is written whether or not the namespace exists, so without a cap
+    an account could grow the table one guessed uuid at a time."""
+    import uuid
+
+    from memgres import admin
+
+    setup, make_store = env
+    make_store("managed")
+    uid = ident.create_user(setup, name="spammer")
+    tok, _ = ident.issue_token(setup, uid)
+    p = ident.resolve(setup, dataclasses.replace(load(), key_mode="managed"), tok)
+
+    monkey = ident.MAX_PENDING_REQUESTS_PER_USER
+    ident.MAX_PENDING_REQUESTS_PER_USER = 3
+    try:
+        for _ in range(3):
+            admin.request_access(setup, p, namespace_id=str(uuid.uuid4()))
+        with pytest.raises(ValueError) as e:
+            admin.request_access(setup, p, namespace_id=str(uuid.uuid4()))
+        assert "cap" in str(e.value)
+    finally:
+        ident.MAX_PENDING_REQUESTS_PER_USER = monkey
+
+
+def test_a_uuid_spelling_postgres_rejects_never_reaches_postgres(env):
+    """`uuid.UUID` accepts spellings Postgres does not (`urn:uuid:…`, braces).
+    Validating the value and then forwarding the ORIGINAL — which is what this
+    did — aborts the caller's transaction with a driver error, surfaces as a
+    server fault, and leaves the connection refusing every later statement."""
+    setup, make_store = env
+    make_store("managed")
+    uid = ident.create_user(setup, name="u")
+    ns = ident.create_namespace(setup, uid, "own")
+
+    assert ident.reaches(setup, uid, f"urn:uuid:{ns}") == "admin"   # normalized
+    assert ident.reaches(setup, uid, "{" + ns + "}") == "admin"
+    # something that is no uuid at all is a plain argument error
+    with pytest.raises(ValueError):
+        ident.reaches(setup, uid, "not-a-uuid")
+    with pytest.raises(ValueError):
+        ident.request_access(setup, uid, "not-a-uuid")
+    # the connection is still usable — no fault ever reached the driver
+    assert ident.reaches(setup, uid, ns) == "admin"
+
+
+def test_capabilities_never_advertise_a_door_that_always_closes(env):
+    """`create_own_namespace` refuses a read-only token, a scoped token and a
+    credential with no owning user. Reporting the bare right would send all
+    three at a door that is going to refuse them."""
+    from memgres import admin
+
+    setup, make_store = env
+    make_store("managed")
+    cfg = dataclasses.replace(load(), key_mode="managed")
+    uid = ident.create_user(setup, name="u", can_create_namespace=True)
+    ns = ident.create_namespace(setup, uid, "own")
+
+    reader, _ = ident.issue_token(setup, uid, permission="read")
+    scoped, _ = ident.issue_token(setup, uid, namespace_id=ns, permission="admin")
+    for tok in (reader, scoped):
+        p = ident.resolve(setup, cfg, tok)
+        assert admin.capabilities(setup, p)["can_create_namespace"] is False
+        with pytest.raises(DENIED):
+            ident.create_own_namespace(setup, p, "second")
+
+    # the env break-glass root owns no account, so it has no tokens to manage
+    root = ident.Principal(user_id=None, permission="admin",
+                           scope_namespace_id=None, is_admin=True)
+    caps = admin.capabilities(setup, root)
+    assert caps["can_manage_own_tokens"] is False
+    assert caps["can_create_namespace"] is False
+
+    # …and an ordinary unscoped writer with the right still gets a True
+    full, _ = ident.issue_token(setup, uid, permission="write")
+    assert admin.capabilities(
+        setup, ident.resolve(setup, cfg, full))["can_create_namespace"] is True

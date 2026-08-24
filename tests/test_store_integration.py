@@ -446,6 +446,42 @@ def test_a_chain_written_across_the_upgrade_still_verifies(store):
     assert store.verify_history(None, m.id) is True         # across the boundary
 
 
+def test_an_older_client_would_call_an_untouched_chain_tampered(store):
+    """Why 0013 raised the compatibility floor even though the SQL is additive:
+    it changed what a stored `row_hash` MEANS. A pre-0013 client recomputes
+    every row with the v1 recipe and reports an untampered v2 chain as tampered
+    — a wrong answer from the one function whose entire job is to be trusted,
+    and a silent one. The floor turns that into a refusal to start."""
+    from memgres.store import _row_hash
+
+    m = store.write(body="1\n", tags=["a", "b"])
+    assert store.verify_history(None, m.id) is True
+
+    prev = None
+    for r in store.history(None, m.id):
+        as_v1 = _row_hash(prev, m.id, r["seq"], r["op"], r["diff"],
+                          r["hash_after"], r["path_after"], r["tags_after"],
+                          r["source"], r["reason"], r["author_user_id"],
+                          r["author_token_id"], r["title_before"],
+                          r["title_after"], version=1)
+        assert as_v1 != r["row_hash"]           # what the old client computes
+        prev = r["row_hash"]
+
+
+def test_a_recipe_from_the_future_is_not_reported_as_tampering(store):
+    """A version this build does not know means the row was written by something
+    newer. Saying "tampered" would accuse the data of what is really a version
+    gap — and that is the answer someone acts on."""
+    m = store.write(body="1\n")
+    with store._conn.cursor() as cur:
+        cur.execute("UPDATE memory_history SET hash_version=99 WHERE memory_id=%s",
+                    (m.id,))
+    store._conn.commit()
+    with pytest.raises(ValueError) as e:
+        store.verify_history(None, m.id)
+    assert "v99" in str(e.value)
+
+
 def test_forget_erases_history(store):
     m = store.write(body="secret\n")
     assert store.forget(None, m.id) is True

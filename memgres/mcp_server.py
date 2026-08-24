@@ -869,7 +869,15 @@ def build_server(cfg: Optional[Config] = None):
                       "has_admin_ceiling", "is_admin")}
 
         def _caps_for_caller():
-            """This request's capabilities, or None if the caller is unknown."""
+            """This request's capabilities, or None if the caller is unknown.
+
+            Only a failed CREDENTIAL answers None. A database that is briefly
+            unavailable raises, and the `tools/list` fails — which a client
+            retries. Swallowing it would answer with the read-only subset
+            instead: a client lists once at connect and caches, so a one-second
+            blip would take an agent's write tools away for the whole session,
+            and the agent would report the server as read-only.
+            """
             if not _identity_on:
                 # One implicit caller who may do everything; there is no
                 # credential to resolve and nothing to withhold.
@@ -878,12 +886,17 @@ def build_server(cfg: Optional[Config] = None):
                 ctx = mcp.get_context()
             except Exception:
                 ctx = None
-            try:
-                with pool.connection() as conn:
-                    p = identity.resolve(conn, cfg, _token(ctx, None))
-                    return admin.capabilities(conn, p)
-            except Exception:
-                return None
+            with pool.connection() as conn:
+                try:
+                    # `touch=False`: listing tools is asking ABOUT the
+                    # credential, not acting on it. Stamping `last_used_at` here
+                    # would make every `tools/list` a write transaction and turn
+                    # the column into "last connected".
+                    p = identity.resolve(conn, cfg, _token(ctx, None),
+                                         touch=False)
+                except identity.AuthError:
+                    return None
+                return admin.capabilities(conn, p)
 
         async def _list_visible_tools():
             tools = await mcp.list_tools()

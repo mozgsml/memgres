@@ -194,9 +194,22 @@ def test_hiding_a_tool_is_not_how_it_is_refused(deployment, monkeypatch):
     assert "memory_write" not in _listed(mcp)
     with pytest.raises(ToolError) as e:
         asyncio.run(mcp.call_tool("memory_write", {"body": "should not land\n"}))
-    msg = str(e.value).lower()
-    assert "unknown tool" not in msg
-    assert "permission" in msg or "read" in msg or "token" in msg
+    assert "unknown tool" not in str(e.value).lower()
+
+    # and it did not land — the refusal is the service layer's, not the list's
+    conn = psycopg.connect(DSN, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM memory WHERE body LIKE %s",
+                        ("should not land%",))
+            assert cur.fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    # a tool the same credential IS shown works, so the refusal above was about
+    # permission and not about the server being broken for this client
+    assert asyncio.run(mcp.call_tool("memory_recall", {"query": "anything"})) \
+        is not None
 
 
 def test_a_narrowed_credential_narrows_the_list_even_for_a_superadmin(
@@ -224,6 +237,65 @@ def test_a_narrowed_credential_narrows_the_list_even_for_a_superadmin(
     assert "memory_issue_token" not in shown            # so is minting tokens
     assert "memory_admin_edit_namespace" in shown       # its own namespace remains
     assert "memory_write" in shown
+
+
+def test_a_database_blip_fails_the_listing_rather_than_shrinking_it(deployment,
+                                                                   monkeypatch):
+    """Swallowing every failure into "unidentified caller" answers with the
+    read-only subset. A client lists once at connect and caches, so a one-second
+    blip would take an agent's write tools away for the whole session and the
+    agent would report the server as read-only. Failing is recoverable; a wrong
+    list is not."""
+    root_tok, writer, _ = deployment
+    _env(monkeypatch, MEMGRES_ADMIN_TOKEN=root_tok, MEMGRES_ADMIN_ROLE="superadmin",
+         MEMGRES_TOKEN=writer)
+    mcp = build_server(load())
+    assert "memory_write" in _listed(mcp)
+
+    import memgres.mcp_server as ms
+
+    real = ms.identity.resolve
+
+    def explode(conn, cfg, secret, **kw):
+        raise RuntimeError("pool timeout")
+
+    monkeypatch.setattr(ms.identity, "resolve", explode)
+    try:
+        with pytest.raises(RuntimeError):
+            _listed(mcp)
+    finally:
+        monkeypatch.setattr(ms.identity, "resolve", real)
+
+    # a token that simply fails to authenticate is NOT a blip: it answers
+    _env(monkeypatch, MEMGRES_ADMIN_TOKEN=root_tok, MEMGRES_ADMIN_ROLE="superadmin",
+         MEMGRES_TOKEN=identity.new_token())
+    shown = _listed(build_server(load()))
+    assert "memory_recall" in shown and "memory_write" not in shown
+
+
+def test_listing_tools_does_not_count_as_using_the_token(deployment, monkeypatch):
+    """`resolve` stamps `last_used_at`. Listing is asking ABOUT the credential,
+    not acting on it — counting it would make every `tools/list` a write
+    transaction and turn the column into "last connected"."""
+    root_tok, writer, _ = deployment
+    _env(monkeypatch, MEMGRES_ADMIN_TOKEN=root_tok, MEMGRES_ADMIN_ROLE="superadmin",
+         MEMGRES_TOKEN=writer)
+    mcp = build_server(load())
+
+    conn = psycopg.connect(DSN, autocommit=True)
+    try:
+        def last_used():
+            with conn.cursor() as cur:
+                cur.execute("SELECT last_used_at FROM token WHERE token_hash=%s",
+                            (identity.token_hash(writer),))
+                return cur.fetchone()[0]
+
+        _listed(mcp)
+        assert last_used() is None
+        asyncio.run(mcp.call_tool("memory_recall", {"query": "anything"}))
+        assert last_used() is not None          # a real call still stamps it
+    finally:
+        conn.close()
 
 
 def test_visibility_can_be_turned_off(deployment, monkeypatch):

@@ -285,6 +285,54 @@ def test_the_wide_word_does_not_widen_a_scoped_token(env):
     assert [h.namespace for h in hits] == [ids[0]]
 
 
+def test_naming_no_namespace_at_all_gets_the_same_refusal(env):
+    """The trap reached by saying nothing. A superadmin with ONE membership was
+    silently answered from that one namespace — the exact partial answer the
+    keyword refusal exists to prevent, one function away from the fix."""
+    setup, s = env
+    _, root, _ = _superadmin(setup, "root", "ops")
+    _, other, _ = _owner(setup, "tenant", "theirs")
+    s.write(other, body="apple elsewhere\n", space="theirs")
+
+    with pytest.raises(SpaceAmbiguous) as e:
+        s.recall(root, "apple")                     # no space, no space_id
+    assert "'*'" in str(e.value)
+    assert len(s.recall(root, "apple", space="*")) == 1
+
+    # a WRITE with no address still resolves to the single membership: it has to
+    # land somewhere, and nothing is left out of an answer
+    s.write(root, body="apple of my own\n")
+    assert len(s.recall(root, "apple", space="ops")) == 1
+
+
+def test_a_stranger_cannot_take_the_wide_keyword_away(env):
+    """`*` was checked against EVERY name in the deployment, so any tenant could
+    disable it for the superadmin by naming a namespace `*` — and with `all`
+    already refused, the two errors pointed at each other and left the operator
+    enumerating uuids. A stranger's choice of name must not reach into what this
+    caller's words mean."""
+    setup, s = env
+    _, root, _ = _superadmin(setup, "root", "ops")
+    _, tenant, ids = _owner(setup, "tenant", "*")
+    s.write(tenant, body="apple in the star\n", space_id=ids[0])
+    s.write(root, body="apple in ops\n", space="ops")
+
+    assert len(s.recall(root, "apple", space="*")) == 2      # still works
+
+
+def test_owning_a_namespace_named_like_the_wide_keyword_is_ambiguous_not_forbidden(env):
+    """For the owner of a namespace named `*`, that name is the likely meaning —
+    so the answer is the ambiguity refusal, not a lecture about superadmins."""
+    setup, s = env
+    _, tok, ids = _owner(setup, "plain", "*", "other")
+    s.write(tok, body="apple\n", space_id=ids[0])
+
+    with pytest.raises(SpaceAmbiguous) as e:
+        s.recall(tok, "apple", space="*")
+    assert "space_id" in str(e.value)
+    assert len(s.recall(tok, "apple", space_id=ids[0])) == 1
+
+
 def test_a_namespace_actually_named_like_a_keyword_is_not_swallowed(env):
     """Namespace names are free text, so a keyword can collide with a real name.
     Neither meaning is assumed — the call is refused and told to use the id."""
