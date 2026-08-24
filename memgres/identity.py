@@ -347,6 +347,129 @@ def resolve_space(conn, principal: Principal, *, space_id: Optional[str] = None,
         raise SpaceNotFound("user has no default namespace yet")
 
 
+ALL_SPACES = "all"
+
+
+def _as_list(v) -> List[str]:
+    """One address or several. A bare str is ONE name/id, never a char sequence."""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    return [str(x) for x in v]
+
+
+def _wants_all(space) -> bool:
+    """True when ``space`` IS the ``all`` keyword — as a bare string or as the
+    sole element of a list. Anywhere else (``["all", "notes"]``) it is read as a
+    literal namespace name, so the keyword can never silently widen a list the
+    caller meant literally."""
+    names = _as_list(space)
+    return len(names) == 1 and names[0] == ALL_SPACES
+
+
+def resolve_spaces(conn, principal: Principal, *, space=None,
+                   space_id=None) -> List[Tuple[str, str]]:
+    """Resolve a READ address that may span several namespaces.
+
+    Returns ``[(namespace_id, effective_permission), …]`` — deduped, in the order
+    the caller named them (or creation order for ``all``).
+
+    * ``space`` — an own-namespace name, a list of them, or the keyword ``"all"``
+      (every namespace the caller reaches).
+    * ``space_id`` — a reachable namespace id or a list of them. Shared namespaces
+      have no resolvable name (see :func:`resolve_space`), so this is the only way
+      to name one. ``space`` and ``space_id`` may be combined.
+    * neither — one reachable namespace is used silently; SEVERAL is an error.
+
+    That last rule is the one difference from :func:`resolve_space`, and it is
+    deliberate: a write with no address falls back on the declared default,
+    because filing something in your own drawer is a choice the user already made.
+    A read cannot do the same — searching the default while three other reachable
+    namespaces go unsearched returns "nothing found", which reads as *absence* and
+    is indistinguishable from an answer. A partial result that looks complete is
+    the expensive failure, so the caller is asked to say where to look.
+
+    Every address is resolved through :func:`resolve_space`, so scope pinning,
+    reachability and the token's permission ceiling are enforced in exactly one
+    place — this function only decides WHICH namespaces are in play, never whether
+    the caller may have them.
+    """
+    names, ids = _as_list(space), _as_list(space_id)
+
+    if _wants_all(space):
+        if ids:
+            raise SpaceAmbiguous(
+                "`space='all'` already means every namespace you reach — drop "
+                "`space_id`, or list the namespaces you want explicitly")
+        return _all_reachable(conn, principal)
+
+    if not names and not ids:
+        return [_sole_reachable(conn, principal)]
+
+    out: List[Tuple[str, str]] = []
+    seen: set = set()
+    for nsid in ids:
+        _collect(out, seen, resolve_space(conn, principal, space_id=nsid))
+    for name in names:
+        _collect(out, seen, resolve_space(conn, principal, space=name))
+    return out
+
+
+def _collect(out: List[Tuple[str, str]], seen: set, resolved: Tuple[str, str]) -> None:
+    """Append unless this namespace is already in play (the same space can be
+    reached twice — by id and by name — and must not be searched twice)."""
+    nsid, perm = resolved
+    if nsid not in seen:
+        seen.add(nsid)
+        out.append((nsid, perm))
+
+
+def _all_reachable(conn, principal: Principal) -> List[Tuple[str, str]]:
+    """Every namespace the caller reaches, capped by the token ceiling."""
+    if principal.user_id is None:
+        # An env break-glass root has no membership rows to enumerate, and a
+        # provisional open-mode token owns nothing yet. Neither can say "all".
+        raise AuthError("this token must address a namespace by id")
+    ceiling = principal.permission
+    if principal.scope_namespace_id is not None:
+        # A scoped token reaches exactly one namespace by construction; `all`
+        # must not widen it. Resolving through the single-space path keeps the
+        # reachability re-check that scope pinning relies on.
+        return [resolve_space(conn, principal,
+                              space_id=principal.scope_namespace_id)]
+    reachable = list_spaces(conn, principal.user_id)
+    if not reachable:
+        raise SpaceNotFound("you can reach no namespaces yet")
+    if any(s["name"] == ALL_SPACES for s in reachable):
+        raise SpaceAmbiguous(
+            f"you can reach a namespace actually named '{ALL_SPACES}', so the "
+            f"keyword is ambiguous here — address that one by `space_id`")
+    return [(s["id"], perm_min(s["permission"], ceiling)) for s in reachable]
+
+
+def _sole_reachable(conn, principal: Principal) -> Tuple[str, str]:
+    """The caller's only namespace, or an error naming the candidates."""
+    if principal.user_id is None:
+        if principal.is_admin:            # env break-glass root owns nothing
+            raise AuthError("global admin must address a space by id")
+        raise SpaceNotFound("token has no namespaces yet")
+    if principal.scope_namespace_id is not None:
+        return resolve_space(conn, principal,
+                             space_id=principal.scope_namespace_id)
+    reachable = list_spaces(conn, principal.user_id)
+    if len(reachable) == 1:
+        only = reachable[0]
+        return only["id"], perm_min(only["permission"], principal.permission)
+    if not reachable:
+        raise SpaceNotFound("you can reach no namespaces yet")
+    names = ", ".join(sorted(s["name"] for s in reachable))
+    raise SpaceAmbiguous(
+        f"you can reach {len(reachable)} namespaces ({names}) — searching one of "
+        f"them silently would look like an answer, so say which: `space` with one "
+        f"or more names, or `space='{ALL_SPACES}'` for all of them")
+
+
 # ─── management: users / namespaces / members ────────────────────────────────
 def create_user(conn, name: str = "", description: str = "",
                 role: str = "user", *,

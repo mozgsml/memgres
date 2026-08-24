@@ -291,3 +291,53 @@ def test_admin_provisioning_and_request_access(monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_recall_over_several_namespaces(monkeypatch):
+    """The wire shape of a multi-namespace address: repeated query params
+    (`?space=a&space=b`), a single `?space=all`, and the hit telling you which
+    namespace answered. A bare `?space=a` must keep meaning exactly one space —
+    the list form is additive, not a break."""
+    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    for k in list(os.environ):
+        if k.startswith("MEMGRES_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
+    monkeypatch.setenv("MEMGRES_KEY_MODE", "open")
+    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
+    monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
+    from memgres import identity
+
+    app = create_app(load())
+    tok = identity.new_token()
+    h = {"Authorization": f"Bearer {tok}"}
+    with TestClient(app) as client:
+        for space in ("work", "home", "spare"):
+            assert client.post("/memories",
+                               json={"body": f"apple in {space}\n", "space": space},
+                               headers=h).status_code == 201
+
+        # several reachable and none named → refused, with the candidates
+        r = client.get("/recall", params={"q": "apple"}, headers=h)
+        assert r.status_code == 422 and "work" in r.text and "home" in r.text
+
+        # repeated param = exactly those two
+        r = client.get("/recall", params={"q": "apple", "space": ["work", "home"]},
+                       headers=h)
+        assert {hit["space"] for hit in r.json()} == {"work", "home"}
+
+        # the keyword takes them all
+        r = client.get("/recall", params={"q": "apple", "space": "all"}, headers=h)
+        assert {hit["space"] for hit in r.json()} == {"work", "home", "spare"}
+        assert all(hit["space_id"] for hit in r.json())
+
+        # one name is still one namespace
+        r = client.get("/recall", params={"q": "apple", "space": "work"}, headers=h)
+        assert [hit["space"] for hit in r.json()] == ["work"]
+
+        # browse and title-find address the same way
+        assert len(client.get("/memories", params={"space": "all"},
+                              headers=h).json()) == 3
+        assert client.get("/find", params={"q": "apple", "space": "all"},
+                          headers=h).status_code == 200

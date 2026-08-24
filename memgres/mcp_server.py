@@ -25,7 +25,7 @@ either. (``single`` mode needs no token at all.)
 
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Union
 
 try:  # mcp SDK >= 2.0 renamed the module fastmcp -> mcpserver
     from mcp.server.mcpserver import Context
@@ -38,6 +38,10 @@ from .embeddings import get_embedder
 from .bootstrap import bootstrap_admin
 from .schema import migrate
 from .store import Store, build_replace
+
+# One namespace, several, or the keyword "all" — the address shape every search
+# tool accepts. Named once so the three tools cannot drift apart.
+Spaces = Optional[Union[str, List[str]]]
 
 
 # The MCP `initialize` response carries a server-side `instructions` string; a
@@ -239,7 +243,7 @@ def build_server(cfg: Optional[Config] = None):
                       path_prefix: Optional[str] = None,
                       snippet: Optional[bool] = None,
                       full_body: Optional[bool] = None,
-                      space: Optional[str] = None, space_id: Optional[str] = None,
+                      space: Spaces = None, space_id: Spaces = None,
                       token: Optional[str] = None, ctx: Context = None) -> List[dict]:
         """Search memories. `mode`: lexical | semantic | hybrid | auto. `match`
         governs lexical word combination — defaults to OR-any (any query word
@@ -250,8 +254,14 @@ def build_server(cfg: Optional[Config] = None):
         best-matching segment, lexical uses ts_headline) with `lines`=[start,end];
         `kind="full"` means the snippet IS the whole body (short body, or
         `full_body=true`). Pass `full_body=true` to force whole bodies,
-        `snippet=false` to skip slicing. `space`/`space_id` pick which namespace
-        to search (default: yours)."""
+        `snippet=false` to skip slicing.
+
+        WHERE to search: `space` takes a namespace name, a list of names, or
+        `"all"` for every namespace you reach; `space_id` takes ids (the only way
+        to name a namespace shared WITH you). Omit both and your single namespace
+        is used — but if you reach several, naming one is REQUIRED, because
+        searching just one of them would return "nothing found" and read like an
+        answer. Every hit carries `space`/`space_id` saying where it came from."""
         with pool.connection() as conn:
             return [h.to_recall_dict()
                     for h in _store(conn).recall(
@@ -263,15 +273,16 @@ def build_server(cfg: Optional[Config] = None):
     @mcp.tool()
     def memory_list(path_prefix: Optional[str] = None,
                     tags: Optional[List[str]] = None, limit: int = 50,
-                    offset: int = 0, space: Optional[str] = None,
-                    space_id: Optional[str] = None,
+                    offset: int = 0, space: Spaces = None,
+                    space_id: Spaces = None,
                     token: Optional[str] = None, ctx: Context = None) -> List[dict]:
         """BROWSE (enumerate) a subtree — NOT a search. Lists memories under
         `path_prefix` (e.g. survey all of 'decisions.*') ordered by path, with a
         short first-line `preview` of each. No query, no ranking; use
         `memory_recall` when you want relevance search. Optionally narrow by
-        `tags`; `limit`/`offset` paginate. `space`/`space_id` pick the namespace
-        (default: yours)."""
+        `tags`; `limit`/`offset` paginate. `space`/`space_id` pick the
+        namespace(s) — a name, a list, or `"all"`; required when you reach
+        several. Rows carry `space`/`space_id`."""
         with pool.connection() as conn:
             return _store(conn).list(
                 _token(ctx, token), path_prefix=path_prefix, tags=tags,
@@ -281,12 +292,13 @@ def build_server(cfg: Optional[Config] = None):
     def memory_find(query: str, k: int = 10, tags: Optional[List[str]] = None,
                     path_prefix: Optional[str] = None,
                     match: Optional[Literal["any", "all"]] = None,
-                    space: Optional[str] = None, space_id: Optional[str] = None,
+                    space: Spaces = None, space_id: Spaces = None,
                     token: Optional[str] = None, ctx: Context = None) -> List[dict]:
         """LOCATE by curated `title` (+ tags) — a light "where is it" search over
         titles only, NEVER the body. Returns {id, path, title, tags, score} (no
         body/snippet), so it's cheap to scan before a heavier `memory_recall`.
-        Works even without an embedder. Narrow by `tags`/`path_prefix`."""
+        Works even without an embedder. Narrow by `tags`/`path_prefix`; pick
+        namespace(s) with `space`/`space_id` (a name, a list, or `"all"`)."""
         with pool.connection() as conn:
             return _store(conn).find(_token(ctx, token), query, k=k, tags=tags,
                                      path_prefix=path_prefix, match=match,

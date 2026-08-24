@@ -47,6 +47,12 @@ class Hit:
     path: Optional[str]
     score: float
     title: str = ""               # curated caption (from HIT_COLUMNS)
+    namespace: str = ""           # which namespace this hit came from. Carried on
+                                  # every hit because a recall may span several —
+                                  # without it the caller cannot tell where a
+                                  # result lives, nor address it for a follow-up.
+    space: Optional[str] = None   # that namespace's NAME, filled in by the store
+                                  # (the memory row holds only the id)
     # filled in by search.attach_snippets after ranking. `snippet` is the text we
     # return: the most relevant slice, or the whole body when it's short / forced.
     # `kind` says which — "full" (snippet IS the entire body) vs "snippet" (a
@@ -67,7 +73,8 @@ class Hit:
         body (dropped by attach_snippets) and the internal chunk_span."""
         return {"id": self.id, "title": self.title, "tags": self.tags,
                 "path": self.path, "score": self.score, "snippet": self.snippet,
-                "kind": self.kind, "lines": self.lines}
+                "kind": self.kind, "lines": self.lines,
+                "space_id": self.namespace, "space": self.space}
 
 
 def _vec_literal(vec: Sequence[float]) -> str:
@@ -79,18 +86,37 @@ def _vec_literal(vec: Sequence[float]) -> str:
 # definition so lexical and both chunk backends SELECT the same set and adding a
 # field is one edit. When a backend ranks in SQL and appends its score column
 # AFTER these, the score is row[len(HIT_COLUMNS)].
-HIT_COLUMNS = "id, body, tags, path::text, title"
+HIT_COLUMNS = "id, body, tags, path::text, title, namespace"
 
 
 def row_to_hit(row, score: float) -> "Hit":
     """Build a Hit from a (HIT_COLUMNS) row plus a separately-supplied score."""
-    return Hit(str(row[0]), row[1], list(row[2]), row[3], float(score), title=row[4])
+    return Hit(str(row[0]), row[1], list(row[2]), row[3], float(score),
+               title=row[4], namespace=str(row[5]))
 
 
-def build_filters(ns: str, tags: Optional[Sequence[str]], path_prefix: Optional[str]):
-    """Return (sql_fragment, params) for the shared WHERE tail."""
-    sql = ["namespace = %s", "(expires_at IS NULL OR expires_at > now())"]
-    params: list = [ns]
+def as_namespaces(ns) -> List[str]:
+    """Normalize a namespace address to a list of ids.
+
+    A read may span several namespaces (see ``identity.resolve_spaces``), so every
+    filter below takes a *set*. A bare ``str`` is ONE namespace — never a sequence
+    of characters, which is the bug this function exists to make impossible."""
+    if isinstance(ns, str):
+        return [ns]
+    return [str(n) for n in ns]
+
+
+def build_filters(ns, tags: Optional[Sequence[str]], path_prefix: Optional[str]):
+    """Return (sql_fragment, params) for the shared WHERE tail.
+
+    ``ns`` is one namespace id or several. The tenant predicate is ``= ANY`` in
+    both cases: one code path, so a multi-namespace read cannot diverge from a
+    single-namespace one. This is the ONLY place the tenant filter is written for
+    Postgres — ``fetch_hit_rows`` re-applies it to every candidate a vector
+    backend proposes, which is what keeps a backend-side filter bug a recall
+    problem rather than a cross-tenant leak."""
+    sql = ["namespace = ANY(%s)", "(expires_at IS NULL OR expires_at > now())"]
+    params: list = [as_namespaces(ns)]
     if tags:
         sql.append("tags @> %s")           # row must contain all requested tags
         params.append(list(tags))
@@ -100,7 +126,7 @@ def build_filters(ns: str, tags: Optional[Sequence[str]], path_prefix: Optional[
     return " AND ".join(sql), params
 
 
-def fetch_hit_rows(conn, ns: str, memory_ids: Sequence[str],
+def fetch_hit_rows(conn, ns, memory_ids: Sequence[str],
                    tags: Optional[Sequence[str]],
                    path_prefix: Optional[str]) -> dict:
     """Bodies (HIT_COLUMNS) for the given memory ids, applying the shared
@@ -117,7 +143,7 @@ def fetch_hit_rows(conn, ns: str, memory_ids: Sequence[str],
         return {str(r[0]): r for r in cur.fetchall()}
 
 
-def grouped_chunk_search(conn, ns: str, k: int,
+def grouped_chunk_search(conn, ns, k: int,
                          tags: Optional[Sequence[str]],
                          path_prefix: Optional[str],
                          fetch_chunks: Callable[[int, List[str]], List[tuple]]

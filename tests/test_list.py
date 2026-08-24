@@ -64,7 +64,7 @@ def test_lists_subtree_ordered_by_path(store):
     assert all(r["path"].startswith("decisions") for r in rows)
     # shape of each row
     assert set(rows[0]) == {"id", "path", "tags", "title", "preview",
-                            "created_at", "updated_at"}
+                            "created_at", "updated_at", "space_id", "space"}
 
 
 def test_preview_is_first_line_truncated(store):

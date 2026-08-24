@@ -261,3 +261,85 @@ def test_open_mode_random_token_reads_nothing(env):
     with setup.cursor() as cur:
         cur.execute("SELECT count(*) FROM app_user")
         assert cur.fetchone()[0] == 1       # only the victim
+
+
+# ─── multi-namespace search: widening must never widen past what you reach ───
+# `space="all"` is the one address that does not name its namespaces, so it is
+# the one an attacker would reach for. These pin that it resolves from the
+# caller's OWN reachability and nothing else.
+def test_all_never_includes_an_unreachable_namespace(env):
+    setup, make_store = env
+    s = make_store("managed")
+    v_uid = ident.create_user(setup, name="victim")
+    vns = ident.create_namespace(setup, v_uid, "secrets")
+    victim_tok, _ = ident.issue_token(setup, v_uid)
+    s.write(victim_tok, body="launch codes\n", space="secrets")
+
+    a_uid = ident.create_user(setup, name="attacker")
+    ident.create_namespace(setup, a_uid, "mine")
+    attacker_tok, _ = ident.issue_token(setup, a_uid)
+    s.write(attacker_tok, body="codes for my own lunch\n", space="mine")
+
+    hits = s.recall(attacker_tok, "launch codes", space="all")
+    assert all(h.namespace != vns for h in hits)
+    assert all("launch codes" not in (h.snippet or "") for h in hits)
+    # and the same for the browse + title paths, which share the filter
+    assert all(r["space_id"] != vns for r in s.list(attacker_tok, space="all"))
+    assert all(r["space_id"] != vns
+               for r in s.find(attacker_tok, "codes", space="all"))
+
+
+def test_all_does_not_widen_a_scoped_token(env):
+    """A token scoped to one namespace must stay there even when its user owns
+    others — `all` means "all you reach", and a scoped token reaches one."""
+    setup, make_store = env
+    s = make_store("managed")
+    uid = ident.create_user(setup, name="u")
+    work = ident.create_namespace(setup, uid, "work")
+    ident.create_namespace(setup, uid, "private")
+    full, _ = ident.issue_token(setup, uid)
+    s.write(full, body="work note\n", space="work")
+    s.write(full, body="private diary entry\n", space="private")
+
+    scoped, _ = ident.issue_token(setup, uid, namespace_id=work)
+    hits = s.recall(scoped, "note diary entry", space="all")
+    assert hits, "the scoped token should still see its own namespace"
+    assert all(h.namespace == work for h in hits)
+    assert all("diary" not in (h.snippet or "") for h in hits)
+
+
+def test_listing_a_foreign_namespace_is_refused_not_dropped(env):
+    """Naming an unreachable namespace must FAIL, not be silently skipped:
+    a quietly-narrowed search returns a partial answer that looks complete."""
+    setup, make_store = env
+    s = make_store("managed")
+    v_uid = ident.create_user(setup, name="victim")
+    vns = ident.create_namespace(setup, v_uid, "secrets")
+
+    a_uid = ident.create_user(setup, name="attacker")
+    ident.create_namespace(setup, a_uid, "mine")
+    attacker_tok, _ = ident.issue_token(setup, a_uid)
+
+    with pytest.raises(DENIED):                      # foreign id alone
+        s.recall(attacker_tok, "anything", space_id=vns)
+    with pytest.raises(DENIED):                      # mixed with a legit one
+        s.recall(attacker_tok, "anything", space="mine", space_id=vns)
+    with pytest.raises(DENIED):                      # a name they do not own
+        s.recall(attacker_tok, "anything", space=["mine", "secrets"])
+
+
+def test_read_only_ceiling_holds_across_all_spaces(env):
+    """`all` must not launder a read-only token into a writer anywhere."""
+    setup, make_store = env
+    s = make_store("managed")
+    uid = ident.create_user(setup, name="u")
+    ident.create_namespace(setup, uid, "a")
+    ident.create_namespace(setup, uid, "b")
+    writer, _ = ident.issue_token(setup, uid)
+    s.write(writer, body="alpha note\n", space="a")
+    s.write(writer, body="beta note\n", space="b")
+
+    reader, _ = ident.issue_token(setup, uid, permission="read")
+    assert len(s.recall(reader, "note", space="all")) == 2
+    with pytest.raises(DENIED):
+        s.write(reader, body="should not land\n", space="a")

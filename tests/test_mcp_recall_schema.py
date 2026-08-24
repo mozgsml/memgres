@@ -37,6 +37,12 @@ pytestmark = pytest.mark.skipif(not _reachable(), reason="no test Postgres")
 
 
 def _clear_env(monkeypatch):
+    # Each test builds a server against a differently-stamped collection, so
+    # start from an empty schema — otherwise the stamp guard (rightly) refuses
+    # the next build and the file only passes when some other test happened to
+    # clean up first.
+    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
@@ -68,6 +74,26 @@ def test_with_embedder_keeps_vector_modes(monkeypatch):
     mcp = build_server(load())
     enum = _recall_mode_enum(mcp)
     assert set(enum) == {"lexical", "semantic", "hybrid", "auto"}
+
+
+def _space_schema(mcp, tool_name):
+    tools = getattr(getattr(mcp, "_tool_manager", None), "_tools", {})
+    return tools[tool_name].parameters["properties"]["space"]
+
+
+def test_space_accepts_one_name_or_several(monkeypatch):
+    """The advertised schema must let a model pass a LIST, not just a string —
+    otherwise `space=["work","home"]` is rejected by tool-argument validation
+    before the resolver ever sees it, and the multi-namespace address is
+    unreachable over MCP no matter what the core supports."""
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
+    mcp = build_server(load())
+    for tool in ("memory_recall", "memory_find", "memory_list"):
+        for field in ("space", "space_id"):
+            variants = _space_schema(mcp, tool).get("anyOf", [])
+            kinds = {v.get("type") for v in variants}
+            assert {"string", "array", "null"} <= kinds, f"{tool}.{field}: {variants}"
 
 
 if __name__ == "__main__":

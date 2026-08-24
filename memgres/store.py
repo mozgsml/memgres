@@ -186,6 +186,39 @@ class Store:
         author = (principal.user_id, principal.token_id)
         return nsid, author
 
+    def _authorize_read(self, token: Optional[str], *, space=None, space_id=None):
+        """Resolve a READ address that may span several namespaces.
+
+        Returns ``(namespace_ids, names)`` — the ids every search must filter on,
+        and ``{id: name}`` so a hit can say where it came from in the words the
+        caller used. The single-namespace ``_authorize`` stays the entry point for
+        writes and id-addressed reads; this one exists only for the search paths,
+        which are the only ones that can legitimately span namespaces."""
+        if not self._identity_on:
+            return [""], {}
+        token = token or self.cfg.default_token or None
+        with self._conn.transaction():
+            principal = identity.resolve(self._conn, self.cfg, token)
+            resolved = identity.resolve_spaces(self._conn, principal,
+                                               space=space, space_id=space_id)
+        for nsid, perm in resolved:
+            if not identity.perm_at_least(perm, "read"):
+                raise identity.AuthError(
+                    f"read permission required for namespace {nsid} "
+                    f"(token grants {perm})")
+        ns_ids = [nsid for nsid, _ in resolved]
+        return ns_ids, self._space_names(ns_ids)
+
+    def _space_names(self, ns_ids: Sequence[str]) -> dict:
+        """``{namespace_id: name}`` for the namespaces in play — one small query,
+        so every hit can carry a human-readable space without joining per row."""
+        if not ns_ids:
+            return {}
+        cur = self._conn.cursor()
+        cur.execute("SELECT id, name FROM namespace WHERE id = ANY(%s)",
+                    (list(ns_ids),))
+        return {str(r[0]): r[1] for r in cur.fetchall()}
+
     def _expiry_sql(self, ttl_days: Optional[int]) -> str:
         days = ttl_days if ttl_days is not None else self.cfg.retention_days
         return "NULL" if not days or days <= 0 else f"now() + interval '{int(days)} days'"
@@ -492,38 +525,46 @@ class Store:
                path_prefix: Optional[str] = None, mode: str = "auto",
                match: Optional[str] = None,
                snippet: Optional[bool] = None, full_body: Optional[bool] = None,
-               space: Optional[str] = None, space_id: Optional[str] = None):
+               space=None, space_id=None):
+        """Search. ``space``/``space_id`` may name one namespace, several, or
+        ``'all'`` — see :func:`identity.resolve_spaces`."""
         from .search import recall as _recall
-        ns, _ = self._authorize(token, space=space, space_id=space_id, need="read")
-        return _recall(self._conn, self.cfg, self.embedder, ns,
+        ns, names = self._authorize_read(token, space=space, space_id=space_id)
+        hits = _recall(self._conn, self.cfg, self.embedder, ns,
                        query, k=k, tags=tags, path_prefix=path_prefix, mode=mode,
                        match=match, backend=self._vectors,
                        snippet=snippet, full_body=full_body)
+        for h in hits:
+            h.space = names.get(h.namespace)
+        return hits
 
     # ─── find: locate by title (+ tags), no body ────────────────────────────
     def find(self, token: Optional[str], query: str, *, k: int = 10,
              tags: Optional[Sequence[str]] = None,
              path_prefix: Optional[str] = None, match: Optional[str] = None,
-             space: Optional[str] = None, space_id: Optional[str] = None) -> List[dict]:
+             space=None, space_id=None) -> List[dict]:
         """Locate memories whose curated `title` matches — a light "where is it"
         search over titles + tags, never the body. Returns light rows; works
-        without an embedder. See ``search.find``."""
+        without an embedder. Spans namespaces like ``recall``. See ``search.find``."""
         from .search import find as _find
-        ns, _ = self._authorize(token, space=space, space_id=space_id, need="read")
-        return _find(self._conn, self.cfg, ns, query, tags=tags,
+        ns, names = self._authorize_read(token, space=space, space_id=space_id)
+        rows = _find(self._conn, self.cfg, ns, query, tags=tags,
                      path_prefix=path_prefix, k=k, match=match)
+        for r in rows:
+            r["space"] = names.get(r["space_id"])
+        return rows
 
     # ─── list: enumerate a subtree (no query, no ranking) ───────────────────
     def list(self, token: Optional[str], *, path_prefix: Optional[str] = None,
              tags: Optional[Sequence[str]] = None, limit: int = 50,
-             offset: int = 0, space: Optional[str] = None,
-             space_id: Optional[str] = None) -> List[dict]:
+             offset: int = 0, space=None, space_id=None) -> List[dict]:
         """Browse (enumerate) memories under a subtree — NOT a search: no FTS, no
         vectors, no scoring. Rows are ordered by path so a subtree reads in tree
-        order. ``build_filters`` scopes by namespace + not-expired + tags +
-        subtree, so this is multi-tenant safe by construction."""
+        order, and across several namespaces by namespace first, so each tree
+        still reads whole. ``build_filters`` scopes by namespace + not-expired +
+        tags + subtree, so this is multi-tenant safe by construction."""
         from .vector.base import build_filters
-        ns, _ = self._authorize(token, space=space, space_id=space_id, need="read")
+        ns, names = self._authorize_read(token, space=space, space_id=space_id)
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
         where, params = build_filters(ns, tags, path_prefix)
@@ -531,15 +572,19 @@ class Store:
         cur.execute(
             "SELECT id, path::text, tags, title, "
             "left(split_part(body, E'\\n', 1), %s) AS preview, "
-            "created_at, updated_at "
-            f"FROM memory WHERE {where} ORDER BY path, id LIMIT %s OFFSET %s",
+            "created_at, updated_at, namespace "
+            f"FROM memory WHERE {where} ORDER BY namespace, path, id "
+            "LIMIT %s OFFSET %s",
             [self.cfg.list_preview_chars] + params + [limit, offset])
-        cols = ["id", "path", "tags", "title", "preview", "created_at", "updated_at"]
+        cols = ["id", "path", "tags", "title", "preview", "created_at",
+                "updated_at", "space_id"]
         rows = []
         for r in cur.fetchall():
             d = dict(zip(cols, r))
             d["id"] = str(d["id"])
             d["tags"] = list(d["tags"]) if d["tags"] is not None else []
+            d["space_id"] = str(d["space_id"])
+            d["space"] = names.get(d["space_id"])
             rows.append(d)
         return rows
 

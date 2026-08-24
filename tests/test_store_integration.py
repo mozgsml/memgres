@@ -330,7 +330,8 @@ def test_find_matches_title_not_body(store):
     ids = [h["id"] for h in hits]
     assert a.id in ids                 # 'fruit' is in a's TITLE
     assert b.id not in ids             # b has 'fruit' only in its BODY → not matched
-    assert set(hits[0]) == {"id", "path", "title", "tags", "score"}   # light rows
+    assert set(hits[0]) == {"id", "path", "title", "tags", "score",
+                            "space_id", "space"}                     # light rows
 
 
 def test_find_respects_tag_filter(store):

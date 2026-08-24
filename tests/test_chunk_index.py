@@ -230,5 +230,60 @@ def test_qdrant_cross_tenant_semantic_isolation(qdrant_store):
     _cross_tenant_semantic_isolation(qdrant_store)
 
 
+# ─── semantic recall across several namespaces (both backends) ───────────────
+def _multi_space_semantic(store):
+    """`space="all"` must widen the SEMANTIC path to exactly the namespaces the
+    caller reaches — no more, no fewer. This is the one place where the ranking
+    filter (Qdrant payload / pgvector SQL) and the row filter (Postgres) could
+    disagree: a narrower ranking filter silently loses hits, a wider one is
+    caught by `fetch_hit_rows`. Running it on both backends is what keeps them
+    honest against each other.
+    """
+    from memgres import identity as ident
+
+    cfg = replace(store.cfg, key_mode="managed")
+    conn = store._conn
+    migrate(conn, cfg)
+    s = Store(cfg, embedder=store.embedder, conn=conn, backend=store._vectors)
+
+    uid = ident.create_user(conn, name="owner")
+    ident.create_namespace(conn, uid, "work")
+    ident.create_namespace(conn, uid, "home")
+    tok, _ = ident.issue_token(conn, uid)
+
+    other = ident.create_user(conn, name="stranger")
+    ident.create_namespace(conn, other, "theirs")
+    other_tok, _ = ident.issue_token(conn, other)
+
+    w = s.write(tok, body="apple pie recipe from work.\n", space="work")
+    h = s.write(tok, body="apple tree in the home garden.\n", space="home")
+    s.write(other_tok, body="apple orchard that is none of your business.\n",
+            space="theirs")
+
+    hits = s.recall(tok, "apple", mode="semantic", space="all")
+    assert {x.id for x in hits} == {w.id, h.id}          # both of mine, only mine
+    assert all("none of your business" not in (x.snippet or "") for x in hits)
+    # every hit says which namespace it came from, by id AND by name
+    assert {x.space for x in hits} == {"work", "home"}
+    assert all(x.namespace for x in hits)
+
+    # naming a subset narrows it back down
+    only_work = s.recall(tok, "apple", mode="semantic", space="work")
+    assert [x.id for x in only_work] == [w.id]
+
+    # the same namespace named twice (by name and by id) is searched once
+    work_id = next(x.namespace for x in only_work)
+    twice = s.recall(tok, "apple", mode="semantic", space="work", space_id=work_id)
+    assert [x.id for x in twice] == [w.id]
+
+
+def test_pg_multi_space_semantic(pg_store):
+    _multi_space_semantic(pg_store)
+
+
+def test_qdrant_multi_space_semantic(qdrant_store):
+    _multi_space_semantic(qdrant_store)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

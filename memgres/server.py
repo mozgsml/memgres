@@ -246,7 +246,9 @@ def create_app(cfg: Optional[Config] = None):
     def list_memories(path: Optional[str] = None,
                       tags: Optional[str] = Query(None, description="comma-separated"),
                       limit: int = 50, offset: int = 0,
-                      space: Optional[str] = None, space_id: Optional[str] = None,
+                      space: Optional[List[str]] = Query(
+                          None, description="namespace name(s), or 'all'"),
+                      space_id: Optional[List[str]] = Query(None),
                       tok: Optional[str] = Depends(token)):
         """Browse (enumerate) a subtree — not a search. Lists memories under
         `path` ordered by path, each with a short first-line `preview`."""
@@ -268,7 +270,9 @@ def create_app(cfg: Optional[Config] = None):
                tags: Optional[str] = Query(None, description="comma-separated"),
                path_prefix: Optional[str] = None,
                snippet: Optional[bool] = None, full_body: Optional[bool] = None,
-               space: Optional[str] = None, space_id: Optional[str] = None,
+               space: Optional[List[str]] = Query(
+                   None, description="namespace name(s), or 'all'"),
+               space_id: Optional[List[str]] = Query(None),
                tok: Optional[str] = Depends(token)):
         taglist = [t for t in (tags.split(",") if tags else []) if t]
         with pool.connection() as conn:
@@ -282,7 +286,9 @@ def create_app(cfg: Optional[Config] = None):
     def find(q: str, k: int = 10,
              tags: Optional[str] = Query(None, description="comma-separated"),
              path_prefix: Optional[str] = None, match: Optional[str] = None,
-             space: Optional[str] = None, space_id: Optional[str] = None,
+             space: Optional[List[str]] = Query(
+                 None, description="namespace name(s), or 'all'"),
+             space_id: Optional[List[str]] = Query(None),
              tok: Optional[str] = Depends(token)):
         """Locate by curated title (+ tags) — light rows, never the body."""
         taglist = [t for t in (tags.split(",") if tags else []) if t]

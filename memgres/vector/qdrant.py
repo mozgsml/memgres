@@ -35,7 +35,7 @@ import os
 import uuid
 from typing import List, Optional, Sequence, Tuple
 
-from .base import Hit, grouped_chunk_search
+from .base import Hit, as_namespaces, grouped_chunk_search
 
 
 class QdrantBackend:
@@ -156,13 +156,17 @@ class QdrantBackend:
         return (points[0].payload or {}).get("src_hash")
 
     # ─── grouped semantic ranking ─────────────────────────────────────────────
-    def search(self, conn, cfg, query_vec: Sequence[float], k: int, ns: str,
+    def search(self, conn, cfg, query_vec: Sequence[float], k: int, ns,
                tags: Optional[Sequence[str]], path_prefix: Optional[str]) -> List[Hit]:
-        from qdrant_client.models import (FieldCondition, Filter, MatchAny,
-                                          MatchValue)
+        from qdrant_client.models import FieldCondition, Filter, MatchAny
+
+        # MatchAny over the same normalized set Postgres filters on. A recall may
+        # span several namespaces; `grouped_chunk_search` re-checks every candidate
+        # against Postgres, so this filter governs recall quality, not tenancy.
+        spaces = as_namespaces(ns)
 
         def fetch_chunks(overfetch: int, exclude: List[str]):
-            must = [FieldCondition(key="namespace", match=MatchValue(value=ns))]
+            must = [FieldCondition(key="namespace", match=MatchAny(any=spaces))]
             must_not = ([FieldCondition(key="memory_id", match=MatchAny(any=exclude))]
                         if exclude else None)
             flt = Filter(must=must, must_not=must_not)

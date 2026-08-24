@@ -16,7 +16,8 @@ from __future__ import annotations
 
 from typing import List, Optional, Sequence
 
-from .vector.base import HIT_COLUMNS, Hit, build_filters, row_to_hit
+from .vector.base import (HIT_COLUMNS, Hit, as_namespaces, build_filters,
+                          row_to_hit)
 
 RRF_K = 60  # standard RRF damping constant
 
@@ -55,7 +56,7 @@ def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
         return [row_to_hit(r, r[-1]) for r in cur.fetchall()]   # score = trailing col
 
 
-def find(conn, cfg, ns: str, query: str, *, tags: Optional[Sequence[str]] = None,
+def find(conn, cfg, ns, query: str, *, tags: Optional[Sequence[str]] = None,
          path_prefix: Optional[str] = None, k: int = 10,
          match: Optional[str] = None) -> List[dict]:
     """Locate memories whose TITLE matches — a light "where is it" search over the
@@ -66,7 +67,8 @@ def find(conn, cfg, ns: str, query: str, *, tags: Optional[Sequence[str]] = None
     tsq, qtext = _tsquery(cfg, match, query)
     where, params = build_filters(ns, tags, path_prefix)
     sql = (
-        f"SELECT id, path::text, title, tags, ts_rank(title_fts, {tsq}) AS score "
+        f"SELECT id, path::text, title, tags, namespace, "
+        f"ts_rank(title_fts, {tsq}) AS score "
         f"FROM memory WHERE {where} AND title_fts @@ {tsq} "
         "ORDER BY score DESC LIMIT %s"
     )
@@ -74,7 +76,8 @@ def find(conn, cfg, ns: str, query: str, *, tags: Optional[Sequence[str]] = None
     with conn.cursor() as cur:
         cur.execute(sql, args)
         return [{"id": str(r[0]), "path": r[1], "title": r[2],
-                 "tags": list(r[3]), "score": float(r[4])} for r in cur.fetchall()]
+                 "tags": list(r[3]), "space_id": str(r[4]), "score": float(r[5])}
+                for r in cur.fetchall()]
 
 
 def _rrf(lists: Sequence[List[Hit]], k: int) -> List[Hit]:
@@ -90,10 +93,12 @@ def _rrf(lists: Sequence[List[Hit]], k: int) -> List[Hit]:
     return fused[:k]
 
 
-def _ts_headline(conn, cfg, ns: str, query: str, hits: List[Hit]) -> dict:
+def _ts_headline(conn, cfg, ns, query: str, hits: List[Hit]) -> dict:
     """One batched ts_headline over every hit id — the lexical/fallback snippet.
     Returns {id: headline}. ids come from the already-ns-scoped ranked hits, so
-    the WHERE stays inside the caller's namespace (no cross-tenant read).
+    the WHERE stays inside the caller's namespaces (no cross-tenant read) — it is
+    re-applied here rather than trusted, because this query reads BODIES and is
+    the one read path that doesn't go through ``build_filters``.
     ``StartSel``/``StopSel`` are emptied so the snippet is clean prose — no
     ``<b>`` markers to mislead the model reading it."""
     ids = [h.id for h in hits]
@@ -101,11 +106,12 @@ def _ts_headline(conn, cfg, ns: str, query: str, hits: List[Hit]) -> dict:
         "SELECT id, ts_headline(%s::regconfig, body, "
         "plainto_tsquery(%s::regconfig, %s), "
         "'MaxWords=40, MinWords=15, ShortWord=3, StartSel=\"\", StopSel=\"\"') "
-        "FROM memory WHERE namespace=%s AND id = ANY(%s)"
+        "FROM memory WHERE namespace = ANY(%s) AND id = ANY(%s)"
     )
     out: dict = {}
     with conn.cursor() as cur:
-        cur.execute(sql, [cfg.fts_language, cfg.fts_language, query, ns, ids])
+        cur.execute(sql, [cfg.fts_language, cfg.fts_language, query,
+                          as_namespaces(ns), ids])
         for r in cur.fetchall():
             out[str(r[0])] = r[1]
     return out
@@ -138,7 +144,7 @@ def _set_chunk(hit: Hit, body: str) -> None:
     hit.kind = "snippet"
 
 
-def attach_snippets(conn, cfg, ns: str, query: str, hits: List[Hit], *,
+def attach_snippets(conn, cfg, ns, query: str, hits: List[Hit], *,
                     snippet: Optional[bool], full_body: Optional[bool]) -> List[Hit]:
     """After ranking, give every hit exactly one body view — never both a slice
     and the whole thing. A hit gets the WHOLE body (``kind="full"``) when the
@@ -182,7 +188,7 @@ def attach_snippets(conn, cfg, ns: str, query: str, hits: List[Hit], *,
     return hits
 
 
-def recall(conn, cfg, embedder, ns: str, query: str, *, k: int = 10,
+def recall(conn, cfg, embedder, ns, query: str, *, k: int = 10,
            tags: Optional[Sequence[str]] = None, path_prefix: Optional[str] = None,
            mode: str = "auto", match: Optional[str] = None,
            backend=None, snippet: Optional[bool] = None,
