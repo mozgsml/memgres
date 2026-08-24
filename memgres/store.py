@@ -25,13 +25,15 @@ retrieval-by-id.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
 import psycopg
 
 from . import identity
 from .config import Config
+from .delimiters import write_warnings
+from .lines import parse_line_spec
 from .diffing import DiffConflict, apply_diff, byte_len, content_hash, make_diff
 from .embeddings import Embedder, get_embedder
 from .vector import make_backend
@@ -97,6 +99,41 @@ class AmbiguousReplace(ValueError):
     """A `replace`'s `old` occurs more than once and `replace_all` wasn't set."""
 
 
+# The same substring edit is spelled three ways across the ecosystem, and memgres
+# is the odd one out — its `replace_` prefix exists to group with `replace_all`.
+# An agent with muscle memory for file editors reaches for the others and gets a
+# confusing refusal, so all three are accepted and folded to the canon here.
+REPLACE_ALIASES = {
+    "old": ("replace_old", "old_string", "old_str"),
+    "new": ("replace_new", "new_string", "new_str"),
+}
+
+
+def fold_replace_aliases(values: dict) -> dict:
+    """Reduce the accepted spellings to ``replace_old``/``replace_new``.
+
+    Two spellings of the same side carrying DIFFERENT text is refused rather than
+    resolved: picking one silently would apply an edit the caller did not ask
+    for, and this whole family of parameters already has a history of quiet
+    damage. Identical values are fine — that is just a client being redundant.
+    """
+    out = dict(values)
+    for side, names in REPLACE_ALIASES.items():
+        seen = {n: out.pop(n) for n in names if out.get(n) is not None}
+        for n in names:
+            out.pop(n, None)
+        if not seen:
+            continue
+        distinct = set(seen.values())
+        if len(distinct) > 1:
+            spelled = ", ".join(f"{n}={v!r}" for n, v in sorted(seen.items()))
+            raise ValueError(
+                f"conflicting values for the replacement's {side} text: {spelled}"
+                " — they name the same parameter, so send only one")
+        out[names[0]] = next(iter(distinct))
+    return out
+
+
 def build_replace(replace_old: Optional[str], replace_new: Optional[str]):
     """Assemble the substring-replace ``(old, new)`` tuple from the two optional
     request fields — the one place both the HTTP and MCP layers turn them into the
@@ -112,8 +149,12 @@ def build_replace(replace_old: Optional[str], replace_new: Optional[str]):
     if replace_old is None and replace_new is None:
         return None
     if replace_old is None or replace_new is None:
-        raise ValueError("replace needs both replace_old and replace_new "
-                         "(pass replace_new='' to delete the matched text)")
+        missing = "replace_new" if replace_new is None else "replace_old"
+        other = "new_string`/`new_str" if replace_new is None else "old_string`/`old_str"
+        raise ValueError(
+            f"replace needs both replace_old and replace_new — `{missing}` is "
+            f"missing (file editors call it `{other}`; those spellings are "
+            f"accepted too). Pass replace_new='' to delete the matched text.")
     return (replace_old, replace_new)
 
 
@@ -136,6 +177,13 @@ class Memory:
     # from the answer instead of forking the memory.
     created: Optional[bool] = None
     moved_from: Optional[str] = None
+    # Non-fatal notes about a write that SUCCEEDED — the data is stored, and
+    # this is what stops a silent corruption from staying silent.
+    warnings: List[str] = field(default_factory=list)
+    # set only by a line-ranged read (see `_slice_lines`)
+    partial: bool = False
+    lines: Optional[List[int]] = None
+    total_lines: Optional[int] = None
 
     def to_dict(self, *, stringify_dates: bool = False) -> dict:
         """Serialize for an API layer. ``stringify_dates`` str()-coerces the
@@ -147,7 +195,9 @@ class Memory:
                 "title": self.title, "tags": self.tags, "path": self.path,
                 "seq": self.seq, "created_at": d(self.created_at),
                 "updated_at": d(self.updated_at), "expires_at": d(self.expires_at),
-                "created": self.created, "moved_from": self.moved_from}
+                "created": self.created, "moved_from": self.moved_from,
+                "warnings": self.warnings, "partial": self.partial,
+                "lines": self.lines, "total_lines": self.total_lines}
 
 
 def _sha(text: str) -> str:
@@ -188,6 +238,25 @@ def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
     if author_user_id:
         h = _fold(h, "memgres.author.v1", author_user_id, author_token_id or "")
     return h
+
+
+def _slice_lines(m: "Memory", spec: str) -> "Memory":
+    """Return ``m`` carrying only the requested lines of its body.
+
+    The slice is marked in three ways because a partial body that looks whole is
+    the expensive mistake here: send it back as a new `body` and everything
+    outside the slice is gone. `content_hash` is dropped rather than kept,
+    since a hash that describes text the caller cannot see is worse than none.
+    """
+    body = m.body or ""
+    all_lines = body.splitlines(keepends=True)
+    wanted = parse_line_spec(spec, len(all_lines)) or []
+    m.body = "".join(all_lines[i - 1] for i in wanted)
+    m.content_hash = None
+    m.partial = True
+    m.lines = [wanted[0], wanted[-1]] if wanted else []
+    m.total_lines = len(all_lines)
+    return m
 
 
 class Store:
@@ -350,14 +419,18 @@ class Store:
             self._check_title_size(title)
             if id is None and at is None:
                 self._check_path_free(ns, path, if_moved)
-                return self._create(ns, author, body, path, tags, source, reason,
-                                    ttl_days, title)
-            id, moved_from = self._address(ns, id, at,
-                                           follow=if_moved == "follow")
-            m = self._update(ns, author, id, body, diff, base_hash, path, tags,
-                             source, reason, ttl_days, title=title,
-                             replace=replace, replace_all=replace_all)
-            m.moved_from = moved_from
+                m = self._create(ns, author, body, path, tags, source, reason,
+                                 ttl_days, title)
+            else:
+                id, moved_from = self._address(ns, id, at,
+                                               follow=if_moved == "follow")
+                m = self._update(ns, author, id, body, diff, base_hash, path,
+                                 tags, source, reason, ttl_days, title=title,
+                                 replace=replace, replace_all=replace_all)
+                m.moved_from = moved_from
+            # Checked on the STORED body, not the request: a substring edit or a
+            # diff can introduce the stray tag just as a whole body can.
+            m.warnings = write_warnings(m.body)
             return m
 
     def _check_path_free(self, ns: str, path: Optional[str],
@@ -917,6 +990,7 @@ class Store:
     # ─── read ───────────────────────────────────────────────────────────────
     def get(self, token: Optional[str], id: Optional[str] = None, *,
             at: Optional[str] = None, if_moved: str = "follow",
+            lines: Optional[str] = None,
             renew: bool = True, _ns: Optional[str] = None,
             space: Optional[str] = None, space_id: Optional[str] = None) -> Memory:
         """Fetch one memory by `id`, or by `at` — the path it lives at.
@@ -924,7 +998,14 @@ class Store:
         A read follows a move by default: the memory that used to live at that
         path is what the caller reached for, and it comes back with `moved_from`
         set so they learn the address changed. Pass `if_moved='error'` to be told
-        instead of redirected."""
+        instead of redirected.
+
+        `lines` ("40-80", "5", "1,10-12") returns only those lines of the body,
+        for reading part of something long without paying for all of it. The
+        result then says so loudly — `partial` is set, `lines` gives the range,
+        `total_lines` the whole size, and `content_hash` comes back **None** —
+        because the one dangerous thing to do with a slice is send it back as a
+        whole `body` and erase everything around it."""
         ns = _ns if _ns is not None else self._authorize(
             token, space=space, space_id=space_id, need="read")[0]
         id, moved_from = self._address(ns, id, at, follow=if_moved == "follow")
@@ -941,8 +1022,9 @@ class Store:
                 cur.execute(
                     f"UPDATE memory SET expires_at={self._expiry_sql(None)} WHERE id=%s",
                     (id,))
-        return Memory(str(row[0]), row[1], row[2], list(row[3]), row[4], row[5],
-                      row[6], row[7], row[8], row[9], moved_from=moved_from)
+        m = Memory(str(row[0]), row[1], row[2], list(row[3]), row[4], row[5],
+                   row[6], row[7], row[8], row[9], moved_from=moved_from)
+        return _slice_lines(m, lines) if lines else m
 
     def history(self, token: Optional[str], id: Optional[str] = None, *,
                 at: Optional[str] = None, if_moved: str = "follow",
@@ -960,13 +1042,15 @@ class Store:
             "SELECT h.seq, h.op, h.diff, h.hash_before, h.hash_after, "
             "h.path_before::text, h.path_after::text, h.tags_before, h.tags_after, "
             "h.source, h.reason, h.author_user_id::text, h.author_token_id::text, "
-            "NULLIF(u.name, '') AS author_name, h.title_before, h.title_after, "
+            "COALESCE(NULLIF(u.full_name, ''), NULLIF(u.name, '')) AS author_name, "
+            "NULLIF(u.email, '') AS author_email, "
+            "h.title_before, h.title_after, "
             "h.prev_row_hash, h.row_hash, h.created_at FROM memory_history h "
             "LEFT JOIN app_user u ON u.id = h.author_user_id "
             "WHERE h.memory_id=%s ORDER BY h.seq", (id,))
         cols = ["seq", "op", "diff", "hash_before", "hash_after", "path_before",
                 "path_after", "tags_before", "tags_after", "source", "reason",
-                "author_user_id", "author_token_id", "author_name",
+                "author_user_id", "author_token_id", "author_name", "author_email",
                 "title_before", "title_after",
                 "prev_row_hash", "row_hash", "created_at"]
         return [dict(zip(cols, r)) for r in cur.fetchall()]

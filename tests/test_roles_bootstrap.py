@@ -320,3 +320,39 @@ def test_a_weakened_token_does_not_open_the_control_plane(managed_client):
     # a scoped token may still administer the namespace it IS scoped to
     Hp = {"Authorization": f"Bearer {pinned}"}
     assert c.get(f"/spaces/{ns}/access-requests", headers=Hp).status_code == 200
+
+
+def test_a_profile_makes_authorship_readable(managed_client):
+    """`app_user.name` was doing two jobs — the handle a token resolves to, and
+    the thing a person reads in blame. It is neither unique nor required, so an
+    audit line could come back as a bare uuid, which nobody can act on."""
+    c, admin_tok = managed_client
+    H = {"Authorization": f"Bearer {admin_tok}"}
+
+    uid = c.post("/admin/users",
+                 json={"name": "ada", "email": "ada@example.com",
+                       "full_name": "Ada Lovelace", "department": "Analytical",
+                       "position": "Engineer"}, headers=H).json()["id"]
+    ns = c.post("/admin/namespaces",
+                json={"owner_user_id": uid, "name": "work"}, headers=H).json()["id"]
+    tok = c.post("/admin/tokens", json={"user_id": uid, "permission": "write"},
+                 headers=H).json()["token"]
+    Ha = {"Authorization": f"Bearer {tok}"}
+
+    mid = c.post("/memories", json={"body": "a line\n"}, headers=Ha).json()["id"]
+    [row] = c.get(f"/memories/{mid}/history", headers=Ha).json()
+    assert row["author_name"] == "Ada Lovelace"      # not the handle, not a uuid
+    assert row["author_email"] == "ada@example.com"
+
+    # the directory carries the rest, and a partial edit leaves it alone
+    assert c.patch(f"/admin/users/{uid}", json={"position": "Lead Engineer"},
+                   headers=H).status_code == 200
+    [ada] = [u for u in c.get("/admin/users", headers=H).json() if u["id"] == uid]
+    assert ada["position"] == "Lead Engineer"
+    assert ada["department"] == "Analytical"          # untouched by the edit
+    assert ada["full_name"] == "Ada Lovelace"
+
+    # email is the future login, so a duplicate is refused
+    assert c.post("/admin/users", json={"name": "other",
+                                        "email": "ADA@example.com"},
+                  headers=H).status_code == 400

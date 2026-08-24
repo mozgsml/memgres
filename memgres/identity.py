@@ -497,18 +497,55 @@ def _sole_reachable(conn, principal: Principal) -> Tuple[str, str]:
 
 
 # ─── management: users / namespaces / members ────────────────────────────────
+# The fields that say who a person is, as opposed to what their account may do.
+# Listed once so create, edit and every read agree on the set.
+PROFILE_FIELDS = ("email", "full_name", "department", "position")
+
+
 def create_user(conn, name: str = "", description: str = "",
                 role: str = "user", *,
-                can_create_namespace: bool = False) -> str:
+                can_create_namespace: bool = False, **profile) -> str:
     """Create a user. It owns nothing yet: give it a namespace, share one with
-    it, or grant `can_create_namespace` so it can make its own."""
+    it, or grant `can_create_namespace` so it can make its own.
+
+    ``profile`` takes any of :data:`PROFILE_FIELDS` — who the person is, which
+    is what makes an authorship line in `blame` readable rather than a uuid."""
     if role not in SERVICE_ROLES:
         raise ValueError(f"bad role: {role}")
+    unknown = set(profile) - set(PROFILE_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown profile field(s): {', '.join(sorted(unknown))}")
+    cols = ["name", "description", "role", "can_create_namespace"]
+    vals = [name, description, role, can_create_namespace]
+    for f in PROFILE_FIELDS:
+        if profile.get(f) is not None:
+            cols.append(f)
+            vals.append(profile[f])
+    placeholders = ", ".join(["%s"] * len(cols))
     with conn.cursor() as cur:
-        cur.execute("INSERT INTO app_user (name, description, role, "
-                    "can_create_namespace) VALUES (%s, %s, %s, %s) RETURNING id",
-                    (name, description, role, can_create_namespace))
+        cur.execute(f"INSERT INTO app_user ({', '.join(cols)}) "
+                    f"VALUES ({placeholders}) RETURNING id", vals)
         return str(cur.fetchone()[0])
+
+
+def edit_user(conn, user_id: str, **profile) -> None:
+    """Change a user's profile fields. Only the ones passed are touched, so a
+    partial update cannot blank the rest."""
+    unknown = set(profile) - set(PROFILE_FIELDS) - {"name", "description"}
+    if unknown:
+        raise ValueError(f"unknown profile field(s): {', '.join(sorted(unknown))}")
+    sets, vals = [], []
+    for f, v in profile.items():
+        if v is not None:
+            sets.append(f"{f}=%s")
+            vals.append(v)
+    if not sets:
+        return
+    with conn.cursor() as cur:
+        cur.execute(f"UPDATE app_user SET {', '.join(sets)} WHERE id=%s",
+                    vals + [user_id])
+        if cur.rowcount == 0:
+            raise SpaceNotFound(f"no such user {user_id}")
 
 
 def set_can_create_namespace(conn, user_id: str, allowed: bool) -> None:
@@ -531,8 +568,8 @@ def list_users(conn, *, role: Optional[str] = None, limit: Optional[int] = None,
     """
     if role is not None and role not in SERVICE_ROLES:
         raise ValueError(f"bad role: {role}")
-    sql = ("SELECT id, name, description, role, "
-           "can_create_namespace, created_at FROM app_user")
+    sql = ("SELECT id, name, description, role, can_create_namespace, "
+           "created_at, email, full_name, department, position FROM app_user")
     args: list = []
     if role is not None:
         sql += " WHERE role=%s"                # backed by app_user_role_idx
@@ -544,8 +581,8 @@ def list_users(conn, *, role: Optional[str] = None, limit: Optional[int] = None,
     if offset:
         sql += " OFFSET %s"
         args.append(offset)
-    cols = ["id", "name", "description", "role",
-            "can_create_namespace", "created_at"]
+    cols = ["id", "name", "description", "role", "can_create_namespace",
+            "created_at", *PROFILE_FIELDS]
     with conn.cursor() as cur:
         cur.execute(sql, args)
         out = []

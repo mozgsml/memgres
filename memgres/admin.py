@@ -176,7 +176,8 @@ def whoami(conn, p: Principal) -> dict:
 # ─── users ───────────────────────────────────────────────────────────────────
 
 def create_user(conn, p: Principal, *, name: str = "", description: str = "",
-                role: str = "user", can_create_namespace: bool = False) -> str:
+                role: str = "user", can_create_namespace: bool = False,
+                **profile) -> str:
     """Create a user and return its id.
 
     Minting an admin-role user is itself a superadmin act: a user_manager must
@@ -191,7 +192,21 @@ def create_user(conn, p: Principal, *, name: str = "", description: str = "",
     if role != "user" and not p.is_admin:
         raise Forbidden("granting an admin role requires superadmin")
     return identity.create_user(conn, name, description, role=role,
-                                can_create_namespace=can_create_namespace)
+                                can_create_namespace=can_create_namespace,
+                                **profile)
+
+
+def edit_user(conn, p: Principal, *, user_id: str, **profile) -> dict:
+    """Change who a user is — email, full name, department, position.
+
+    Provisioning-tier, and refused on an admin-role account for a user_manager
+    like every other operation that takes a target: an authorship line is what
+    an audit reads, so being able to rewrite whose it looks like is authority.
+    """
+    require_manage_users(p)
+    _require_target_is_plain_user(conn, p, user_id, "editing a profile")
+    identity.edit_user(conn, user_id, **profile)
+    return {"user_id": user_id}
 
 
 def set_can_create_namespace(conn, p: Principal, *, user_id: str,

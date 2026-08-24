@@ -37,7 +37,7 @@ from .config import Config, load
 from .embeddings import get_embedder
 from .bootstrap import bootstrap_admin
 from .schema import migrate
-from .store import Store, build_replace
+from .store import Store, build_replace, fold_replace_aliases
 
 # One namespace, several, or the keyword "all" — the address shape every search
 # tool accepts. Named once so the three tools cannot drift apart.
@@ -204,6 +204,10 @@ def build_server(cfg: Optional[Config] = None):
                      diff: Optional[str] = None, base_hash: Optional[str] = None,
                      replace_old: Optional[str] = None,
                      replace_new: Optional[str] = None, replace_all: bool = False,
+                     old_string: Optional[str] = None,
+                     new_string: Optional[str] = None,
+                     old_str: Optional[str] = None,
+                     new_str: Optional[str] = None,
                      path: Optional[str] = None, tags: Optional[List[str]] = None,
                      title: Optional[str] = None,
                      source: Optional[str] = None, reason: Optional[str] = None,
@@ -214,7 +218,9 @@ def build_server(cfg: Optional[Config] = None):
 
         EDIT an existing one by addressing it — `id`, or `at` (the tree path it
         lives at, e.g. at="decisions.pricing") — plus ONE of: a whole new `body`;
-        a substring edit `replace_old`→`replace_new` (server finds `replace_old`
+        a substring edit `replace_old`→`replace_new` — also accepted as
+        `old_string`/`new_string` or `old_str`/`new_str`, the spellings file
+        editors use (the server finds `replace_old`
         and rewrites just it — no diff to hand-build, and a body larger than the
         write cap stays editable since only old+new are sent; `replace_old` must
         be unique unless `replace_all=true`); or a unified `diff` with the
@@ -238,7 +244,12 @@ def build_server(cfg: Optional[Config] = None):
         `space` picks one of your namespaces by name (`space_id` for a shared
         one); omit both to use your default. The answer's `created` says whether
         this made a new memory or edited one."""
-        replace = build_replace(replace_old, replace_new)
+        folded = fold_replace_aliases(
+            {"replace_old": replace_old, "replace_new": replace_new,
+             "old_string": old_string, "new_string": new_string,
+             "old_str": old_str, "new_str": new_str})
+        replace = build_replace(folded.get("replace_old"),
+                                folded.get("replace_new"))
         with pool.connection() as conn:
             return _mem(_store(conn).write(
                 _token(ctx, token), id=id or None, at=at or None,
@@ -257,7 +268,13 @@ def build_server(cfg: Optional[Config] = None):
         (`at="decisions.pricing"`). Renews its TTL. If that path has since moved,
         you get the memory anyway and `moved_from` in the answer tells you the
         address changed — use the new `path` from then on. `if_moved="error"` asks
-        to be told rather than redirected."""
+        to be told rather than redirected.
+
+        `lines` ("40-80", "5", "1,10-12") returns only part of a long body. The
+        answer is then marked `partial`, carries `total_lines`, and has NO
+        `content_hash` — do not send a slice back as a whole `body`, or
+        everything outside it is erased. To change part of a long memory use
+        `replace_old`/`replace_new` instead."""
         with pool.connection() as conn:
             return _mem(_store(conn).get(_token(ctx, token), id, at=at,
                                          if_moved=if_moved,
@@ -546,18 +563,48 @@ def build_server(cfg: Optional[Config] = None):
         def memory_admin_create_user(name: str = "", description: str = "",
                                      role: str = "user",
                                      can_create_namespace: bool = False,
+                                     email: Optional[str] = None,
+                                     full_name: Optional[str] = None,
+                                     department: Optional[str] = None,
+                                     position: Optional[str] = None,
                                      token: Optional[str] = None,
                                      ctx: Context = None) -> dict:
             """Create a user and return its id. A new user owns nothing yet —
             give it a namespace with `memory_admin_create_namespace`, share one
             with `memory_admin_add_member`, or set `can_create_namespace` so it
-            can make its own. Minting an admin-role user requires superadmin."""
+            can make its own. Minting an admin-role user requires superadmin.
+
+            `full_name`/`email`/`department`/`position` say who the person is;
+            `full_name` is what `memory_blame` shows as the author, so without it
+            an audit trail reads as bare uuids."""
             with pool.connection() as conn, conn.transaction():
                 uid = admin.create_user(conn, _principal(conn, _token(ctx, token)),
                                         name=name, description=description,
                                         role=role,
-                                        can_create_namespace=can_create_namespace)
+                                        can_create_namespace=can_create_namespace,
+                                        email=email, full_name=full_name,
+                                        department=department, position=position)
             return {"id": uid}
+
+        @mcp.tool()
+        def memory_admin_edit_user(user_id: str,
+                                   name: Optional[str] = None,
+                                   description: Optional[str] = None,
+                                   email: Optional[str] = None,
+                                   full_name: Optional[str] = None,
+                                   department: Optional[str] = None,
+                                   position: Optional[str] = None,
+                                   token: Optional[str] = None,
+                                   ctx: Context = None) -> dict:
+            """Change who a user is. Only the fields you pass are touched, so a
+            partial update cannot blank the rest."""
+            fields = {"name": name, "description": description, "email": email,
+                      "full_name": full_name, "department": department,
+                      "position": position}
+            with pool.connection() as conn, conn.transaction():
+                return admin.edit_user(
+                    conn, _principal(conn, _token(ctx, token)), user_id=user_id,
+                    **{k: v for k, v in fields.items() if v is not None})
 
         @mcp.tool()
         def memory_admin_set_can_create_namespace(user_id: str, allowed: bool,

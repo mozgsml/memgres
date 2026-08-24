@@ -31,27 +31,11 @@ from .config import Config, load
 from .diffing import DiffConflict
 from .embeddings import get_embedder
 from .identity import SpaceNotFound
+from .lines import parse_line_spec
 from .bootstrap import bootstrap_admin
 from .schema import migrate
 from .store import (Conflict, NoParent, NotFound, PathMoved, PathTaken, Store,
-                    TooLarge, build_replace)
-
-
-def _parse_lines(spec: Optional[str]) -> Optional[List[int]]:
-    """Parse a line selector like '2' or '1,3-5' into [2] / [1,3,4,5]. None → all."""
-    if not spec:
-        return None
-    out: List[int] = []
-    for part in spec.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            a, b = part.split("-", 1)
-            out.extend(range(int(a), int(b) + 1))
-        else:
-            out.append(int(part))
-    return out or None
+                    TooLarge, build_replace, fold_replace_aliases)
 
 
 def create_app(cfg: Optional[Config] = None):
@@ -102,6 +86,11 @@ def create_app(cfg: Optional[Config] = None):
         replace_old: Optional[str] = None
         replace_new: Optional[str] = None
         replace_all: bool = False
+        # the spellings file editors use; folded to the canon, conflicts refused
+        old_string: Optional[str] = None
+        new_string: Optional[str] = None
+        old_str: Optional[str] = None
+        new_str: Optional[str] = None
         path: Optional[str] = None
         tags: Optional[List[str]] = None
         title: Optional[str] = None
@@ -166,6 +155,14 @@ def create_app(cfg: Optional[Config] = None):
             # echo the DB message (avoids leaking schema / existence detail).
             raise HTTPException(400, "bad request")
 
+    def _folded_replace(req):
+        """The substring edit, whichever of its three spellings arrived."""
+        folded = fold_replace_aliases({
+            "replace_old": req.replace_old, "replace_new": req.replace_new,
+            "old_string": req.old_string, "new_string": req.new_string,
+            "old_str": req.old_str, "new_str": req.new_str})
+        return build_replace(folded.get("replace_old"), folded.get("replace_new"))
+
     def _ref(mid: str) -> dict:
         """Turn the URL's memory segment into the store's address argument.
 
@@ -203,14 +200,16 @@ def create_app(cfg: Optional[Config] = None):
 
     @app.get("/memories/{mid}")
     def read(mid: str, tok: Optional[str] = Depends(token),
-             if_moved: str = "follow",
+             if_moved: str = "follow", lines: Optional[str] = None,
              space: Optional[str] = None, space_id: Optional[str] = None):
         """Fetch one memory. `mid` is its id or its tree path; a path that has
         since moved is followed by default, and the answer says so via
-        `moved_from`. Pass `if_moved=error` to be told instead."""
+        `moved_from`. Pass `if_moved=error` to be told instead. `lines`
+        ("40-80", "1,10-12") returns only those lines — the answer is then marked
+        `partial` and carries no `content_hash`."""
         with pool.connection() as conn:
             return _mem(_guard(lambda: _store(conn).get(
-                tok, **_ref(mid), if_moved=if_moved,
+                tok, **_ref(mid), if_moved=if_moved, lines=lines,
                 space=space, space_id=space_id)))
 
     @app.patch("/memories/{mid}")
@@ -221,7 +220,7 @@ def create_app(cfg: Optional[Config] = None):
             m = _guard(lambda: _store(conn).write(
                 tok, **_ref(mid), if_moved=req.if_moved,
                 body=req.body, diff=req.diff, base_hash=req.base_hash,
-                replace=build_replace(req.replace_old, req.replace_new),
+                replace=_folded_replace(req),
                 replace_all=req.replace_all,
                 path=req.path, tags=req.tags, title=req.title,
                 source=req.source, reason=req.reason,
@@ -262,7 +261,7 @@ def create_app(cfg: Optional[Config] = None):
         """Who last changed each line. Grouped into author-blocks by default
         (`group=false` for per-line); `text=false` drops bodies for a pure
         ownership map; `lines` selects specific 1-based lines/ranges (per-line)."""
-        want = _parse_lines(lines)
+        want = parse_line_spec(lines)
         with pool.connection() as conn:
             s = _store(conn)
             if want is not None or not group:
@@ -439,6 +438,19 @@ def create_app(cfg: Optional[Config] = None):
         description: str = ""
         role: str = "user"
         can_create_namespace: bool = False
+        # who the person is — what makes an authorship line readable
+        email: Optional[str] = None
+        full_name: Optional[str] = None
+        department: Optional[str] = None
+        position: Optional[str] = None
+
+    class EditUser(BaseModel):
+        name: Optional[str] = None
+        description: Optional[str] = None
+        email: Optional[str] = None
+        full_name: Optional[str] = None
+        department: Optional[str] = None
+        position: Optional[str] = None
 
     class NamespaceRight(BaseModel):
         allowed: bool
@@ -466,7 +478,17 @@ def create_app(cfg: Optional[Config] = None):
             return {"id": _guard(lambda: admin.create_user(
                 conn, p, name=req.name, description=req.description,
                 role=req.role,
-                can_create_namespace=req.can_create_namespace))}
+                can_create_namespace=req.can_create_namespace,
+                email=req.email, full_name=req.full_name,
+                department=req.department, position=req.position))}
+
+    @app.patch("/admin/users/{user_id}")
+    def admin_edit_user(user_id: str, req: EditUser, p=Depends(principal)):
+        """Change who a user is. Only the fields sent are touched."""
+        with pool.connection() as conn:
+            return _guard(lambda: admin.edit_user(
+                conn, p, user_id=user_id,
+                **req.model_dump(exclude_none=True)))
 
     @app.post("/admin/users/{user_id}/can-create-namespace")
     def admin_set_create_right(user_id: str, req: NamespaceRight,
