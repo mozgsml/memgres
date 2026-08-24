@@ -130,8 +130,13 @@ def test_provisioning_end_to_end(box):
     # and the new credential is real: it writes, reads back, and knows itself
     who = _call(mcp, "memory_whoami", token=minted["token"])
     assert who["user_id"] == uid and who["permission"] == "write"
-    assert who["capabilities"] == {"is_admin": False, "can_manage_users": False,
-                                   "can_create_namespace": False}
+    # capabilities are EFFECTIVE for this credential, not the role's potential:
+    # a write-ceiling token administers nothing, not even its own tokens
+    assert who["capabilities"] == {
+        "is_admin": False, "can_manage_users": False,
+        "can_administer_deployment": False, "can_create_namespace": False,
+        "can_write": True, "can_manage_own_tokens": False,
+        "has_admin_ceiling": False}
 
     _call(mcp, "memory_write", body="a deal closed", path="deals.acme",
           token=minted["token"])

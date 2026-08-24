@@ -51,6 +51,93 @@ Spaces = Optional[Union[str, List[str]]]
 MCP_INSTRUCTION_MAX_BYTES = 2048
 
 
+# ─── what each tool needs before it is worth showing ─────────────────────────
+# Requirements are read against `admin.capabilities()` plus one pseudo-key,
+# `identity`, which means "this deployment has identities at all" (every mode
+# but `single`). A tool whose requirements are unmet is left out of the list the
+# client sees.
+#
+# **This is not an authorization boundary and must never be mistaken for one.**
+# Every tool authorizes on call, against the same service layer the HTTP surface
+# uses; a client that ignores the list and calls a hidden tool is refused there.
+# What this buys is honesty and context: a read-only agent is not shown five
+# write tools it will only ever be refused, and a model that cannot see a tool
+# does not spend turns trying it and reasoning about the failure.
+#
+# A tool missing from this table is SHOWN, not hidden. Hiding by default would
+# make forgetting an entry a silent disappearance — the failure that is hard to
+# notice — while showing one that cannot be used costs a refusal the caller can
+# read. `tests/test_mcp_tool_visibility.py` keeps the table complete anyway.
+TOOL_VISIBILITY = {
+    # data plane — reads are what any credential can do
+    "memory_recall": (),
+    "memory_get": (),
+    "memory_list": (),
+    "memory_find": (),
+    "memory_blame": (),
+    "memory_history": (),
+    "memory_server_info": (),
+    "memory_write": ("can_write",),
+    "memory_move": ("can_write",),
+    "memory_forget": ("can_write",),
+    # self-service identity — meaningless where there are no identities
+    "memory_whoami": ("identity",),
+    "memory_list_spaces": ("identity",),
+    "memory_set_alias": ("identity",),
+    "memory_drop_alias": ("identity",),
+    "memory_create_space": ("identity", "can_create_namespace"),
+    "memory_issue_token": ("identity", "can_manage_own_tokens"),
+    "memory_list_tokens": ("identity", "can_manage_own_tokens"),
+    "memory_revoke_token": ("identity", "can_manage_own_tokens"),
+    # control plane — the tier each one's service function enforces
+    "memory_admin_list_users": ("identity", "can_manage_users"),
+    "memory_admin_create_user": ("identity", "can_manage_users"),
+    "memory_admin_edit_user": ("identity", "can_manage_users"),
+    "memory_admin_set_can_create_namespace": ("identity", "can_manage_users"),
+    "memory_admin_list_namespaces": ("identity", "can_manage_users"),
+    "memory_admin_create_namespace": ("identity", "can_manage_users"),
+    "memory_admin_issue_token": ("identity", "can_manage_users"),
+    "memory_admin_list_tokens": ("identity", "can_manage_users"),
+    "memory_admin_revoke_token": ("identity", "can_manage_users"),
+    "memory_admin_set_role": ("identity", "can_administer_deployment"),
+    "memory_admin_add_member": ("identity", "can_administer_deployment"),
+    "memory_admin_count_orphans": ("identity", "can_administer_deployment"),
+    "memory_admin_adopt_orphans": ("identity", "can_administer_deployment"),
+    # per-namespace admin: any namespace OWNER qualifies, so no deployment-wide
+    # role decides these — but the credential still has to carry an admin
+    # ceiling, since the effective permission is membership ∧ ceiling
+    "memory_admin_edit_namespace": ("identity", "has_admin_ceiling"),
+    "memory_admin_list_members": ("identity", "has_admin_ceiling"),
+}
+
+
+def visible_tools(names, caps: Optional[dict], identity_on: bool):
+    """The subset of ``names`` worth showing to a caller with ``caps``.
+
+    ``caps=None`` means the caller could not be identified (no token, or one
+    that failed to resolve). Nothing beyond the unconditional tools is shown
+    then — but the read surface stays, so a misconfigured client still sees a
+    working server and gets a real authentication error when it calls.
+    """
+    out = []
+    for name in names:
+        needs = TOOL_VISIBILITY.get(name)
+        if needs is None:                     # unlisted: show it (see above)
+            out.append(name)
+            continue
+        ok = True
+        for need in needs:
+            if need == "identity":
+                ok = identity_on
+            else:
+                ok = bool(caps and caps.get(need))
+            if not ok:
+                break
+        if ok:
+            out.append(name)
+    return out
+
+
 def _instruction_text() -> Optional[str]:
     """Operator-supplied MCP instructions from ``MEMGRES_INSTRUCTION``, or None to
     omit the field entirely. Capped at ``MCP_INSTRUCTION_MAX_BYTES`` on a UTF-8
@@ -763,6 +850,54 @@ def build_server(cfg: Optional[Config] = None):
             with pool.connection() as conn, conn.transaction():
                 return {"revoked": admin.revoke_token(
                     conn, _principal(conn, _token(ctx, token)), token_id=token_id)}
+
+    # ─── per-caller tool list ───────────────────────────────────────────────
+    # MEMGRES_MCP_TOOL_VISIBILITY = auto (default) | off.
+    #
+    # The tool list is answered per request, so on an http endpoint each client
+    # sees the tools ITS token can use; on stdio the pinned token makes the
+    # answer constant. Note it is computed at LIST time: a client caches what it
+    # got at connect, so rights changed mid-session are not reflected until it
+    # lists again. That is a display lag, never a permission one — the call path
+    # re-authorizes every time.
+    _vis = _os.environ.get("MEMGRES_MCP_TOOL_VISIBILITY", "auto").strip().lower()
+    if _vis not in ("0", "false", "off", "no"):
+        _identity_on = cfg.key_mode != "single"
+        _all_caps = {k: True for k in
+                     ("can_write", "can_create_namespace", "can_manage_users",
+                      "can_manage_own_tokens", "can_administer_deployment",
+                      "has_admin_ceiling", "is_admin")}
+
+        def _caps_for_caller():
+            """This request's capabilities, or None if the caller is unknown."""
+            if not _identity_on:
+                # One implicit caller who may do everything; there is no
+                # credential to resolve and nothing to withhold.
+                return _all_caps
+            try:
+                ctx = mcp.get_context()
+            except Exception:
+                ctx = None
+            try:
+                with pool.connection() as conn:
+                    p = identity.resolve(conn, cfg, _token(ctx, None))
+                    return admin.capabilities(conn, p)
+            except Exception:
+                return None
+
+        async def _list_visible_tools():
+            tools = await mcp.list_tools()
+            allowed = set(visible_tools([t.name for t in tools],
+                                        _caps_for_caller(), _identity_on))
+            return [t for t in tools if t.name in allowed]
+
+        # Registering over the SDK's own handler. Guarded like the schema
+        # pruning below: if a future SDK moves this, the server keeps serving
+        # the full list rather than failing to start.
+        try:
+            mcp._mcp_server.list_tools()(_list_visible_tools)
+        except Exception:                                   # pragma: no cover
+            pass
 
     # Best-effort: on a pinned/single endpoint drop the (now unused) `token` arg
     # from each tool's advertised schema so the model doesn't even see it. Purely

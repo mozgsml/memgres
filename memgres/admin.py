@@ -148,6 +148,41 @@ def require_namespace_admin(conn, p: Principal, namespace_id: str) -> Optional[s
     return p.user_id
 
 
+def _has_full_credential(p: Principal) -> bool:
+    """The boolean form of :func:`_require_full_credential` — for reporting what
+    a caller may do, where the refusal itself is not wanted."""
+    return p.permission == "admin" and p.scope_namespace_id is None
+
+
+def capabilities(conn, p: Principal) -> dict:
+    """What this principal may actually do, right now, with THIS credential.
+
+    Every value is EFFECTIVE, not aspirational: a superadmin holding a read-only
+    or namespace-scoped token cannot manage users with it, and this says so —
+    the same answer `_require_full_credential` would give. Reporting the role's
+    potential instead would send a caller (or a rendered UI) at a door that is
+    going to refuse it, which is the drift the service layer exists to prevent.
+
+    `is_admin` is the exception and stays the plain role fact: per-namespace
+    authorization consults the role, not the credential, so a name that means
+    "the role" has to remain available.
+    """
+    return {
+        "is_admin": p.is_admin,
+        "can_manage_users": (identity.can_manage_users(p)
+                             and _has_full_credential(p)),
+        "can_administer_deployment": p.is_admin and _has_full_credential(p),
+        "can_create_namespace": identity.can_create_namespace(conn, p),
+        "can_write": identity.perm_at_least(p.permission, "write"),
+        "can_manage_own_tokens": _has_full_credential(p),
+        # Administering ONE namespace (edit it, list its members) needs an
+        # admin-ceiling credential but not an unscoped one — a token pinned to
+        # the namespace it administers is exactly the right shape. Whether the
+        # caller is admin ON a given namespace still depends on that namespace.
+        "has_admin_ceiling": p.permission == "admin",
+    }
+
+
 def whoami(conn, p: Principal) -> dict:
     """Who the caller is and what they may do — capabilities, not just a role.
 
@@ -165,11 +200,7 @@ def whoami(conn, p: Principal) -> dict:
         "permission": p.permission,          # this credential's ceiling
         "scope_namespace_id": p.scope_namespace_id,
         "token_id": p.token_id,
-        "capabilities": {
-            "is_admin": p.is_admin,
-            "can_manage_users": identity.can_manage_users(p),
-            "can_create_namespace": identity.can_create_namespace(conn, p),
-        },
+        "capabilities": capabilities(conn, p),
     }
 
 
