@@ -940,9 +940,18 @@ class Store:
         return True
 
     # ─── forget: real erasure ───────────────────────────────────────────────
-    def forget(self, token: Optional[str], id: str, *, space: Optional[str] = None,
+    def forget(self, token: Optional[str], id: Optional[str] = None, *,
+               at: Optional[str] = None, if_moved: str = "error",
+               space: Optional[str] = None,
                space_id: Optional[str] = None) -> bool:
+        """Erase a memory addressed by `id` or by `at` (its path).
+
+        Like every write, a stale address is refused rather than followed:
+        deleting the memory that used to live somewhere else, on the strength of
+        an address that no longer means what the caller thinks, is the one
+        mistake here that cannot be undone."""
         ns, _ = self._authorize(token, space=space, space_id=space_id, need="write")
+        id, _moved = self._address(ns, id, at, follow=if_moved == "follow")
         with self._conn.transaction():
             cur = self._conn.cursor()
             cur.execute("DELETE FROM memory WHERE id=%s AND namespace=%s", (id, ns))

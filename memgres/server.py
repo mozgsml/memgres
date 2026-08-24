@@ -32,7 +32,8 @@ from .embeddings import get_embedder
 from .identity import SpaceNotFound
 from .bootstrap import bootstrap_admin
 from .schema import migrate
-from .store import Conflict, NoParent, NotFound, Store, TooLarge, build_replace
+from .store import (Conflict, NoParent, NotFound, PathMoved, PathTaken, Store,
+                    TooLarge, build_replace)
 
 
 def _parse_lines(spec: Optional[str]) -> Optional[List[int]]:
@@ -91,6 +92,7 @@ def create_app(cfg: Optional[Config] = None):
         ttl_days: Optional[int] = None
         space: Optional[str] = None          # namespace name (your own)
         space_id: Optional[str] = None       # namespace id (canonical; shared spaces)
+        if_moved: str = "error"              # a vacated `path`: refuse, or "create"
 
     class EditBody(BaseModel):
         body: Optional[str] = None
@@ -107,6 +109,7 @@ def create_app(cfg: Optional[Config] = None):
         ttl_days: Optional[int] = None
         space: Optional[str] = None
         space_id: Optional[str] = None
+        if_moved: str = "error"              # a stale address: refuse, or "follow"
 
     class MoveBody(BaseModel):
         path: str
@@ -114,6 +117,7 @@ def create_app(cfg: Optional[Config] = None):
         reason: Optional[str] = None
         space: Optional[str] = None
         space_id: Optional[str] = None
+        if_moved: str = "error"
 
     # ─── auth: extract the namespace token ──────────────────────────────────
     def token(authorization: Optional[str] = Header(None),
@@ -138,6 +142,11 @@ def create_app(cfg: Optional[Config] = None):
             raise HTTPException(404, "not found")
         except (Conflict, DiffConflict) as e:
             raise HTTPException(409, str(e))
+        except (PathMoved, PathTaken) as e:
+            # 409, not 422: the request is well-formed — the caller's picture of
+            # where things live is what is out of date. Listed before ValueError,
+            # which they subclass.
+            raise HTTPException(409, str(e))
         except NoParent as e:
             raise HTTPException(409, str(e))
         except admin.Lockout as e:           # would leave nobody in charge
@@ -156,6 +165,15 @@ def create_app(cfg: Optional[Config] = None):
             # echo the DB message (avoids leaking schema / existence detail).
             raise HTTPException(400, "bad request")
 
+    def _ref(mid: str) -> dict:
+        """Turn the URL's memory segment into the store's address argument.
+
+        It may be a uuid or a tree path, and the two cannot be confused: an ltree
+        label is `[A-Za-z0-9_]`, so a path never contains the dashes a uuid
+        always has. One route set therefore serves both addresses, instead of a
+        parallel `/by-path/...` tree that would have to be kept in step."""
+        return {"id": mid} if "-" in mid else {"at": mid}
+
     # ─── routes ─────────────────────────────────────────────────────────────
     @app.get("/healthz")
     def healthz():
@@ -167,15 +185,20 @@ def create_app(cfg: Optional[Config] = None):
             m = _guard(lambda: _store(conn).write(
                 tok, body=req.body, path=req.path, tags=req.tags, title=req.title,
                 source=req.source, reason=req.reason, ttl_days=req.ttl_days,
-                space=req.space, space_id=req.space_id))
+                if_moved=req.if_moved, space=req.space, space_id=req.space_id))
             return _mem(m)
 
     @app.get("/memories/{mid}")
     def read(mid: str, tok: Optional[str] = Depends(token),
+             if_moved: str = "follow",
              space: Optional[str] = None, space_id: Optional[str] = None):
+        """Fetch one memory. `mid` is its id or its tree path; a path that has
+        since moved is followed by default, and the answer says so via
+        `moved_from`. Pass `if_moved=error` to be told instead."""
         with pool.connection() as conn:
             return _mem(_guard(lambda: _store(conn).get(
-                tok, mid, space=space, space_id=space_id)))
+                tok, **_ref(mid), if_moved=if_moved,
+                space=space, space_id=space_id)))
 
     @app.patch("/memories/{mid}")
     def edit(mid: str, req: EditBody, tok: Optional[str] = Depends(token)):
@@ -183,7 +206,8 @@ def create_app(cfg: Optional[Config] = None):
             # build_replace runs inside _guard so a lone replace_old/new surfaces
             # as its ValueError -> 422, not a silent delete or an uncaught 500.
             m = _guard(lambda: _store(conn).write(
-                tok, id=mid, body=req.body, diff=req.diff, base_hash=req.base_hash,
+                tok, **_ref(mid), if_moved=req.if_moved,
+                body=req.body, diff=req.diff, base_hash=req.base_hash,
                 replace=build_replace(req.replace_old, req.replace_new),
                 replace_all=req.replace_all,
                 path=req.path, tags=req.tags, title=req.title,
@@ -195,7 +219,8 @@ def create_app(cfg: Optional[Config] = None):
     def move(mid: str, req: MoveBody, tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
             m = _guard(lambda: _store(conn).move(
-                tok, mid, req.path, source=req.source, reason=req.reason,
+                tok, **_ref(mid), new_path=req.path, if_moved=req.if_moved,
+                source=req.source, reason=req.reason,
                 space=req.space, space_id=req.space_id))
             return _mem(m)
 
@@ -204,7 +229,7 @@ def create_app(cfg: Optional[Config] = None):
                space: Optional[str] = None, space_id: Optional[str] = None):
         with pool.connection() as conn:
             ok = _guard(lambda: _store(conn).forget(
-                tok, mid, space=space, space_id=space_id))
+                tok, **_ref(mid), space=space, space_id=space_id))
             if not ok:
                 raise HTTPException(404, "not found")
 
@@ -213,7 +238,7 @@ def create_app(cfg: Optional[Config] = None):
                 space: Optional[str] = None, space_id: Optional[str] = None):
         with pool.connection() as conn:
             return _guard(lambda: _store(conn).history(
-                tok, mid, space=space, space_id=space_id))
+                tok, **_ref(mid), space=space, space_id=space_id))
 
     @app.get("/memories/{mid}/blame")
     def blame(mid: str, upto_seq: Optional[int] = None,
@@ -229,9 +254,11 @@ def create_app(cfg: Optional[Config] = None):
             s = _store(conn)
             if want is not None or not group:
                 return _guard(lambda: s.annotate(
-                    tok, mid, upto_seq, want, space=space, space_id=space_id))
+                    tok, upto_seq=upto_seq, lines=want, **_ref(mid),
+                    space=space, space_id=space_id))
             return _guard(lambda: s.annotate_grouped(
-                tok, mid, upto_seq, text, space=space, space_id=space_id))
+                tok, upto_seq=upto_seq, include_text=text, **_ref(mid),
+                space=space, space_id=space_id))
 
     @app.get("/memories/{mid}/at/{seq}")
     def at_version(mid: str, seq: int, tok: Optional[str] = Depends(token),
@@ -239,7 +266,7 @@ def create_app(cfg: Optional[Config] = None):
         """The exact body as it was at version `seq` (reconstructed from history)."""
         with pool.connection() as conn:
             body = _guard(lambda: _store(conn).reconstruct(
-                tok, mid, seq, space=space, space_id=space_id))
+                tok, upto_seq=seq, **_ref(mid), space=space, space_id=space_id))
             return {"seq": seq, "body": body}
 
     @app.get("/memories")

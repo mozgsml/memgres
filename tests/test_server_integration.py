@@ -341,3 +341,54 @@ def test_recall_over_several_namespaces(monkeypatch):
                               headers=h).json()) == 3
         assert client.get("/find", params={"q": "apple", "space": "all"},
                           headers=h).status_code == 200
+
+
+def test_a_memory_is_addressable_by_path_over_http(client):
+    """The URL segment takes either address. They can't be confused: an ltree
+    label is [A-Za-z0-9_], so a path never has the dashes a uuid always has."""
+    r = client.post("/memories", json={"body": "one\n", "path": "ops.postgres"})
+    assert r.status_code == 201 and r.json()["created"] is True
+    mid = r.json()["id"]
+
+    assert client.get("/memories/ops.postgres").json()["id"] == mid
+    assert client.get(f"/memories/{mid}").json()["id"] == mid
+    assert client.get("/memories/ops.postgres/history").json()[0]["op"] == "create"
+
+    r = client.patch("/memories/ops.postgres", json={"body": "two\n"})
+    assert r.status_code == 200 and r.json()["created"] is False
+    assert client.get(f"/memories/{mid}").json()["body"] == "two\n"
+
+
+def test_a_stale_path_is_a_conflict_not_a_second_memory(client):
+    """The whole point, over the wire: a write to an address a memory left is
+    refused with where it went — not answered with a quiet duplicate."""
+    mid = client.post("/memories", json={"body": "real\n",
+                                         "path": "ops.old"}).json()["id"]
+    assert client.post(f"/memories/{mid}/move",
+                       json={"path": "ops.new"}).status_code == 200
+
+    r = client.post("/memories", json={"body": "dupe\n", "path": "ops.old"})
+    assert r.status_code == 409 and "ops.new" in r.text
+    assert len(client.get("/memories").json()) == 1        # nothing was created
+
+    # a read, by contrast, follows and says the address changed
+    got = client.get("/memories/ops.old").json()
+    assert got["id"] == mid and got["moved_from"] == "ops.old"
+    assert client.get("/memories/ops.old",
+                      params={"if_moved": "error"}).status_code == 409
+
+    # and the two deliberate answers both work
+    r = client.patch("/memories/ops.old", json={"body": "edited\n",
+                                                "if_moved": "follow"})
+    assert r.status_code == 200 and r.json()["id"] == mid
+    r = client.post("/memories", json={"body": "new tenant\n", "path": "ops.old",
+                                       "if_moved": "create"})
+    assert r.status_code == 201 and r.json()["id"] != mid
+
+
+def test_creating_at_an_occupied_path_is_a_conflict(client):
+    mid = client.post("/memories", json={"body": "mine\n",
+                                         "path": "ops.a"}).json()["id"]
+    r = client.post("/memories", json={"body": "also\n", "path": "ops.a"})
+    assert r.status_code == 409 and mid in r.text
+    assert client.get(f"/memories/{mid}").json()["body"] == "mine\n"

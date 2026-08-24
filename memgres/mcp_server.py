@@ -199,6 +199,8 @@ def build_server(cfg: Optional[Config] = None):
 
     @mcp.tool()
     def memory_write(body: Optional[str] = None, id: Optional[str] = None,
+                     at: Optional[str] = None,
+                     if_moved: Literal["error", "follow", "create"] = "error",
                      diff: Optional[str] = None, base_hash: Optional[str] = None,
                      replace_old: Optional[str] = None,
                      replace_new: Optional[str] = None, replace_all: bool = False,
@@ -208,31 +210,57 @@ def build_server(cfg: Optional[Config] = None):
                      ttl_days: Optional[int] = None,
                      space: Optional[str] = None, space_id: Optional[str] = None,
                      token: Optional[str] = None, ctx: Context = None) -> dict:
-        """Create or edit a memory. Omit `id` to create (needs `body`). To edit,
-        pass `id` plus ONE of: a whole new `body`; a substring edit
-        `replace_old`→`replace_new` (server finds `replace_old` and rewrites just
-        it — no diff to hand-build, and a body larger than the write cap stays
-        editable since only old+new are sent; `replace_old` must be unique unless
-        `replace_all=true`); or a unified `diff` with the `base_hash` it was cut
-        from. `path`/`tags` set the tree position and labels; `title` is a short
-        curated caption (set whole, searchable via `memory_find`); `source`/`reason`
-        record provenance. `space` picks one of your namespaces by name (`space_id`
-        for a shared one); omit both to use your default."""
+        """Create or edit a memory.
+
+        EDIT an existing one by addressing it — `id`, or `at` (the tree path it
+        lives at, e.g. at="decisions.pricing") — plus ONE of: a whole new `body`;
+        a substring edit `replace_old`→`replace_new` (server finds `replace_old`
+        and rewrites just it — no diff to hand-build, and a body larger than the
+        write cap stays editable since only old+new are sent; `replace_old` must
+        be unique unless `replace_all=true`); or a unified `diff` with the
+        `base_hash` it was cut from.
+
+        CREATE by giving neither `id` nor `at` (needs `body`). `path` files the
+        new memory at an address. Note the difference: **`at` finds an existing
+        memory, `path` says where a memory lives.** Creating at a path something
+        else already occupies is refused, naming the occupant — edit that one with
+        `at` instead of making a near-duplicate beside it.
+
+        If the address you used is one a memory MOVED AWAY from, the write is
+        refused and the error says where it went — otherwise your edit would land
+        on a memory you didn't name, or quietly become a SECOND memory on the same
+        subject while the first lives on elsewhere. Then decide: `if_moved="follow"`
+        to edit it at its new address, or `if_moved="create"` to claim the vacated
+        path for something genuinely new.
+
+        `tags` labels it; `title` is a short curated caption (set whole,
+        searchable via `memory_find`); `source`/`reason` record provenance.
+        `space` picks one of your namespaces by name (`space_id` for a shared
+        one); omit both to use your default. The answer's `created` says whether
+        this made a new memory or edited one."""
         replace = build_replace(replace_old, replace_new)
         with pool.connection() as conn:
             return _mem(_store(conn).write(
-                _token(ctx, token), id=id or None, body=body, diff=diff,
+                _token(ctx, token), id=id or None, at=at or None,
+                if_moved=if_moved, body=body, diff=diff,
                 base_hash=base_hash, replace=replace, replace_all=replace_all,
                 path=path, tags=tags, title=title, source=source,
                 reason=reason, ttl_days=ttl_days, space=space, space_id=space_id))
 
     @mcp.tool()
-    def memory_get(id: str, space: Optional[str] = None,
+    def memory_get(id: Optional[str] = None, at: Optional[str] = None,
+                   if_moved: Literal["follow", "error"] = "follow",
+                   space: Optional[str] = None,
                    space_id: Optional[str] = None,
                    token: Optional[str] = None, ctx: Context = None) -> dict:
-        """Fetch one memory by id (renews its TTL)."""
+        """Fetch one memory, by `id` or by `at` — the tree path it lives at
+        (`at="decisions.pricing"`). Renews its TTL. If that path has since moved,
+        you get the memory anyway and `moved_from` in the answer tells you the
+        address changed — use the new `path` from then on. `if_moved="error"` asks
+        to be told rather than redirected."""
         with pool.connection() as conn:
-            return _mem(_store(conn).get(_token(ctx, token), id,
+            return _mem(_store(conn).get(_token(ctx, token), id, at=at,
+                                         if_moved=if_moved,
                                          space=space, space_id=space_id))
 
     @mcp.tool()
@@ -315,7 +343,8 @@ def build_server(cfg: Optional[Config] = None):
         return server_info(cfg, embed_dim=dim)
 
     @mcp.tool()
-    def memory_blame(id: str, grouped: bool = True,
+    def memory_blame(id: Optional[str] = None, at: Optional[str] = None,
+                     grouped: bool = True,
                      space: Optional[str] = None, space_id: Optional[str] = None,
                      token: Optional[str] = None, ctx: Context = None) -> List[dict]:
         """Who last changed each line. Grouped into author-blocks by default;
@@ -326,11 +355,13 @@ def build_server(cfg: Optional[Config] = None):
             s = _store(conn)
             tok = _token(ctx, token)
             if grouped:
-                return s.annotate_grouped(tok, id, space=space, space_id=space_id)
-            return s.annotate(tok, id, space=space, space_id=space_id)
+                return s.annotate_grouped(tok, id, at=at, space=space,
+                                          space_id=space_id)
+            return s.annotate(tok, id, at=at, space=space, space_id=space_id)
 
     @mcp.tool()
-    def memory_history(id: str, space: Optional[str] = None,
+    def memory_history(id: Optional[str] = None, at: Optional[str] = None,
+                       space: Optional[str] = None,
                        space_id: Optional[str] = None,
                        token: Optional[str] = None, ctx: Context = None) -> List[dict]:
         """The full change chain for a memory: per version the diff, provenance
@@ -338,27 +369,37 @@ def build_server(cfg: Optional[Config] = None):
         / resolved author_name), and the hash-chain fields. Author is authoritative
         (from the authenticated principal), unlike free-text source/reason."""
         with pool.connection() as conn:
-            return _store(conn).history(_token(ctx, token), id,
+            return _store(conn).history(_token(ctx, token), id, at=at,
                                         space=space, space_id=space_id)
 
     @mcp.tool()
-    def memory_move(id: str, new_path: str, reason: Optional[str] = None,
+    def memory_move(new_path: str, id: Optional[str] = None,
+                    at: Optional[str] = None,
+                    if_moved: Literal["error", "follow"] = "error",
+                    reason: Optional[str] = None,
                     space: Optional[str] = None, space_id: Optional[str] = None,
                     token: Optional[str] = None, ctx: Context = None) -> dict:
-        """Move a memory to a new tree path (cascades its subtree)."""
+        """Move a memory to a new tree path (cascades its subtree). Address it by
+        `id` or by `at` (its current path). Every node that moves records the
+        move, so its old path still resolves afterwards."""
         with pool.connection() as conn:
             return _mem(_store(conn).move(_token(ctx, token), id, new_path,
+                                          at=at, if_moved=if_moved,
                                           reason=reason, space=space,
                                           space_id=space_id))
 
     @mcp.tool()
-    def memory_forget(id: str, space: Optional[str] = None,
+    def memory_forget(id: Optional[str] = None, at: Optional[str] = None,
+                      space: Optional[str] = None,
                       space_id: Optional[str] = None,
                       token: Optional[str] = None, ctx: Context = None) -> dict:
-        """Permanently delete a memory and its history (GDPR erasure)."""
+        """Permanently delete a memory and its history (GDPR erasure). Address it
+        by `id` or by `at` (its path). A path that has since moved is REFUSED
+        rather than followed — deleting on the strength of a stale address is the
+        one mistake here you cannot undo."""
         with pool.connection() as conn:
             return {"forgotten": _store(conn).forget(
-                _token(ctx, token), id, space=space, space_id=space_id)}
+                _token(ctx, token), id, at=at, space=space, space_id=space_id)}
 
     # ─── identity: spaces & tokens (open/managed modes) ─────────────────────
     @mcp.tool()
