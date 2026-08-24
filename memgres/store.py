@@ -9,6 +9,12 @@ Every state change appends one hash-chained row to ``memory_history`` with
 `source`/`reason` provenance. ``forget`` hard-deletes the row and (by cascade)
 its whole history — real erasure, not a tombstone.
 
+A memory has two addresses: its `id` and its tree `path`, which is unique within
+a namespace. Operations take either (`at=` for the path). A path that a memory
+has moved away from still resolves, from the `move` rows in its history — reads
+follow it, writes refuse and say where it went, so a stale address cannot quietly
+become a second memory beside the first.
+
 Tree moves cascade: changing a node's `path` re-addresses its whole subtree, and
 each descendant records that move in its OWN history — a node's address changing
 is a change to that node, and it is what lets an old path still be resolved
@@ -846,6 +852,13 @@ class Store:
              if_moved: str = "error",
              source: Optional[str] = None, reason: Optional[str] = None,
              space: Optional[str] = None, space_id: Optional[str] = None) -> Memory:
+        """Re-address a memory (and, by cascade, its subtree). Address the memory
+        by `id` or by `at` (its current path); `new_path` is where it goes."""
+        # `new_path` is only optional in the signature so `at=` can be passed by
+        # keyword. A move with no destination is meaningless, and left to fall
+        # through it would reach `write` as a metadata-free edit — a silent no-op.
+        if not new_path:
+            raise ValueError("move needs a destination path")
         return self.write(token, id=id, at=at, if_moved=if_moved, path=new_path,
                           source=source, reason=reason,
                           space=space, space_id=space_id)

@@ -210,5 +210,14 @@ def test_if_moved_rejects_a_value_it_does_not_know(store):
         store.write(body="x\n", path="ops.a", if_moved="whatever")
 
 
+def test_a_move_with_no_destination_is_an_error(store):
+    """`new_path` is optional only so `at=` can be a keyword; a move with nowhere
+    to go would otherwise fall through as a metadata-free edit — a silent no-op."""
+    m = store.write(body="x\n", path="ops.a")
+    with pytest.raises(ValueError):
+        store.move(None, m.id)
+    assert store.get(None, m.id).path == "ops.a"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
