@@ -113,6 +113,7 @@ class Config:
     embed_retry_backoff_s: float # seconds a failed row is skipped before retry
     # listing / browse
     list_preview_chars: int      # first-line preview length for memory_list (0 = none)
+    list_bodies_max_bytes: int   # total body bytes one `bodies=true` browse may return
     # embeddings
     embed_provider: str          # none | local | jina | openai | openai-compatible
     embed_model: str
@@ -138,6 +139,8 @@ class Config:
             raise ValueError("MEMGRES_EMBED_MAX_SEQ must be >= 0")
         if self.list_preview_chars < 0:
             raise ValueError("MEMGRES_LIST_PREVIEW_CHARS must be >= 0")
+        if self.list_bodies_max_bytes < 1:
+            raise ValueError("MEMGRES_LIST_BODIES_MAX_BYTES must be >= 1")
         if self.chunk_chars < 1:
             raise ValueError("MEMGRES_CHUNK_CHARS must be >= 1")
         if self.chunk_overlap < 0:
@@ -216,6 +219,7 @@ def load() -> Config:
         embed_max_attempts=_int("MEMGRES_EMBED_MAX_ATTEMPTS", 5),
         embed_retry_backoff_s=_float("MEMGRES_EMBED_RETRY_BACKOFF_S", 60.0),
         list_preview_chars=_int("MEMGRES_LIST_PREVIEW_CHARS", 120),
+        list_bodies_max_bytes=_int("MEMGRES_LIST_BODIES_MAX_BYTES", 200_000),
         embed_provider=_str("MEMGRES_EMBED_PROVIDER", "none"),
         embed_model=_str("MEMGRES_EMBED_MODEL", ""),
         embed_dim=_int("MEMGRES_EMBED_DIM", 0),

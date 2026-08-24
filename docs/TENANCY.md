@@ -13,8 +13,9 @@ The rest of this document is about `open` and `managed`.
 
 ## The model
 
-- **user** — an account. Owns namespaces and holds tokens. Has one *default*
-  namespace used when a call doesn't name a space.
+- **user** — an account. Owns namespaces and holds tokens. Where its calls land
+  is never inferred: with one reachable namespace there is nothing to choose,
+  and beyond that it says which.
 - **namespace** — an isolation unit owned by a user. Memories in different
   namespaces are never co-searchable. A namespace carries a `description` and an
   `instruction` (free text telling an agent how to use it).
@@ -57,21 +58,145 @@ A `superadmin`'s data access is capped by its token ceiling like anyone's; a
 ## Addressing a space
 
 A namespace **id** (a uuid) is the canonical, unambiguous address. A **name** is
-a convenience that resolves **only among your own** namespaces — so a name can
-never collide with a namespace someone shared with you (that one is reached by
-id). In practice:
+a convenience: it resolves against every namespace you can reach, plus your own
+aliases. Names are unique only per owner, so two reachable spaces can carry one
+name — see below. In practice:
 
-- your own space → pass `space="notes"` (a name; owner is implied by your token);
-- a shared space → pass `space_id="<uuid>"` (from `list_spaces`);
-- neither → your **default** namespace.
+- by **name** → `space="notes"`: your alias for a space, or any space you reach
+  that carries that name;
+- by **id** → `space_id="<uuid>"` (from `list_spaces`), always unambiguous;
+- **neither** → your token's scope, or your single reachable namespace. Reaching
+  several and naming none is an error, not a guess.
 
-Every read/write API takes optional `space` and `space_id`.
+Every read/write API takes optional `space` and `space_id`. **Nothing is created
+by being addressed**: a name that matches nothing is an error, so a typo is a
+mistake rather than a new, empty, plausible-looking space your write lands in.
+Ask for one with `POST /spaces` (`memory_create_space`), which needs the right to
+create namespaces.
+
+### When a name means two things
+
+A namespace's name is unique per owner, so two people may each own `notes` — and
+once one of them shares theirs with you, the bare name means two things in your
+account. That collision is made by *someone else's* act of sharing, after you had
+already named your own spaces, so it cannot be refused when a namespace is
+created without letting your names block other people from sharing. It is
+refused when you address it, with both candidates named, and you settle it with
+an **alias**:
+
+```bash
+curl -s $BASE/spaces/aliases -d '{"alias":"bobs-notes","space_id":"<uuid>"}'
+curl -s -X DELETE $BASE/spaces/aliases/bobs-notes
+```
+
+An alias is private to you and **grants nothing** — the space has to be reachable
+already. Two collisions are refused up front because they would be yours to
+cause: an alias that shadows a name that already works for you, and a namespace
+born with the name of one of your aliases. The one that remains — a stranger
+sharing a space named like your alias — resolves in favour of your alias, since
+a deliberate label of yours should not be broken by someone else's naming.
+
+### Searching several spaces
+
+A search (`recall`, `find`, the `list` browse) may span namespaces. `space` takes
+a name, a list of names, or the keyword `"all"`; `space_id` takes ids, and the
+two combine. Over HTTP they are repeated query parameters:
+
+```bash
+curl -s "$BASE/recall?q=pricing&space=work&space=notes"   # two of yours
+curl -s "$BASE/recall?q=pricing&space=all"                 # everything you reach
+curl -s "$BASE/recall?q=pricing&space=work&space_id=<uuid>"  # yours + a shared one
+curl -s "$BASE/recall?q=pricing&space=*"                   # superadmin: everything
+```
+
+Every hit says which namespace answered, via `space` and `space_id`.
+
+**`all` is refused for a superadmin** whenever it would answer with less than
+that credential can read — that is, whenever namespaces exist outside its
+memberships. A superadmin reaches any namespace by id, so for that one caller
+the word asks two different questions, and the narrow answer looks exactly like
+the wide one: nothing found reads as "there is nothing", not as "not where I
+looked". The refusal names what `all` would have covered and offers `*`, which
+adds no reach — it spends in one call the access `space_id` already gives that
+role one namespace at a time. A token scoped to a single namespace stays scoped
+under either word. For everyone else `all` is unchanged, because for them it is
+genuinely everything.
+
+The same refusal covers a search that names **no** namespace at all, which is
+the same trap reached by saying nothing. (A *write* still resolves to your one
+membership: it has to land somewhere, and nothing is being left out of an
+answer.)
+
+There is deliberately no keyword for "the namespaces I belong to". Namespace
+names are free text and the obvious candidates are names people use — the first
+draft of this shadowed a namespace literally called `mine` in the test suite.
+`*` survives that objection, and the collision is still checked rather than
+assumed away: if a namespace **you reach** is named `*`, the keyword is refused
+as ambiguous and you address that one by id. The check is deliberately scoped to
+what you reach — checking every name in the deployment let any tenant disable
+the keyword for the superadmin by naming a namespace `*`, and a stranger's
+choice of name must not reach into what your words mean.
+
+**If you reach more than one namespace, you must name one** — for a search as
+much as for a write. Searching one of them and answering "nothing found" is
+indistinguishable from an answer, and a write that guesses is a misfile. So you
+are told which namespaces were meant, and you pick — or, for a search, say
+`all`.
+
+(If you happen to own a namespace literally named `all`, the keyword is refused
+as ambiguous rather than guessed at; address that one by `space_id`.)
+
+One asymmetry worth knowing: `all` means *every namespace you are a member or
+owner of*. A **superadmin** additionally reaches any namespace by id, so for that
+one caller `all` covers less than the credential could — deliberately, since a
+routine search should not sweep other tenants' data into a context by default.
+Address those by `space_id`.
+
+## Addressing a memory
+
+Within a namespace a memory has two addresses: its **id** (a uuid) and its
+**path** (the tree address, unique per namespace). `at` takes the path anywhere
+an `id` is taken — get, write, move, forget, history, blame. Over HTTP the URL
+segment takes either: it is read as an id when it parses as a uuid, and as a
+path otherwise — so hyphenated and non-ASCII paths address fine:
+
+```bash
+curl -s $BASE/memories/decisions.pricing          # by path
+curl -s $BASE/memories/018f…-…                    # by id
+curl -s -X PATCH $BASE/memories/decisions.pricing -d '{"body":"…"}'
+```
+
+`at` and `path` are different jobs: **`at` finds a memory, `path` says where a
+memory lives.** So `at="ops.x"` edits whatever is at that address, while
+`path="ops.x"` files a new memory there (and the two together move one).
+
+### When the address has moved
+
+A memory that moves records the address it left, so an old path still resolves.
+What happens then depends on what you are doing:
+
+- **reads follow it** and set `moved_from` in the answer — the memory that used
+  to live there is what you reached for, and now you know its address changed;
+- **writes refuse**, and say where it went. Writing to a stale address means your
+  picture is out of date, and both quiet answers commit you to it: edit the moved
+  memory and your write lands somewhere you did not name; create at the vacated
+  path and you now have two memories on one subject, the second of which you will
+  keep writing to while the first lives on elsewhere — with no error at any point.
+  `if_moved="follow"` edits it where it is now; `if_moved="create"` claims the
+  vacated path for something genuinely new;
+- **deletes never follow.** Deleting on the strength of a stale address is the
+  one mistake here you cannot undo.
+
+A *deleted* memory leaves no redirect at all — erasure is real, history goes with
+the row — so its path is simply free again. That is exactly the case where a
+duplicate is impossible, since there is nothing left to duplicate.
 
 ## Getting a token
 
 **open mode — bring your own.** Generate one yourself (any `mgk_` + 43 url-safe
-chars) and just start using it; the user + a `default` namespace are created
-lazily on your **first write** (never on a read, so probing creates nothing).
+chars). The account materializes when you ask for your first namespace
+(`POST /spaces`) — never on a read, so probing creates nothing, and never as a
+side effect of a write that named a space you mistyped.
 
 ```python
 import secrets
@@ -91,7 +216,8 @@ Send the token as `Authorization: Bearer <token>` (or `X-Memgres-Token`).
 BASE=http://localhost:8080
 TOK="mgk_…"
 
-# write into a named space (created lazily the first time)
+# make the space, then write into it — nothing is created by being named
+curl -s $BASE/spaces -H "Authorization: Bearer $TOK" -d '{"name":"work"}'
 curl -s $BASE/memories -H "Authorization: Bearer $TOK" \
   -d '{"body":"first note\n","space":"work","tags":["seed"]}'
 
@@ -123,21 +249,51 @@ Tools:
 
 - `memory_write` / `memory_get` / `memory_recall` / `memory_move` /
   `memory_history` / `memory_blame` / `memory_forget` — all take `space` /
-  `space_id`;
-- `memory_list_spaces` — your reachable namespaces (id, name, permission, default);
+  `space_id`; the id-addressed ones also take `at` (a path);
+- `memory_whoami` — what THIS credential may do, as capabilities. Effective, not
+  aspirational: a superadmin holding a scoped or read-only token is told it
+  cannot provision with it, because it cannot;
+- `memory_list_spaces` — your reachable namespaces (id, name, permission, alias);
+- `memory_create_space` / `memory_set_alias` / `memory_drop_alias` — make one,
+  and give it a name of your own;
 - `memory_issue_token` — mint a token (rotate/delegate; secret returned once);
-- `memory_list_tokens` / `memory_revoke_token` — manage them.
+- `memory_list_tokens` / `memory_revoke_token` — manage them;
+- `memory_admin_*` — the control plane (see below), where the caller has the
+  authority for it.
 
 Only a genuinely multi-tenant endpoint (`open`/`managed`, **no** pinned token)
 exposes a `token` argument for the model to supply; force it either way with
 `MEMGRES_MCP_TOKEN_ARG=on|off`. In `single` mode no token is needed at all.
+
+### What a client is shown
+
+The tool list is answered per caller: a read-only token is not offered the write
+tools, a plain user does not see the control plane, and a `single`-mode
+deployment — which has no identities — does not advertise namespace, token and
+user management. Each tool is classified by the capability its service function
+already enforces, and those capabilities are the ones `whoami` reports, so the
+list cannot drift from the rules. On an http endpoint each client sees what its
+own token can use; on stdio the pinned token makes the answer constant.
+
+**This is display, not authorization.** Every tool authorizes on call: a client
+that ignores the list and calls a hidden tool is refused by the service layer,
+with a message about permission rather than "unknown tool" — otherwise a change
+of rights would look like a broken server, and the real check would have quietly
+moved into a display table. For the same reason an unclassified tool is shown
+rather than hidden. The list is computed when the client lists, so rights
+changed mid-session appear the next time it does; the call path re-authorizes
+every time regardless. `MEMGRES_MCP_TOOL_VISIBILITY=off` lists everything.
+
+A web panel gets the same answer in its own shape: `whoami` returns the
+capabilities, and the panel renders its controls from them — one computation,
+two interfaces.
 
 ## Sharing a namespace (request-access)
 
 Someone wants into a namespace they don't own:
 
 ```bash
-# requester asks for read on a namespace id
+# requester asks for read on a namespace id  →  202 {"status": "submitted"}
 curl -s $BASE/spaces/<space_id>/access-requests \
   -H "Authorization: Bearer $REQUESTER" -d '{"permission":"read"}'
 
@@ -148,6 +304,20 @@ curl -s $BASE/access-requests/<req_id>/approve  -H "Authorization: Bearer $ADMIN
 
 After approval the requester's tokens reach the shared space **by id**, at the
 granted permission.
+
+The requester's receipt says only that the request was submitted. It carries no
+request id — deciding belongs to whoever administers the namespace, who reads
+ids from the listing — and a namespace that does not exist answers exactly like
+one the requester cannot reach, so the route cannot be used to find out which
+uuids are real. That holds for the *timing* too, which is why the request is
+recorded either way: while the write was conditional the two cases were ~8×
+apart on the clock, which tells an outsider exactly what the identical wording
+withheld. A request pointing at nothing is inert — nobody can list it, and
+deciding it is refused — and each account may have 100 open requests, which
+bounds both the table and request spam.
+
+Already reaching it is reported plainly (`already_reachable`): that is the
+caller's own access, which `/spaces` shows them anyway.
 
 ## First admin — bootstrap (managed mode)
 
@@ -203,6 +373,42 @@ curl -s $BASE/admin/tokens/<token_id>/revoke $A
 # service-role management (superadmin only)
 curl -s $BASE/admin/users/$UID/grant-superadmin $A
 curl -s $BASE/admin/users/$UID/revoke-superadmin -d '{"demote_to":"user"}' $A
+```
+
+The same operations are available over MCP as `memory_admin_*` tools, over the
+same service layer — so an operator working through an MCP client is not pushed
+onto curl. `MEMGRES_MCP_ADMIN_TOOLS=on|off|auto` controls whether they are
+registered; `auto` registers them wherever there are identities to administer,
+which is every mode but `single`. Turning them off shortens an agent-facing tool
+list — it is a context economy, **not** a security boundary, since every tool
+authorizes when it is called.
+
+### Who may act on whom
+
+**Authority is the role AND the token, never just the role.** A deployment-wide
+control-plane act needs an *unscoped, admin-ceiling* token; a per-namespace one
+refuses a token scoped to a different namespace. So handing an agent a read-only
+or namespace-pinned token really does narrow it, even when the account behind it
+is an admin — otherwise the agent could simply issue itself a better credential.
+
+A `user_manager` provisions ordinary accounts: it may act on accounts holding the
+plain `user` role, and nothing else. Issuing, revoking or listing tokens for an
+account that holds an admin role requires `superadmin` — without that rule, a
+`user_manager` could mint a token for a superadmin's account and become data-root
+in one request. The last superadmin also cannot be demoted or have their last
+token revoked, since that would leave the control plane with nobody in charge.
+
+### Creating namespaces
+
+Bringing a namespace into existence is a right (`can_create_namespace`), separate
+from provisioning people: an ordinary member can be trusted to organize their own
+corner without also being able to create users. Admin roles always have it. A
+user who has no namespace and no right to create one gets an explanation telling
+them to ask for one — not a silently-created namespace nobody asked for.
+
+```bash
+curl -s $BASE/admin/users/$UID/can-create-namespace -d '{"allowed":true}' $A
+curl -s $BASE/whoami -H "Authorization: Bearer $TOKEN"   # capabilities, not a role name
 ```
 
 ## Anti-garbage

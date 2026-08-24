@@ -1,0 +1,28 @@
+-- Which recipe computed a history row's hash (schema v14).
+--
+-- `store._row_hash` v1 joined the tag list with a comma inside an otherwise
+-- \x1f-separated field list, so `['a','b']` and `['a,b']` hash IDENTICALLY.
+-- Anyone able to write to this table could therefore rewrite a row's tag set
+-- into another set with the same joined text, and `verify_history` would still
+-- call the chain intact. Tags carry meaning here — a recall can be scoped to
+-- them — so that is a silent rewrite of what a memory says about itself.
+--
+-- v2 folds the tags through the same domain-separated construction `_fold`
+-- already used for title and author: each tag is reduced to its own fixed-width
+-- digest before joining, which makes the mapping injective — no tag can absorb
+-- a delimiter and stand in for two.
+--
+-- The fix changes the computed digest, so every row written before it would
+-- fail verification against the new recipe. Rather than rehash stored history
+-- (which would mean rewriting the very thing whose immutability is the point,
+-- and would make every previously recorded hash unverifiable), each row records
+-- the recipe it was written with and is verified against that one. Existing
+-- rows are v1 by default and keep verifying exactly as before; everything from
+-- this version on is v2.
+--
+-- Relabelling a row to dodge the stronger recipe does not work: v2 folds the
+-- tags into the digest instead of leaving them in the flat field list, so a v2
+-- row recomputed as v1 (or the reverse) yields a different hash. The column
+-- selects the recipe; it is not itself a claim the recipe has to trust.
+ALTER TABLE memory_history
+    ADD COLUMN IF NOT EXISTS hash_version smallint NOT NULL DEFAULT 1;

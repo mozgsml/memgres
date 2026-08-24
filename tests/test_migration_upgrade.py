@@ -167,3 +167,41 @@ def test_additive_newer_db_is_allowed_and_not_downgraded(conn):
         assert cur.fetchone()[0] == ahead            # not downgraded
     conn.rollback()
     conn.autocommit = True
+
+
+def test_schema_version_tracks_the_migrations_on_disk():
+    """A forgotten bump is invisible: migrations re-apply on every start, so the
+    new SQL lands while the database keeps claiming the old version — and the
+    compatibility floor, which is expressed in those numbers, then protects the
+    wrong set of clients."""
+    import re
+
+    from memgres.schema import MIGRATIONS_DIR, SCHEMA_VERSION
+
+    numbers = sorted(int(re.match(r"(\d+)_", f.name).group(1))
+                     for f in MIGRATIONS_DIR.glob("*.sql"))
+    assert numbers == list(range(1, len(numbers) + 1)), "a gap in the numbering"
+    assert SCHEMA_VERSION == numbers[-1] + 1
+
+
+def test_a_client_that_predates_the_hash_recipe_is_locked_out(conn, monkeypatch):
+    """The floor's whole job, stated as behaviour rather than as a constant.
+    0013 changed what a stored `row_hash` MEANS, so a client from before it
+    recomputes v2 rows with the v1 recipe and calls an untouched chain tampered
+    — the kind of wrong answer that is worse than a refusal to start. (0011
+    dropped a column every 0.5.x read path selects, which is the other half.)"""
+    from memgres import schema
+    from memgres.schema import SchemaMismatch, migrate
+
+    cfg = _fresh_full_schema(conn)                   # stamps the current floor
+    conn.commit()
+
+    monkeypatch.setattr(schema, "SCHEMA_VERSION", 13)    # a pre-0013 build
+    with pytest.raises(SchemaMismatch, match="Update this client"):
+        migrate(conn, cfg)
+    conn.rollback()
+
+    monkeypatch.setattr(schema, "SCHEMA_VERSION", 14)    # the build that carries it
+    migrate(conn, cfg)                                   # runs
+    conn.rollback()
+    conn.autocommit = True

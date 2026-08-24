@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Sequence, Tuple
 
-from .base import Hit, _vec_literal, grouped_chunk_search
+from .base import Hit, _vec_literal, as_namespaces, grouped_chunk_search
 
 
 class PgvectorBackend:
@@ -43,14 +43,24 @@ class PgvectorBackend:
             row = cur.fetchone()
         return row[0] if row else None
 
+    def retag_namespace(self, conn, old_ns: str, new_ns: str) -> int:
+        # Same database, so this rides in the caller's transaction and commits
+        # or rolls back with the memories themselves.
+        with conn.cursor() as cur:
+            cur.execute("UPDATE memory_segment SET namespace=%s WHERE namespace=%s",
+                        (new_ns, old_ns))
+            return cur.rowcount
+
     # ─── grouped semantic ranking ─────────────────────────────────────────────
-    def search(self, conn, cfg, query_vec: Sequence[float], k: int, ns: str,
+    def search(self, conn, cfg, query_vec: Sequence[float], k: int, ns,
                tags: Optional[Sequence[str]], path_prefix: Optional[str]) -> List[Hit]:
         qv = _vec_literal(query_vec)
 
         def fetch_chunks(overfetch: int, exclude: List[str]):
-            where = "namespace = %s"
-            params: list = [ns]
+            # `= ANY` over the same normalized set the Postgres row filter uses,
+            # so ranking and filtering can't be scoped differently.
+            where = "namespace = ANY(%s)"
+            params: list = [as_namespaces(ns)]
             if exclude:
                 where += " AND memory_id <> ALL(%s)"
                 params.append(exclude)

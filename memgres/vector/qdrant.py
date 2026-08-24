@@ -35,7 +35,7 @@ import os
 import uuid
 from typing import List, Optional, Sequence, Tuple
 
-from .base import Hit, grouped_chunk_search
+from .base import Hit, as_namespaces, grouped_chunk_search
 
 
 class QdrantBackend:
@@ -155,14 +155,47 @@ class QdrantBackend:
             return None
         return (points[0].payload or {}).get("src_hash")
 
+    def retag_namespace(self, conn, old_ns: str, new_ns: str) -> int:
+        """Rewrite the namespace payload on every chunk point of ``old_ns``.
+
+        Qdrant is out of band, so this cannot join the Postgres transaction. It
+        is therefore done FIRST and the memories move second: a run that dies in
+        between leaves points tagged for a namespace whose memories are still
+        orphaned, and orphaned memories are unreachable anyway — so the halfway
+        state answers nothing wrong, and re-running finishes the job."""
+        from qdrant_client.models import (FieldCondition, Filter, MatchValue)
+
+        flt = Filter(must=[FieldCondition(key="namespace",
+                                          match=MatchValue(value=old_ns))])
+        moved, offset = 0, None
+        while True:
+            points, offset = self.client.scroll(
+                self.chunks, scroll_filter=flt, limit=256,
+                with_payload=False, with_vectors=False, offset=offset)
+            if not points:
+                break
+            # wait=True because `adopt_orphans` moves the vectors FIRST and the
+            # rows second, and that ordering only protects anything if the
+            # vector write is durable before the rows follow.
+            self.client.set_payload(self.chunks, payload={"namespace": new_ns},
+                                    points=[p.id for p in points], wait=True)
+            moved += len(points)
+            if offset is None:
+                break
+        return moved
+
     # ─── grouped semantic ranking ─────────────────────────────────────────────
-    def search(self, conn, cfg, query_vec: Sequence[float], k: int, ns: str,
+    def search(self, conn, cfg, query_vec: Sequence[float], k: int, ns,
                tags: Optional[Sequence[str]], path_prefix: Optional[str]) -> List[Hit]:
-        from qdrant_client.models import (FieldCondition, Filter, MatchAny,
-                                          MatchValue)
+        from qdrant_client.models import FieldCondition, Filter, MatchAny
+
+        # MatchAny over the same normalized set Postgres filters on. A recall may
+        # span several namespaces; `grouped_chunk_search` re-checks every candidate
+        # against Postgres, so this filter governs recall quality, not tenancy.
+        spaces = as_namespaces(ns)
 
         def fetch_chunks(overfetch: int, exclude: List[str]):
-            must = [FieldCondition(key="namespace", match=MatchValue(value=ns))]
+            must = [FieldCondition(key="namespace", match=MatchAny(any=spaces))]
             must_not = ([FieldCondition(key="memory_id", match=MatchAny(any=exclude))]
                         if exclude else None)
             flt = Filter(must=must, must_not=must_not)

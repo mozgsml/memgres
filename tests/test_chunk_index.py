@@ -208,7 +208,11 @@ def _cross_tenant_semantic_isolation(store):
     conn = store._conn
     migrate(conn, cfg)
     s = Store(cfg, embedder=store.embedder, conn=conn, backend=store._vectors)
+    from memgres import identity as ident
+
     ta, tb = new_token(), new_token()
+    for t in (ta, tb):       # open mode: each token asks for its own space
+        ident.create_own_namespace(conn, ident.resolve(conn, cfg, t), "mine")
     a = s.write(ta, body="apple secret belonging to tenant A.\n")
     b = s.write(tb, body="apple secret belonging to tenant B.\n")
     assert s._authorize(ta, need="read")[0] != s._authorize(tb, need="read")[0]
@@ -228,6 +232,119 @@ def test_pg_cross_tenant_semantic_isolation(pg_store):
 
 def test_qdrant_cross_tenant_semantic_isolation(qdrant_store):
     _cross_tenant_semantic_isolation(qdrant_store)
+
+
+# ─── semantic recall across several namespaces (both backends) ───────────────
+def _multi_space_semantic(store):
+    """`space="all"` must widen the SEMANTIC path to exactly the namespaces the
+    caller reaches — no more, no fewer. This is the one place where the ranking
+    filter (Qdrant payload / pgvector SQL) and the row filter (Postgres) could
+    disagree: a narrower ranking filter silently loses hits, a wider one is
+    caught by `fetch_hit_rows`. Running it on both backends is what keeps them
+    honest against each other.
+    """
+    from memgres import identity as ident
+
+    cfg = replace(store.cfg, key_mode="managed")
+    conn = store._conn
+    migrate(conn, cfg)
+    s = Store(cfg, embedder=store.embedder, conn=conn, backend=store._vectors)
+
+    uid = ident.create_user(conn, name="owner")
+    ident.create_namespace(conn, uid, "work")
+    ident.create_namespace(conn, uid, "home")
+    tok, _ = ident.issue_token(conn, uid)
+
+    other = ident.create_user(conn, name="stranger")
+    ident.create_namespace(conn, other, "theirs")
+    other_tok, _ = ident.issue_token(conn, other)
+
+    w = s.write(tok, body="apple pie recipe from work.\n", space="work")
+    h = s.write(tok, body="apple tree in the home garden.\n", space="home")
+    s.write(other_tok, body="apple orchard that is none of your business.\n",
+            space="theirs")
+
+    hits = s.recall(tok, "apple", mode="semantic", space="all")
+    assert {x.id for x in hits} == {w.id, h.id}          # both of mine, only mine
+    assert all("none of your business" not in (x.snippet or "") for x in hits)
+    # every hit says which namespace it came from, by id AND by name
+    assert {x.space for x in hits} == {"work", "home"}
+    assert all(x.namespace for x in hits)
+
+    # naming a subset narrows it back down
+    only_work = s.recall(tok, "apple", mode="semantic", space="work")
+    assert [x.id for x in only_work] == [w.id]
+
+    # the same namespace named twice (by name and by id) is searched once
+    work_id = next(x.namespace for x in only_work)
+    twice = s.recall(tok, "apple", mode="semantic", space="work", space_id=work_id)
+    assert [x.id for x in twice] == [w.id]
+
+
+def test_pg_multi_space_semantic(pg_store):
+    _multi_space_semantic(pg_store)
+
+
+def test_qdrant_multi_space_semantic(qdrant_store):
+    _multi_space_semantic(qdrant_store)
+
+
+# ─── adopting single-mode data, on both backends ─────────────────────────────
+def _adopt_orphans_keeps_both_recalls(store):
+    """The trap this guards: a memory's namespace is written down TWICE — on the
+    row and on every chunk vector. Move the rows and forget the vectors and
+    lexical recall works while semantic recall returns nothing at all. No error,
+    no warning, just an empty answer that looks like "not found".
+
+    So the check is not "did the rows move" but "does BOTH kinds of recall find
+    them afterwards", run against whichever backend is under test.
+    """
+    from dataclasses import replace as _replace
+
+    from memgres import admin, identity as ident
+
+    conn = store._conn
+    # seed as single mode: everything lands in the nameless namespace
+    single = _replace(store.cfg, key_mode="single")
+    migrate(conn, single)
+    s0 = Store(single, embedder=store.embedder, conn=conn, backend=store._vectors)
+    m = s0.write(None, body="apple pie recipe from the old days\n", path="old.pie")
+    assert [h.id for h in s0.recall(None, "apple", mode="semantic")] == [m.id]
+
+    # switch to managed: the corpus is still there, and now unreachable
+    managed = _replace(store.cfg, key_mode="managed")
+    migrate(conn, managed)
+    s = Store(managed, embedder=store.embedder, conn=conn, backend=store._vectors)
+    root = ident.create_user(conn, name="root", role="superadmin")
+    nsid = ident.create_namespace(conn, root, "adopted")
+    tok, _ = ident.issue_token(conn, root, permission="admin")
+    p = ident.resolve(conn, managed, tok)
+    assert s.recall(tok, "apple", mode="semantic", space="adopted") == []
+
+    assert admin.count_orphans(conn, p)["orphans"] == 1
+    out = admin.adopt_orphans(conn, p, namespace_id=nsid, vectors=store._vectors)
+    assert out["adopted"] == 1 and out["chunks"] >= 1
+    assert admin.count_orphans(conn, p)["orphans"] == 0
+
+    # BOTH recalls must find it now — the semantic one is the one that would
+    # have gone quietly empty
+    assert [h.id for h in s.recall(tok, "apple", mode="lexical",
+                                   space="adopted")] == [m.id]
+    assert [h.id for h in s.recall(tok, "apple", mode="semantic",
+                                   space="adopted")] == [m.id]
+    assert s.get(tok, m.id, space="adopted").path == "old.pie"
+
+    # idempotent: running it again is a no-op, not a second migration
+    assert admin.adopt_orphans(conn, p, namespace_id=nsid,
+                               vectors=store._vectors)["adopted"] == 0
+
+
+def test_pg_adopt_orphans_keeps_both_recalls(pg_store):
+    _adopt_orphans_keeps_both_recalls(pg_store)
+
+
+def test_qdrant_adopt_orphans_keeps_both_recalls(qdrant_store):
+    _adopt_orphans_keeps_both_recalls(qdrant_store)
 
 
 if __name__ == "__main__":

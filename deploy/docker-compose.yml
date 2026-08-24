@@ -43,7 +43,7 @@ services:
 
   # API tier — serves HTTP, only FLAGS writes (embedding deferred to the worker).
   api:
-    build: { context: .., args: { EXTRAS: "server,qdrant" } }   # or image: ghcr.io/mozgsml/memgres:0.4.0
+    build: { context: .., args: { EXTRAS: "server,qdrant" } }   # or image: ghcr.io/mozgsml/memgres:X.Y.Z
     command: ["memgres-server"]
     environment:
       <<: *memgres-env
@@ -57,7 +57,7 @@ services:
 
   # Worker tier — does the embedding. Scale replicas as write volume grows.
   worker:
-    build: { context: .., args: { EXTRAS: "qdrant" } }          # or image: ghcr.io/mozgsml/memgres:0.4.0
+    build: { context: .., args: { EXTRAS: "qdrant" } }          # or image: ghcr.io/mozgsml/memgres:X.Y.Z
     command: ["memgres-worker"]
     environment:
       <<: *memgres-env                        # same embedder + backend as the API

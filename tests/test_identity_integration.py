@@ -20,7 +20,8 @@ from memgres.config import load  # noqa: E402
 from memgres.schema import migrate  # noqa: E402
 from memgres import identity as ident  # noqa: E402
 from memgres.identity import (  # noqa: E402
-    AuthError, SpaceNotFound, Principal, new_token, valid_format,
+    AuthError, SpaceAmbiguous, SpaceNotFound, Principal, new_token,
+    valid_format,
     TOKEN_RE,
 )
 from memgres.store import NotFound as NotFoundErr  # noqa: E402
@@ -132,57 +133,182 @@ def test_bring_your_own_token_open_mode(conn):
         ident.register_token(conn, uid, "too-weak")
 
 
-# ─── space resolution: by name (own only) ────────────────────────────────────
-def test_name_resolves_own_and_lazy_creates_on_write(conn):
-    uid = ident.create_user(conn)
+# ─── space resolution: by name ───────────────────────────────────────────────
+def test_a_name_that_matches_nothing_is_an_error_not_a_new_space(conn):
+    """Addressing an unknown name used to CREATE it, so a typo produced a new
+    empty space and the write landed there looking like it had worked. Creating
+    is now something you ask for."""
+    uid = ident.create_user(conn, can_create_namespace=True)
     secret, _ = ident.issue_token(conn, uid, permission="write")
     p = ident.resolve(conn, cfg(conn), secret)
 
-    # read of a non-existent name never creates
-    with pytest.raises(SpaceNotFound):
-        ident.resolve_space(conn, p, space="proj", for_write=False)
+    for for_write in (False, True):
+        with pytest.raises(SpaceNotFound):
+            ident.resolve_space(conn, p, space="proj", for_write=for_write)
 
-    nsid, perm = ident.resolve_space(conn, p, space="proj", for_write=True)
+    nsid = ident.create_own_namespace(conn, p, "proj")
+    again, perm = ident.resolve_space(conn, p, space="proj")
+    assert again == nsid
     assert perm == "write"                       # min(owner=admin, ceiling=write)
-    again, _ = ident.resolve_space(conn, p, space="proj")
-    assert again == nsid                          # same space, not a duplicate
 
 
-def test_default_namespace_resolution_and_set(conn):
-    uid = ident.create_user(conn)
+def test_creating_a_namespace_needs_the_right(conn):
+    uid = ident.create_user(conn)                # no can_create_namespace
     secret, _ = ident.issue_token(conn, uid, permission="write")
     p = ident.resolve(conn, cfg(conn), secret)
-    # no space arg, no default yet → read fails, write lazily creates default
-    with pytest.raises(SpaceNotFound):
-        ident.resolve_space(conn, p)
-    dflt, _ = ident.resolve_space(conn, p, for_write=True)
-    # now it's the user's default
-    again, _ = ident.resolve_space(conn, p)
-    assert again == dflt
-    # switch default to another space
-    other = ident.create_namespace(conn, uid, "other")
-    ident.set_default_space(conn, uid, other)
-    p2 = ident.resolve(conn, cfg(conn), secret)
-    assert ident.resolve_space(conn, p2)[0] == other
+    with pytest.raises(AuthError):
+        ident.create_own_namespace(conn, p, "proj")
 
 
-# ─── the collision the model is built to avoid ───────────────────────────────
-def test_name_never_collides_with_shared_space(conn):
+def test_no_reachable_namespace_is_an_error_on_both_reads_and_writes(conn):
+    """There is no default namespace to fall back on any more — where data goes
+    is never inferred."""
+    uid = ident.create_user(conn, can_create_namespace=True)
+    secret, _ = ident.issue_token(conn, uid, permission="write")
+    p = ident.resolve(conn, cfg(conn), secret)
+    for for_write in (False, True):
+        with pytest.raises(SpaceNotFound):
+            ident.resolve_space(conn, p, for_write=for_write)
+
+    # with exactly one, there is nothing to choose and it resolves silently
+    only = ident.create_own_namespace(conn, p, "only")
+    assert ident.resolve_space(conn, p)[0] == only
+
+
+# ─── the collision the alias exists for ──────────────────────────────────────
+def test_a_shared_namespace_is_reachable_by_its_name(conn):
     alice = ident.create_user(conn, name="alice")
     bob = ident.create_user(conn, name="bob")
-    a_notes = ident.create_namespace(conn, alice, "notes")
-    b_notes = ident.create_namespace(conn, bob, "notes")   # same name, other owner
-    ident.add_member(conn, b_notes, alice, "write")         # alice shares bob's notes
+    b_notes = ident.create_namespace(conn, bob, "notes")
+    ident.add_member(conn, b_notes, alice, "write")
 
     secret, _ = ident.issue_token(conn, alice, permission="admin")
     p = ident.resolve(conn, cfg(conn), secret)
+    # alice owns nothing called notes, so the shared one answers to the name
+    by_name, perm = ident.resolve_space(conn, p, space="notes")
+    assert by_name == b_notes and perm == "write"
 
-    # name resolves to alice's OWN notes, never bob's
-    by_name, _ = ident.resolve_space(conn, p, space="notes")
-    assert by_name == a_notes
-    # bob's notes is reachable only by id, with the shared (write) permission
-    by_id, perm = ident.resolve_space(conn, p, space_id=b_notes)
-    assert by_id == b_notes and perm == "write"
+
+def test_two_namespaces_of_one_name_are_refused_until_aliased(conn):
+    """Nobody chose this collision — alice named hers, bob named his, and then
+    bob shared. So it is refused with both named, and alice settles it."""
+    alice = ident.create_user(conn, name="alice")
+    bob = ident.create_user(conn, name="bob")
+    a_notes = ident.create_namespace(conn, alice, "notes")
+    b_notes = ident.create_namespace(conn, bob, "notes")
+    ident.add_member(conn, b_notes, alice, "write")
+
+    secret, _ = ident.issue_token(conn, alice, permission="admin")
+    p = ident.resolve(conn, cfg(conn), secret)
+    with pytest.raises(SpaceAmbiguous) as e:
+        ident.resolve_space(conn, p, space="notes")
+    assert a_notes in str(e.value) and b_notes in str(e.value)
+
+    # each is still addressable by id, and an alias makes a name for it
+    assert ident.resolve_space(conn, p, space_id=b_notes)[0] == b_notes
+    ident.create_alias(conn, alice, "bobs-notes", b_notes)
+    assert ident.resolve_space(conn, p, space="bobs-notes")[0] == b_notes
+
+
+def test_an_alias_outlives_a_name_someone_else_brings(conn):
+    """Your alias is your decision; a name arriving later is a stranger's. The
+    alias keeps working — otherwise sharing would silently break your calls."""
+    alice = ident.create_user(conn, name="alice")
+    bob = ident.create_user(conn, name="bob")
+    carol = ident.create_user(conn, name="carol")
+    b_ns = ident.create_namespace(conn, bob, "b-stuff")
+    ident.add_member(conn, b_ns, alice, "read")
+    ident.create_alias(conn, alice, "shared", b_ns)
+
+    secret, _ = ident.issue_token(conn, alice, permission="admin")
+    p = ident.resolve(conn, cfg(conn), secret)
+    assert ident.resolve_space(conn, p, space="shared")[0] == b_ns
+
+    # carol now shares a namespace actually NAMED 'shared'
+    c_ns = ident.create_namespace(conn, carol, "shared")
+    ident.add_member(conn, c_ns, alice, "read")
+    assert ident.resolve_space(conn, p, space="shared")[0] == b_ns    # unchanged
+    assert ident.resolve_space(conn, p, space_id=c_ns)[0] == c_ns
+
+
+def test_an_alias_may_not_shadow_a_name_that_already_works(conn):
+    alice = ident.create_user(conn, name="alice")
+    bob = ident.create_user(conn, name="bob")
+    mine = ident.create_namespace(conn, alice, "notes")
+    theirs = ident.create_namespace(conn, bob, "other")
+    ident.add_member(conn, theirs, alice, "read")
+
+    with pytest.raises(SpaceAmbiguous):
+        ident.create_alias(conn, alice, "notes", theirs)     # would shadow `mine`
+    # and an alias grants nothing: the target must already be reachable
+    unreachable = ident.create_namespace(conn, bob, "private")
+    with pytest.raises(SpaceNotFound):
+        ident.create_alias(conn, alice, "peek", unreachable)
+    assert ident.resolve_space(
+        conn, ident.resolve(conn, cfg(conn),
+                            ident.issue_token(conn, alice)[0]),
+        space="notes")[0] == mine
+
+
+def test_no_door_may_create_a_namespace_your_alias_shadows(conn):
+    """The rule was written on the self-service door and missing from the two
+    admin-side ones, so an admin provisioning you a namespace could leave every
+    call naming it resolving to a DIFFERENT, shared space — silently. It now
+    lives at the single point all three funnel through."""
+    alice = ident.create_user(conn, name="alice", can_create_namespace=True)
+    bob = ident.create_user(conn, name="bob")
+    b_ns = ident.create_namespace(conn, bob, "b-stuff")
+    ident.add_member(conn, b_ns, alice, "write")
+    ident.create_alias(conn, alice, "private", b_ns)
+
+    # the admin door — this is the one that was missing the check
+    with pytest.raises(SpaceAmbiguous):
+        ident.create_namespace(conn, alice, "private")
+    # and no namespace was made, so nothing to clean up
+    assert [n["name"] for n in ident.list_namespaces(conn, owner_user_id=alice)] == []
+
+    secret, _ = ident.issue_token(conn, alice, permission="write")
+    p = ident.resolve(conn, cfg(conn), secret)
+    assert ident.resolve_space(conn, p, space="private")[0] == b_ns
+
+
+def test_a_read_only_token_may_not_create_a_namespace(conn):
+    """A token weakened to read-only is what the docs tell you to give an agent;
+    it must not be able to change deployment state."""
+    uid = ident.create_user(conn, name="u", can_create_namespace=True)
+    ro, _ = ident.issue_token(conn, uid, permission="read")
+    p = ident.resolve(conn, cfg(conn), ro)
+    with pytest.raises(AuthError, match="write-capable"):
+        ident.create_own_namespace(conn, p, "nope")
+    assert ident.list_namespaces(conn) == []
+
+
+def test_one_account_cannot_own_unbounded_namespaces(conn):
+    """A bound, not a business rule: self-service must not be turnable into an
+    INSERT loop by anyone holding a well-formed token."""
+    uid = ident.create_user(conn, name="u", can_create_namespace=True)
+    for i in range(ident.MAX_NAMESPACES_PER_USER):
+        ident.create_namespace(conn, uid, f"ns{i}")
+    with pytest.raises(SpaceAmbiguous, match="cap"):
+        ident.create_namespace(conn, uid, "one-too-many")
+
+
+def test_an_empty_profile_edit_still_has_to_find_the_user(conn):
+    with pytest.raises(SpaceNotFound):
+        ident.edit_user(conn, "00000000-0000-0000-0000-000000000000")
+
+
+def test_a_namespace_may_not_be_born_shadowed_by_your_alias(conn):
+    alice = ident.create_user(conn, name="alice", can_create_namespace=True)
+    bob = ident.create_user(conn, name="bob")
+    b_ns = ident.create_namespace(conn, bob, "b-stuff")
+    ident.add_member(conn, b_ns, alice, "read")
+    ident.create_alias(conn, alice, "notes", b_ns)
+
+    secret, _ = ident.issue_token(conn, alice, permission="admin")
+    p = ident.resolve(conn, cfg(conn), secret)
+    with pytest.raises(SpaceAmbiguous):
+        ident.create_own_namespace(conn, p, "notes")
 
 
 def test_space_id_unreachable_rejected(conn):
@@ -214,8 +340,10 @@ def test_scoped_token_confined(conn):
     assert ident.resolve_space(conn, p, space_id=a)[0] == a
     with pytest.raises(AuthError):
         ident.resolve_space(conn, p, space_id=b)
-    with pytest.raises(AuthError):                 # can't create a new one either
+    with pytest.raises(SpaceNotFound):             # an unknown name is not a space
         ident.resolve_space(conn, p, space="c", for_write=True)
+    with pytest.raises(AuthError):                 # and it can't create one either
+        ident.create_own_namespace(conn, p, "c")
 
 
 # ─── provisional user materializes on first write ────────────────────────────
@@ -225,8 +353,10 @@ def test_provisional_user_created_on_write(conn):
     assert p.user_id is None
     with pytest.raises(SpaceNotFound):             # read creates nothing
         ident.resolve_space(conn, p)
-    nsid, _ = ident.resolve_space(conn, p, for_write=True)
+    # open mode is self-service: the first namespace it asks for materializes it
+    nsid = ident.create_own_namespace(conn, p, "mine")
     assert p.user_id is not None and nsid
+    assert ident.resolve_space(conn, p)[0] == nsid
     # re-resolving the same secret now finds a real user
     p2 = ident.resolve(conn, cfg(conn, key_mode="open"), secret)
     assert p2.user_id == p.user_id and not p2.provisional
@@ -266,7 +396,10 @@ def _store(conn, *, key_mode="open", admin_token=""):
 def test_store_open_mode_isolates_tenants(conn):
     s = _store(conn, key_mode="open")
     alice, bob = new_token(), new_token()
-    # each token lazily gets its own user + default namespace on first write
+    # open mode is self-service: each token makes its own space, then writes
+    for tok in (alice, bob):
+        ident.create_own_namespace(
+            conn, ident.resolve(conn, cfg(conn, key_mode="open"), tok), "mine")
     ma = s.write(alice, body="alice private\n", tags=["x"])
     mb = s.write(bob, body="bob private\n", tags=["x"])
     # each reads only their own
@@ -300,8 +433,10 @@ def test_store_managed_rejects_unknown_token(conn):
 
 
 def test_store_named_spaces_same_token(conn):
-    uid = ident.create_user(conn)
+    uid = ident.create_user(conn, can_create_namespace=True)
     tok, _ = ident.issue_token(conn, uid, permission="write")   # unscoped
+    ident.create_namespace(conn, uid, "a")
+    ident.create_namespace(conn, uid, "b")
     s = _store(conn, key_mode="managed")
     a = s.write(tok, body="in a\n", space="a")
     b = s.write(tok, body="in b\n", space="b")
@@ -315,11 +450,140 @@ def test_list_spaces_flags(conn):
     owner = ident.create_user(conn)
     other = ident.create_user(conn)
     mine = ident.create_namespace(conn, owner, "mine")
-    ident.set_default_space(conn, owner, mine)
     theirs = ident.create_namespace(conn, other, "theirs")
     ident.add_member(conn, theirs, owner, "read")
 
     spaces = {s["name"]: s for s in ident.list_spaces(conn, owner)}
-    assert spaces["mine"]["mine"] and spaces["mine"]["is_default"]
-    assert spaces["mine"]["permission"] == "admin"
+    assert spaces["mine"]["mine"] and spaces["mine"]["permission"] == "admin"
     assert not spaces["theirs"]["mine"] and spaces["theirs"]["permission"] == "read"
+    # no alias set yet — you address these by their names
+    assert spaces["mine"]["alias"] is None and spaces["theirs"]["alias"] is None
+
+    ident.create_alias(conn, owner, "shared", theirs)
+    spaces = {s["name"]: s for s in ident.list_spaces(conn, owner)}
+    assert spaces["theirs"]["alias"] == "shared"   # what to type for it
+
+
+# ─── directory reads: users / namespaces / members ───────────────────────────
+def test_list_users_filters_and_pages(conn):
+    a = ident.create_user(conn, name="alice")
+    ident.create_user(conn, name="bob", role="user_manager")
+    root = ident.create_user(conn, name="root", role="superadmin")
+
+    everyone = ident.list_users(conn)
+    assert [u["name"] for u in everyone] == ["alice", "bob", "root"]  # created_at
+    assert {u["id"] for u in everyone} == {a, everyone[1]["id"], root}
+    assert all(u["can_create_namespace"] is False for u in everyone)
+
+    assert [u["name"] for u in ident.list_users(conn, role="superadmin")] == ["root"]
+    assert [u["name"] for u in ident.list_users(conn, limit=2)] == ["alice", "bob"]
+    assert [u["name"] for u in ident.list_users(conn, limit=2, offset=2)] == ["root"]
+
+    with pytest.raises(ValueError):
+        ident.list_users(conn, role="wizard")
+
+
+def test_list_namespaces_is_deployment_wide(conn):
+    """`list_spaces` is caller-relative; this answers what exists at all."""
+    a = ident.create_user(conn, name="a")
+    b = ident.create_user(conn, name="b")
+    ns_a = ident.create_namespace(conn, a, "sales", instruction="deals only")
+    ns_b = ident.create_namespace(conn, b, "hr")
+
+    everything = ident.list_namespaces(conn)
+    assert {n["id"] for n in everything} == {ns_a, ns_b}
+    assert [n for n in everything if n["id"] == ns_a][0]["instruction"] == "deals only"
+    # a's own view sees only a's namespace, which is exactly the difference
+    assert [n["id"] for n in ident.list_namespaces(conn, owner_user_id=a)] == [ns_a]
+    assert [s["id"] for s in ident.list_spaces(conn, a)] == [ns_a]
+
+
+def test_list_members_includes_the_owner(conn):
+    """The owner is not a row in namespace_member, but omitting it would answer
+    "who can see this?" wrongly — the question a public/private split raises."""
+    owner = ident.create_user(conn, name="owner")
+    guest = ident.create_user(conn, name="guest")
+    ns = ident.create_namespace(conn, owner, "kb")
+    ident.add_member(conn, ns, guest, "read")
+
+    members = ident.list_members(conn, ns)
+    assert [(m["user_id"], m["permission"], m["owner"]) for m in members] == [
+        (owner, "admin", True), (guest, "read", False)]
+
+    with pytest.raises(ident.SpaceNotFound):
+        ident.list_members(conn, "00000000-0000-0000-0000-000000000000")
+
+
+def test_token_owner_resolves_and_misses_cleanly(conn):
+    """Authorizing an action addressed by token needs to know whose it is."""
+    uid = ident.create_user(conn, name="u")
+    _, tid = ident.issue_token(conn, uid)
+    assert ident.token_owner(conn, tid) == uid
+    assert ident.token_owner(conn, "00000000-0000-0000-0000-000000000000") is None
+
+
+# ─── the right to create a namespace, and choosing between several ───────────
+def test_without_the_right_a_write_is_refused_not_silently_created(conn):
+    """The old behaviour: any unscoped write token could conjure a namespace by
+    naming one. On a shared deployment that turns a typo into a second store
+    nobody is looking at."""
+    uid = ident.create_user(conn)                       # no right by default
+    secret, _ = ident.issue_token(conn, uid, permission="write")
+    p = ident.resolve(conn, cfg(conn), secret)
+
+    # naming an unknown space is an error whoever you are — nothing is created
+    with pytest.raises(SpaceNotFound):
+        ident.resolve_space(conn, p, space="proj", for_write=True)
+    # and asking outright is refused without the right
+    with pytest.raises(ident.AuthError, match="may not create"):
+        ident.create_own_namespace(conn, p, "proj")
+    assert ident.list_namespaces(conn) == []            # nothing was created
+
+    # granting it makes the same call work
+    ident.set_can_create_namespace(conn, uid, True)
+    nsid = ident.create_own_namespace(conn, p, "proj")
+    assert [n["id"] for n in ident.list_namespaces(conn)] == [nsid]
+    assert ident.resolve_space(conn, p, space="proj")[0] == nsid
+
+
+def test_a_single_reachable_namespace_needs_no_naming(conn):
+    """Strictness scales with what there is to get wrong: with one namespace
+    there is no choice to make, so an unqualified write still lands."""
+    owner = ident.create_user(conn)
+    ns = ident.create_namespace(conn, owner, "only")
+    secret, _ = ident.issue_token(conn, owner, permission="write")
+    p = ident.resolve(conn, cfg(conn), secret)
+
+    assert ident.resolve_space(conn, p)[0] == ns        # read, no default set
+    assert ident.resolve_space(conn, p, for_write=True)[0] == ns
+
+
+def test_several_reachable_namespaces_force_a_choice(conn):
+    """With more than one, guessing is a misfile — and once public and private
+    sit side by side the wrong guess is the expensive one."""
+    owner = ident.create_user(conn)
+    ident.create_namespace(conn, owner, "public")
+    ident.create_namespace(conn, owner, "private")
+    secret, _ = ident.issue_token(conn, owner, permission="write")
+    p = ident.resolve(conn, cfg(conn), secret)
+
+    with pytest.raises(ident.SpaceAmbiguous) as e:
+        ident.resolve_space(conn, p, for_write=True)
+    assert "private" in str(e.value) and "public" in str(e.value)  # names the options
+
+    # naming one resolves it — and there is no default to fall back on instead
+    assert ident.resolve_space(conn, p, space="public")[0] is not None
+
+
+def test_a_shared_namespace_counts_as_reachable(conn):
+    """Reachability, not ownership: a member with exactly one shared namespace
+    should not have to name it either."""
+    owner = ident.create_user(conn)
+    guest = ident.create_user(conn)
+    ns = ident.create_namespace(conn, owner, "team")
+    ident.add_member(conn, ns, guest, "write")
+    secret, _ = ident.issue_token(conn, guest, permission="write")
+    p = ident.resolve(conn, cfg(conn), secret)
+
+    nsid, perm = ident.resolve_space(conn, p, for_write=True)
+    assert nsid == ns and perm == "write"               # membership, not admin

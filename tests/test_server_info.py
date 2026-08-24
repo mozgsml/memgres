@@ -32,9 +32,12 @@ def test_top_level_keys_and_limits(monkeypatch):
     info = server_info(load())
     assert set(info) == {"version", "schema_version", "limits", "embed",
                          "recall_modes", "vector_backend", "key_mode", "fts_language"}
+    monkeypatch.setenv("MEMGRES_LIST_BODIES_MAX_BYTES", "4096")
+    info = server_info(load())
     assert info["limits"] == {"max_body_bytes": 9000, "max_write_bytes": 800,
                               "max_source_bytes": 300, "max_reason_bytes": 200,
-                              "max_title_bytes": 128}
+                              "max_title_bytes": 128,
+                              "list_bodies_max_bytes": 4096}
 
 
 def test_reports_version_and_schema_version(monkeypatch):

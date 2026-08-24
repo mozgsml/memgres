@@ -254,7 +254,11 @@ def test_qdrant_two_namespaces_isolated(qdrant_store, monkeypatch):
     conn = qdrant_store._conn
     migrate(conn, cfg)
     s = Store(cfg, embedder=_Keyword(), conn=conn)
+    from memgres import identity as ident
+
     tok_a, tok_b = new_token(), new_token()
+    for t in (tok_a, tok_b):     # open mode: each token asks for its own space
+        ident.create_own_namespace(conn, ident.resolve(conn, cfg, t), "mine")
     a = s.write(tok_a, body="apple in A\n")
     b = s.write(tok_b, body="banana in B\n")
     ns_a = s._authorize(tok_a, need="read")[0]

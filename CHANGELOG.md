@@ -5,6 +5,360 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.6.0] — 2026-08-24
+
+### Security
+- **A `user_manager` could mint itself a superadmin token.** `POST /admin/tokens`
+  was gated on "may manage users", but the `user_id` in the body was arbitrary and
+  token issuance never looked at the target account's role — so one request
+  against a superadmin's account returned a working data-root token. Verified
+  against the shipped code: with the new guard removed the call answers
+  `201 Created`. Two neighbours on the same gate had the same shape: `revoke_token`
+  would revoke *any* token (including the last superadmin's, locking the control
+  plane out), and `list_tokens` enumerated other people's. The rule is now written
+  once, in the service layer, and covers issue/revoke/list on both transports: a
+  `user_manager` acts only on accounts holding the plain `user` role; anything
+  touching an admin-role account requires superadmin. Not exploitable in a
+  single-user deployment; live from the first account anyone provisions.
+
+- **A weakened credential still opened the control plane.** A role says who
+  someone IS; a token says what THIS credential may do. The gates consulted only
+  the role, so the recommended way to hand an agent a narrow credential — a
+  read-only, namespace-scoped token — protected nothing whenever the account
+  behind it held an admin role: the weak token opened provisioning and issued
+  itself an unscoped admin one. The data plane honoured the pin the whole time,
+  which is exactly what made it look safe. Deployment-wide acts now require an
+  unscoped, admin-ceiling token; per-namespace acts refuse a token scoped
+  elsewhere.
+- **A default namespace was an authority rather than a preference.** Resolving
+  `default_namespace_id` returned `admin` on it with no reachability check, and
+  the new `set_default_space` let a `user_manager` aim that pointer anywhere — so
+  the tier defined as "hands out access without gaining it" could mint a
+  throwaway user, point it at any namespace on the deployment, and read, write and
+  irreversibly erase there with no membership row anywhere. Setting a default now
+  requires that the caller administer the namespace and that the target already
+  reach it; resolving one that is not reachable falls through to the
+  reachable-set logic instead of granting, so a stale pointer degrades to "unset"
+  rather than bricking an account.
+- **Result size is bounded on the search path too.** `k` went straight into
+  `LIMIT`, so one call could ask for a whole namespace and — with
+  `full_body=true` — be answered with it, plus a `ts_headline` over every row.
+  Search now clamps to the same ceiling browse always used.
+- `memory_issue_token(space=…)` created a namespace unconditionally, walking past
+  the right that governs creation everywhere else.
+- Both control-plane findings were demonstrated end to end against a live
+  deployment, and both fixes are pinned by tests verified to fail without them.
+  Neither had been caught by the existing matrix, which only ever pointed weak
+  credentials at a plain-`user` account — where the role check refuses anyway.
+
+- **The history hash was not injective over tags.** `['a','b']` and `['a,b']`
+  produced the same digest, because the tag list was joined with commas inside
+  an otherwise `\x1f`-separated field list. Anyone able to write the table could
+  therefore rewrite what a memory says about itself — tags are not decoration
+  here, recall can be scoped to them — and `verify_history` would still call the
+  chain intact. Tags now fold through the same domain-separated construction as
+  title and author. Stored rows are **not** rehashed: that would rewrite the
+  record whose immutability is the entire point, so each row records the recipe
+  it was written with (`memory_history.hash_version`, schema v14) and is
+  verified against that one. A chain spanning the upgrade verifies end to end,
+  and relabelling a row to dodge the stronger recipe fails, because the two
+  place the tags differently. The `source`/`reason` case was never affected.
+- **`request_access` was a namespace existence oracle**, twice over. An
+  unreachable namespace produced a request and a nonexistent one a foreign-key
+  error, so the difference told an outsider which uuids are real — independent
+  of any access they had. Making the two answers identical was the first half.
+  The second: while the insert stayed *conditional*, the two cases still did
+  different amounts of work, and the gap was measured at ~8× (0.13 ms against
+  1.08 ms, no overlap in 40 paired trials) — the same oracle, moved into the
+  clock. Two answers are only the same when the same work produces them, so the
+  request is now recorded either way (`access_request.namespace_id` is no longer
+  a foreign key, migration 0014) and `identity._reach` resolves reachability in
+  one query instead of doing strictly less work for a namespace that does not
+  exist. Re-measured after the fix: 0.99×, 23/60 paired trials. A row pointing
+  at nothing is inert, and that is now enforced rather than incidental: a
+  superadmin skips the membership lookup that used to establish a namespace
+  exists at all, so it could *list* an orphaned request, and approving one
+  failed on `namespace_member`'s foreign key — a raw driver error instead of a
+  refusal, with the safety of the whole arrangement resting on a constraint in
+  another table. `require_namespace_admin` now checks existence in that branch,
+  which covers every per-namespace admin action at once.
+  `MAX_PENDING_REQUESTS_PER_USER` (100) bounds what one account can add, and
+  caps the request spam that was always possible against real namespaces; it
+  bounds an account rather than an adversary, since `open` mode lets anyone
+  materialize another one. Amending a request you already hold is not capped —
+  it adds no row, and a caller at the limit must still be able to lower a
+  pending `admin` request to `read`. 🔴 The dropped constraint carried
+  `ON DELETE CASCADE`: whatever adds `delete_namespace` must delete that
+  namespace's requests itself.
+- **A read-only superadmin token could administer any namespace.** A role says
+  who someone IS; a token says what THIS credential may do — and
+  `require_namespace_admin` returned on the role before it ever looked at the
+  ceiling. So the credential the docs recommend handing an agent, a read-only
+  superadmin token, could rewrite any namespace's `instruction` (the routing
+  hint other agents read to decide where memories land) and approve access
+  requests, granting strangers write membership anywhere. Neither is a read.
+  Every other caller was already held to it by `perm_min(membership, ceiling)`;
+  the role was skipping past the check, not passing it.
+
+### Removed
+- **The default namespace.** `app_user.default_namespace_id` answered "where does
+  an unaddressed write land", and a better mechanism already existed: a
+  namespace-scoped **token** says the same thing as a property of the credential
+  rather than the person — revocable, auditable, and per-credential, so one
+  person can run an agent on `public` and another on `private` without the two
+  fighting over a single pointer. It was also the last place anything happened
+  silently, and, as the security fix above showed, it was an authority rather
+  than a preference. A concept that has to be guarded is worse than one that does
+  not exist. Dropping the column forgets each user's chosen default; that is the
+  point, since the choice no longer means anything.
+- **Implicit namespace creation.** Addressing a namespace that did not exist
+  created it, so a name typed slightly wrong produced a new, empty,
+  plausible-looking space and the write landed in it looking like it had worked.
+  Creating one is now something you ask for — `POST /spaces`,
+  `memory_create_space` — which makes a typo an error rather than a place.
+
+### Added
+- **A namespace can have a name of your own.** Name resolution now spans every
+  namespace you reach rather than only the ones you own, which is what makes a
+  shared namespace addressable by name at all. That admits a collision: two
+  people may each own `notes`, and once one is shared with you the bare name
+  means two things. It cannot be refused when a namespace is created, because the
+  collision is created LATER by someone else's act of sharing — refusing then
+  would let your names block other people from sharing. So it is refused when you
+  address it, both candidates named, and you settle it with an **alias**: a
+  private name of your own for a namespace you already reach, granting nothing.
+  `POST /spaces/aliases`, `memory_set_alias`, and `list_spaces` reports it as
+  what to type.
+- **Adopting what `single` mode left behind.** Switching `MEMGRES_KEY_MODE` from
+  `single` to open/managed stranded the entire existing corpus: everything was
+  stored under one nameless namespace, no principal resolves to it afterwards,
+  and every read simply came back empty — present, unharmed and invisible, with
+  no signal that it had happened. `count_orphans` reports it and `adopt_orphans`
+  fixes it, idempotently. It moves the chunk vectors first and the rows second,
+  because a memory's namespace is written down twice and Qdrant cannot join the
+  Postgres transaction: doing it the other way round and dying in between would
+  leave lexical recall working and semantic recall answering *nothing*.
+- **Who a user is**: `full_name`, `email`, `department`, `position`.
+  `app_user.name` was doing two jobs — the handle a token resolves to and the
+  thing a person reads in `blame` — and being neither unique nor required, an
+  authorship line could come back as a bare uuid. History now carries the full
+  name and the email. `email` is unique when present (case-insensitively),
+  because it is the natural login for a web panel.
+- **The substring edit answers to three names.** `old_string`/`new_string` and
+  `old_str`/`new_str` are accepted alongside `replace_old`/`replace_new` and
+  folded to the canon before the both-or-neither guard runs. Two spellings of one
+  side carrying DIFFERENT text is refused rather than resolved — choosing one
+  silently would apply an edit nobody asked for.
+- **A warning when a body ends in what looks like your client's tool delimiter.**
+  An LLM client emits its call in a tag-like format; a closing tag generated
+  inside a value is already part of the string when it reaches us and lands in
+  the memory as text. It is reported, never cleaned and never refused: bodies
+  legitimately contain markup. The rule was measured on 88 live records —
+  "unbalanced closing tag with one of our parameter names" alone gave two false
+  positives (records *discussing* this failure); requiring it to sit at the very
+  end gave none.
+- **Partial reads**: `lines="40-80"` returns part of a long body. The answer is
+  marked `partial`, carries `total_lines`, and withholds `content_hash` — the
+  dangerous move with a slice is sending it back as a whole `body`.
+- **HTTP routes for six operations the service layer already offered** —
+  `set_role`, `set_default_space`, `edit_namespace` and the three directory reads
+  were reachable over MCP only, which left a web panel unable to do half the
+  provisioning it would show.
+- **The control plane is reachable over MCP.** Twelve `memory_admin_*` tools plus
+  `memory_whoami`, over the same service layer the HTTP admin routes use — so an
+  operator working through an MCP client is no longer forced onto curl. Three
+  operations had no door at all before this and now do: `set_role` (the
+  `user_manager` role was unreachable — it could be neither granted nor taken
+  away), `edit_namespace` (namespace creation is an upsert that does nothing on
+  conflict, so a typo in a namespace's `instruction` could not be corrected), and
+  `set_default_space`. Registration follows `MEMGRES_MCP_ADMIN_TOOLS=on|off|auto`;
+  `auto` registers them wherever there are identities to administer, i.e.
+  everything but `single` mode. Turning them off shortens an agent-facing tool
+  list — it is a context economy, not a security boundary, since every tool
+  authorizes when called.
+- **`whoami` reports capabilities, not a role name** (`GET /whoami`,
+  `memory_whoami`): `can_manage_users`, `can_create_namespace`, `is_admin`, the
+  token's ceiling and scope. A UI that reads a role name has to re-implement the
+  permission rules in its own code to decide what to show, and those copies drift.
+- **Searching several namespaces at once.** `space` takes a namespace name, a
+  list of names, or the keyword `"all"`; `space_id` takes ids, which remains the
+  only way to name a namespace shared *with* you, since names resolve against
+  your own. Over HTTP they are repeated query parameters (`?space=a&space=b`); a
+  single `?space=a` means exactly what it did. Every hit, `find` row and `list`
+  row now carries `space`/`space_id` saying which namespace answered.
+- **Addressing a memory by its path.** A path is unique within a namespace, so it
+  was always an address — but nothing accepted one, and callers who knew
+  `decisions.pricing` had to search for a uuid first. `at` now takes a path
+  anywhere an `id` is taken (get, write, move, forget, history, blame,
+  reconstruct, verify). Over HTTP the URL segment takes either:
+  `/memories/{uuid}` or `/memories/decisions.pricing`. The segment is read as an
+  id when it parses as a uuid and as a path otherwise — note that modern ltree
+  labels accept hyphens and non-ASCII, so `ops.rate-limits` is an ordinary path
+  and any "looks like it has a dash" shortcut would misread it.
+- **`at` and `path` are separate parameters doing separate jobs**: `at` FINDS the
+  memory to act on, `path` SETS where a memory lives. Folded into one parameter,
+  `write(path=P, body=B)` would have meant either "file a new memory at P" or
+  "replace whatever is at P", distinguishable only by a flag — and the wrong
+  reading silently overwrites a memory nobody meant to touch.
+- **A write to an address a memory has moved away from is refused**, and the
+  refusal says where it went (`if_moved`, default `error`). A caller writing to a
+  stale address is working from a stale picture, and both quiet answers commit
+  them to it: edit the moved memory and the write lands somewhere they did not
+  name; create at the vacated path and they now hold two memories on one subject,
+  the second of which they will keep writing to while the first lives on
+  elsewhere — with no error at any point. `if_moved="follow"` edits it at its new
+  address; `if_moved="create"` claims the vacated path for something new. Reads
+  follow by default and set `moved_from`, because the moved memory is what the
+  reader reached for. Deletes never follow: deleting on the strength of a stale
+  address is the one mistake here that cannot be undone.
+- **`write` reports `created`** — whether the call made a new memory or edited an
+  existing one. That is the distinction a silent duplicate hides behind.
+- **`bodies=true` on a browse** returns whole bodies instead of previews, so a
+  subtree reads in one call rather than a browse plus a fetch per row. Capped in
+  total by `MEMGRES_LIST_BODIES_MAX_BYTES` (default 200 KB, reported by `/info`);
+  rows past the cap come back marked `body_omitted` rather than being dropped.
+- **Creating a namespace is a right** (`app_user.can_create_namespace`), so an
+  ordinary member can organize their own corner without also being able to
+  provision people. Existing accounts are backfilled to `true` — they had the
+  ability, and taking it away silently would break their writes.
+- Directory reads for the control plane: `list_users` (paginated, filterable by
+  role), `list_namespaces`, `list_members`, `token_owner`.
+- **An MCP client is shown the tools it can actually use.** Every client used to
+  see all 33: a read-only agent was offered five write tools, a plain user the
+  whole control plane, and a `single`-mode deployment — which has no identities —
+  advertised namespace, token and user management. The list is answered per
+  request, so an http endpoint shows each client what its own token can use;
+  stdio, with its pinned token, gets a constant answer. Each tool is classified
+  by the capability its service function already enforces, and the capabilities
+  come from `admin.capabilities()` — the same predicates that do the enforcing,
+  so what is displayed cannot drift from what is allowed. **It is not an
+  authorization boundary:** every tool still authorizes on call, and a client
+  that calls a hidden one is refused there, with a message about permission
+  rather than "unknown tool". An unclassified tool is shown rather than hidden,
+  since a vanished tool is the failure nobody notices. Turn it off with
+  `MEMGRES_MCP_TOOL_VISIBILITY=off`.
+- **`space="*"`** — every namespace in the deployment, for a superadmin. The
+  explicit counterpart to `all` no longer answering for that role (below). It
+  adds no reach: the same role already opens any namespace by `space_id`, one
+  call at a time. A token scoped to one namespace stays scoped.
+
+### Changed
+- **A subtree move is now recorded on every node it moves.** Moving a node
+  re-addresses its whole subtree, but only the node itself got a history row:
+  every descendant's path changed silently, its `seq` never advanced, and
+  afterwards nothing could say where its old address had gone. Each descendant now
+  gets a real `move` row on its own hash chain. Consequences, all deliberate: a
+  descendant's `seq` advances and `updated_at` moves. Optimistic concurrency is
+  unaffected — it is keyed on the body's content hash, which a move does not
+  change — and no body is re-embedded.
+- Creating at an occupied path raises `PathTaken`, naming path and occupant,
+  instead of a raw unique-index violation that named neither.
+- `PathMoved` and `PathTaken` are HTTP 409, not the 422 they would inherit as
+  `ValueError`s: the request is well formed; what is stale is the caller's picture
+  of where things live.
+- The control plane moved into a service layer (`memgres/admin.py`). Both
+  transports are now adapters over it and contain no permission logic of their
+  own — which is what let the escalation above be fixed in one place rather than
+  two. HTTP keeps mapping domain errors to status codes; MCP gained that mapping
+  for free, having previously handed clients raw Postgres error text.
+- `admin.py` takes a `Principal`, never a token: authentication belongs to the
+  transport, authorization to the service. A future web login is then one more
+  authenticator producing the same `Principal`, with no change to the core.
+- **`whoami` reports what THIS credential may do, not what the role could.** A
+  superadmin holding a scoped or read-only token cannot provision with it, and
+  the old answer said it could — sending a caller, or a UI rendering itself from
+  the answer, at doors that refuse them. Two new keys separate the halves of
+  "admin" that are actually independent: `has_admin_ceiling` (this credential)
+  and `can_administer_deployment` (the role *and* an unscoped admin credential).
+  `can_write` and `can_manage_own_tokens` join them; `is_admin` stays the plain
+  role fact, since per-namespace authorization consults the role.
+
+### Breaking
+- **Reaching several namespaces and naming none is an error**, for reads and
+  writes alike — there is no default to fall back on any more. Exactly one
+  reachable namespace still resolves on its own, since there is nothing to
+  choose. The error names the candidates and, for a search, the `all` keyword.
+- **A user with no namespace and no right to create one is refused**, with an
+  explanation, instead of silently getting a second namespace called `default`.
+  This is the provisioning bug that made every freshly-provisioned account
+  unusable: `create_user` + `create_namespace` never set `default_namespace_id`,
+  so the account's first read failed and its first write quietly created a
+  namespace nobody had asked for. In `open` mode, where accounts materialize
+  themselves and there is no admin to ask, the right is granted on creation.
+- **An admin-ceiling token is no longer accepted unscoped** on either transport,
+  symmetrically. (The idea of making MCP stricter than HTTP was dropped: it was
+  argued from a private-network topology that is our deployment, not a rule.)
+- Recall hits, `find` rows and `list` rows carry two new keys (`space`,
+  `space_id`); `list` rows in `bodies` mode carry `body`/`body_omitted` in place
+  of `preview`. Anything asserting an exact key set will notice.
+- Redirect resolution only knows about moves recorded from this version on.
+  Subtrees moved by an earlier version left no trail — the bulk update wrote none
+  — and it cannot be reconstructed: after several moves the current shape of the
+  tree does not determine the addresses a node held before.
+
+- **A namespace cannot be created with a name one of the owner's aliases already
+  claims.** The rule existed on the self-service door and was missing from the
+  two admin-side ones, so an admin provisioning you a `private` namespace while
+  you had an alias of that name left every `space="private"` write landing in the
+  *aliased* space — which someone else can read — with a 200 and no warning. It
+  now lives at the single point all three funnel through.
+- **A read-only token cannot create a namespace**, and one account cannot own an
+  unbounded number of them. In `open` mode a never-registered token materializes
+  its own account, so the new `POST /spaces` was otherwise a free INSERT loop for
+  anyone able to generate tokens.
+- **A partial read reports the contiguous runs it actually returned**, not first
+  and last: `lines=1,5` reporting `[1, 5]` reads as "one through five". A
+  selection matching nothing is an error rather than an empty body wearing
+  `partial: true`.
+- `email` is unique but **not verified**: anyone who may provision users can set
+  any address on a plain-user account, so an address can be claimed before its
+  owner has one. Harmless while email is a label; whatever adds email login must
+  add ownership verification in the same change.
+- **`space="all"` is refused for a superadmin** when it would answer with less
+  than that credential can read — that is, when namespaces exist outside its
+  memberships. For every other caller `all` is unchanged, because for them it
+  genuinely is everything. The refusal names what `all` would have covered and
+  offers `space="*"`. Widening the word instead would have pulled other tenants
+  into a routine agent search; leaving it was the silent partial answer this
+  project weighs as heavily as a leak. There is deliberately no second word for
+  "the ones I belong to": namespace names are free text and the obvious
+  candidates are names people use — `mine` shadowed a namespace in this repo's
+  own tests on the first attempt.
+- **`POST /spaces/{id}/access-requests` answers `202` with `{"status": …}`**,
+  not `201` with the request id. The id is gone because the requester has no use
+  for it — deciding belongs to whoever administers the namespace, who reads ids
+  from `list_requests` — and because returning one is half of what made the
+  route an existence oracle. `already_reachable` is still reported: that is the
+  caller's own access, which `list_spaces` shows them anyway.
+- **`whoami` capabilities gained keys and changed meaning** (see Changed).
+  Anything asserting the exact three-key dict will notice. `can_create_namespace`
+  now mirrors every condition `create_own_namespace` enforces — a read-only or
+  scoped credential, or one with no owning user, reports `false` — rather than
+  the bare right, which advertised a door that always closed.
+- **A superadmin read that names no namespace at all is refused too**, on the
+  same terms as `all`: with one membership and other namespaces on the
+  deployment, "your only namespace" answers a narrower question than was asked.
+  The write path is deliberately unchanged — a write has to land somewhere, the
+  namespace you belong to is the only sane target, and nothing is left out of an
+  answer.
+- **The compatibility floor moves to schema v14**, so a client older than this
+  release refuses to run against a database this release has touched. Two
+  reasons, and the second is why it is stated as a floor rather than a note:
+  0011 dropped `app_user.default_namespace_id`, which every 0.5.x read path
+  selects; and 0013 changed what a stored `row_hash` means, so a pre-0013 client
+  recomputes v2 rows with the v1 recipe and reports an untampered chain as
+  **tampered** — a silent wrong answer from the one function whose whole job is
+  to be trusted. **Upgrade every client of a shared database together.**
+  A version this build does not recognise is now an error naming the version,
+  not a "tampered" verdict: an unknown recipe means the row is newer, not bad.
+- `identity.request_access` (exported) returns the request id as `str` rather
+  than `Optional[str]`, and raises `ValueError` at the per-account cap. The
+  None-for-a-missing-namespace case is gone — there is no missing case any more.
+
+### Known, deliberately not changed here
+- `email` is unique but **not verified** — see the note under Breaking. Whatever
+  adds email login must add ownership verification in the same change.
+
 ## [0.5.2] — 2026-08-24
 
 ### Fixed

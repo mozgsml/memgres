@@ -27,7 +27,8 @@ from .identity import (
     Principal, AuthError, SpaceNotFound,
     resolve, resolve_space, new_token, valid_format,
     create_user, create_namespace, list_spaces,
-    issue_token, register_token, revoke_token, list_tokens,
+    list_users, list_namespaces, list_members,
+    issue_token, register_token, revoke_token, list_tokens, token_owner,
     request_access, approve_request, deny_request, list_requests,
 )
 
@@ -43,6 +44,7 @@ __all__ = [
     "Principal", "AuthError", "SpaceNotFound",
     "resolve", "resolve_space", "new_token", "valid_format",
     "create_user", "create_namespace", "list_spaces",
-    "issue_token", "register_token", "revoke_token", "list_tokens",
+    "list_users", "list_namespaces", "list_members",
+    "issue_token", "register_token", "revoke_token", "list_tokens", "token_owner",
     "request_access", "approve_request", "deny_request", "list_requests",
 ]

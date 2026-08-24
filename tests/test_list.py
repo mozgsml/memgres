@@ -64,7 +64,7 @@ def test_lists_subtree_ordered_by_path(store):
     assert all(r["path"].startswith("decisions") for r in rows)
     # shape of each row
     assert set(rows[0]) == {"id", "path", "tags", "title", "preview",
-                            "created_at", "updated_at"}
+                            "created_at", "updated_at", "space_id", "space"}
 
 
 def test_preview_is_first_line_truncated(store):
@@ -144,6 +144,70 @@ def test_list_isolated_between_tenants(managed):
     # never each other's rows
     assert all("bob" not in r["preview"] for r in alice_rows)
     assert all("alice" not in r["preview"] for r in bob_rows)
+
+def test_bodies_reads_a_whole_subtree_in_one_call(store):
+    store.write(body="alpha body\nsecond line\n", path="decisions.a")
+    store.write(body="beta body\n", path="decisions.b")
+
+    rows = store.list(None, path_prefix="decisions", bodies=True)
+    assert [r["body"] for r in rows] == ["alpha body\nsecond line\n", "beta body\n"]
+    assert all(r["body_omitted"] is False for r in rows)
+    assert "preview" not in rows[0]        # one view of the text, never both
+
+
+def test_bodies_past_the_cap_are_announced_not_dropped(store, monkeypatch):
+    store.cfg = dataclasses.replace(store.cfg, list_bodies_max_bytes=20)
+    store.write(body="x" * 15 + "\n", path="t.a")
+    store.write(body="y" * 15 + "\n", path="t.b")
+    store.write(body="z" * 15 + "\n", path="t.c")
+
+    rows = store.list(None, path_prefix="t", bodies=True)
+    assert len(rows) == 3                          # every row still comes back
+    assert rows[0]["body"] is not None and rows[0]["body_omitted"] is False
+    assert [r["body_omitted"] for r in rows[1:]] == [True, True]
+    assert all(r["body"] is None for r in rows[1:])
+
+
+def test_a_first_body_larger_than_the_cap_still_comes_back(store):
+    store.cfg = dataclasses.replace(store.cfg, list_bodies_max_bytes=5)
+    store.write(body="a much longer body than the cap\n", path="t.a")
+
+    [row] = store.list(None, path_prefix="t", bodies=True)
+    assert row["body"].startswith("a much longer") and row["body_omitted"] is False
+
+
+def test_bodies_over_the_cap_are_never_fetched(store):
+    """The cap has to bound the SERVER, not just the answer. Selecting every
+    body and discarding the overflow afterwards still moves every byte — at the
+    default ceilings a 500-row page is 128 MB fetched to return 200 KB. So the
+    page carries sizes, and only the bodies that fit are asked for."""
+    store.cfg = dataclasses.replace(store.cfg, list_bodies_max_bytes=20)
+    for name in ("a", "b", "c"):
+        store.write(body=name * 15 + "\n", path=f"t.{name}")
+
+    seen = []
+    real_execute = store._conn.cursor
+
+    class _Spy:
+        def __init__(self, inner): self._inner = inner
+        def __getattr__(self, k): return getattr(self._inner, k)
+        def execute(self, sql, args=None):
+            seen.append((sql, args))
+            return self._inner.execute(sql, args)
+
+    store._conn.cursor = lambda *a, **kw: _Spy(real_execute(*a, **kw))
+    try:
+        rows = store.list(None, path_prefix="t", bodies=True)
+    finally:
+        store._conn.cursor = real_execute
+
+    assert [r["body_omitted"] for r in rows] == [False, True, True]
+    # the page query asks for sizes, not bodies
+    page = next(sql for sql, _ in seen if "octet_length(body)" in sql)
+    assert "left(split_part" not in page
+    # and exactly one id — the row that fits — has its body fetched
+    fetch = [a for sql, a in seen if "SELECT id, body FROM memory" in sql]
+    assert len(fetch) == 1 and fetch[0][-1] == [rows[0]["id"]]
 
 
 if __name__ == "__main__":

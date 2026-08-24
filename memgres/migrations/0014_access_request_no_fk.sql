@@ -1,0 +1,24 @@
+-- `access_request.namespace_id` stops being a foreign key (schema v15).
+--
+-- Asking to join a namespace must not reveal whether that namespace exists.
+-- Answering identically in both cases was the first half of the fix; the other
+-- half is that the two cases must take the same PATH. While the insert was
+-- conditional — check the namespace, write only if it is there — a nonexistent
+-- id returned after one SELECT and a real one after a SELECT plus a committed
+-- upsert. Measured: ~0.13 ms against ~1.08 ms, no overlap across 40 paired
+-- trials. Identical words, an 8× tell. So the request is now recorded either
+-- way, which the foreign key made impossible.
+--
+-- A row pointing at nothing is inert. `list_requests` selects by namespace, so
+-- nobody can see it; `decide_access` resolves the namespace first and refuses.
+-- What it costs is a table an account could grow one guessed uuid at a time,
+-- which `identity.MAX_PENDING_REQUESTS_PER_USER` bounds — and that cap also
+-- limits the request spam that was always possible against real namespaces.
+--
+-- 🔴 The dropped constraint carried ON DELETE CASCADE. Nothing deletes a
+-- namespace today; whatever adds `delete_namespace` MUST delete that
+-- namespace's access requests in the same operation, because the database will
+-- no longer do it. The requester side keeps its cascade: an account's requests
+-- still vanish with the account.
+ALTER TABLE access_request
+    DROP CONSTRAINT IF EXISTS access_request_namespace_id_fkey;

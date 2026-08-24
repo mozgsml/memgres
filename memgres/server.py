@@ -21,35 +21,21 @@ is built once and shared. Requires the `[server]` extra (fastapi, uvicorn,
 psycopg_pool).
 """
 
+import uuid
 from typing import List, Optional
 
 import psycopg
 
-from . import identity
+from . import admin, identity
 from .config import Config, load
 from .diffing import DiffConflict
 from .embeddings import get_embedder
 from .identity import SpaceNotFound
+from .lines import parse_line_spec
 from .bootstrap import bootstrap_admin
 from .schema import migrate
-from .store import Conflict, NoParent, NotFound, Store, TooLarge, build_replace
-
-
-def _parse_lines(spec: Optional[str]) -> Optional[List[int]]:
-    """Parse a line selector like '2' or '1,3-5' into [2] / [1,3,4,5]. None → all."""
-    if not spec:
-        return None
-    out: List[int] = []
-    for part in spec.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            a, b = part.split("-", 1)
-            out.extend(range(int(a), int(b) + 1))
-        else:
-            out.append(int(part))
-    return out or None
+from .store import (Conflict, NoParent, NotFound, PathMoved, PathTaken, Store,
+                    TooLarge, build_replace, fold_replace_aliases)
 
 
 def create_app(cfg: Optional[Config] = None):
@@ -91,6 +77,7 @@ def create_app(cfg: Optional[Config] = None):
         ttl_days: Optional[int] = None
         space: Optional[str] = None          # namespace name (your own)
         space_id: Optional[str] = None       # namespace id (canonical; shared spaces)
+        if_moved: str = "error"              # a vacated `path`: refuse, or "create"
 
     class EditBody(BaseModel):
         body: Optional[str] = None
@@ -99,6 +86,11 @@ def create_app(cfg: Optional[Config] = None):
         replace_old: Optional[str] = None
         replace_new: Optional[str] = None
         replace_all: bool = False
+        # the spellings file editors use; folded to the canon, conflicts refused
+        old_string: Optional[str] = None
+        new_string: Optional[str] = None
+        old_str: Optional[str] = None
+        new_str: Optional[str] = None
         path: Optional[str] = None
         tags: Optional[List[str]] = None
         title: Optional[str] = None
@@ -107,6 +99,7 @@ def create_app(cfg: Optional[Config] = None):
         ttl_days: Optional[int] = None
         space: Optional[str] = None
         space_id: Optional[str] = None
+        if_moved: str = "error"              # a stale address: refuse, or "follow"
 
     class MoveBody(BaseModel):
         path: str
@@ -114,6 +107,7 @@ def create_app(cfg: Optional[Config] = None):
         reason: Optional[str] = None
         space: Optional[str] = None
         space_id: Optional[str] = None
+        if_moved: str = "error"
 
     # ─── auth: extract the namespace token ──────────────────────────────────
     def token(authorization: Optional[str] = Header(None),
@@ -131,17 +125,26 @@ def create_app(cfg: Optional[Config] = None):
         return Store(cfg, embedder=embedder, conn=conn, backend=backend)
 
     def _guard(fn):
-        """Run a store call, mapping store exceptions to HTTP codes."""
+        """Run a store or admin call, mapping domain exceptions to HTTP codes."""
         try:
             return fn()
         except (NotFound, SpaceNotFound):
             raise HTTPException(404, "not found")
         except (Conflict, DiffConflict) as e:
             raise HTTPException(409, str(e))
+        except (PathMoved, PathTaken) as e:
+            # 409, not 422: the request is well-formed — the caller's picture of
+            # where things live is what is out of date. Listed before ValueError,
+            # which they subclass.
+            raise HTTPException(409, str(e))
         except NoParent as e:
+            raise HTTPException(409, str(e))
+        except admin.Lockout as e:           # would leave nobody in charge
             raise HTTPException(409, str(e))
         except TooLarge as e:
             raise HTTPException(413, str(e))
+        except admin.Forbidden as e:         # before PermissionError — it is one
+            raise HTTPException(403, str(e))
         except PermissionError as e:
             raise HTTPException(401, str(e))
         except ValueError as e:
@@ -151,6 +154,35 @@ def create_app(cfg: Optional[Config] = None):
             # namespace/request, etc. — a client input error, not a 500. Don't
             # echo the DB message (avoids leaking schema / existence detail).
             raise HTTPException(400, "bad request")
+
+    def _folded_replace(req):
+        """The substring edit, whichever of its three spellings arrived."""
+        folded = fold_replace_aliases({
+            "replace_old": req.replace_old, "replace_new": req.replace_new,
+            "old_string": req.old_string, "new_string": req.new_string,
+            "old_str": req.old_str, "new_str": req.new_str})
+        return build_replace(folded.get("replace_old"), folded.get("replace_new"))
+
+    def _ref(mid: str) -> dict:
+        """Turn the URL's memory segment into the store's address argument.
+
+        It may be a memory's uuid or its tree path, so one route set serves both
+        instead of a parallel `/by-path/...` tree that would have to be kept in
+        step. The test is whether the segment PARSES as a uuid — not whether it
+        looks unlike a path. Modern ltree labels accept hyphens and non-ASCII
+        (verified on PG 17), so `ops.rate-limits` is a perfectly ordinary path and
+        any "contains a dash ⇒ it's an id" shortcut would send it down the wrong
+        branch and answer 400.
+
+        A path that is itself uuid-shaped would be read as an id. That is a
+        deliberate, fixed precedence rather than a guess that changes with what
+        happens to exist.
+        """
+        try:
+            uuid.UUID(mid)
+        except ValueError:
+            return {"at": mid}
+        return {"id": mid}
 
     # ─── routes ─────────────────────────────────────────────────────────────
     @app.get("/healthz")
@@ -163,15 +195,22 @@ def create_app(cfg: Optional[Config] = None):
             m = _guard(lambda: _store(conn).write(
                 tok, body=req.body, path=req.path, tags=req.tags, title=req.title,
                 source=req.source, reason=req.reason, ttl_days=req.ttl_days,
-                space=req.space, space_id=req.space_id))
+                if_moved=req.if_moved, space=req.space, space_id=req.space_id))
             return _mem(m)
 
     @app.get("/memories/{mid}")
     def read(mid: str, tok: Optional[str] = Depends(token),
+             if_moved: str = "follow", lines: Optional[str] = None,
              space: Optional[str] = None, space_id: Optional[str] = None):
+        """Fetch one memory. `mid` is its id or its tree path; a path that has
+        since moved is followed by default, and the answer says so via
+        `moved_from`. Pass `if_moved=error` to be told instead. `lines`
+        ("40-80", "1,10-12") returns only those lines — the answer is then marked
+        `partial` and carries no `content_hash`."""
         with pool.connection() as conn:
             return _mem(_guard(lambda: _store(conn).get(
-                tok, mid, space=space, space_id=space_id)))
+                tok, **_ref(mid), if_moved=if_moved, lines=lines,
+                space=space, space_id=space_id)))
 
     @app.patch("/memories/{mid}")
     def edit(mid: str, req: EditBody, tok: Optional[str] = Depends(token)):
@@ -179,8 +218,9 @@ def create_app(cfg: Optional[Config] = None):
             # build_replace runs inside _guard so a lone replace_old/new surfaces
             # as its ValueError -> 422, not a silent delete or an uncaught 500.
             m = _guard(lambda: _store(conn).write(
-                tok, id=mid, body=req.body, diff=req.diff, base_hash=req.base_hash,
-                replace=build_replace(req.replace_old, req.replace_new),
+                tok, **_ref(mid), if_moved=req.if_moved,
+                body=req.body, diff=req.diff, base_hash=req.base_hash,
+                replace=_folded_replace(req),
                 replace_all=req.replace_all,
                 path=req.path, tags=req.tags, title=req.title,
                 source=req.source, reason=req.reason,
@@ -191,7 +231,8 @@ def create_app(cfg: Optional[Config] = None):
     def move(mid: str, req: MoveBody, tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
             m = _guard(lambda: _store(conn).move(
-                tok, mid, req.path, source=req.source, reason=req.reason,
+                tok, **_ref(mid), new_path=req.path, if_moved=req.if_moved,
+                source=req.source, reason=req.reason,
                 space=req.space, space_id=req.space_id))
             return _mem(m)
 
@@ -200,7 +241,7 @@ def create_app(cfg: Optional[Config] = None):
                space: Optional[str] = None, space_id: Optional[str] = None):
         with pool.connection() as conn:
             ok = _guard(lambda: _store(conn).forget(
-                tok, mid, space=space, space_id=space_id))
+                tok, **_ref(mid), space=space, space_id=space_id))
             if not ok:
                 raise HTTPException(404, "not found")
 
@@ -209,7 +250,7 @@ def create_app(cfg: Optional[Config] = None):
                 space: Optional[str] = None, space_id: Optional[str] = None):
         with pool.connection() as conn:
             return _guard(lambda: _store(conn).history(
-                tok, mid, space=space, space_id=space_id))
+                tok, **_ref(mid), space=space, space_id=space_id))
 
     @app.get("/memories/{mid}/blame")
     def blame(mid: str, upto_seq: Optional[int] = None,
@@ -220,14 +261,18 @@ def create_app(cfg: Optional[Config] = None):
         """Who last changed each line. Grouped into author-blocks by default
         (`group=false` for per-line); `text=false` drops bodies for a pure
         ownership map; `lines` selects specific 1-based lines/ranges (per-line)."""
-        want = _parse_lines(lines)
+        # inside _guard: an impossible selector is a 422 about the request, not
+        # a 500 about the server
+        want = _guard(lambda: parse_line_spec(lines))
         with pool.connection() as conn:
             s = _store(conn)
             if want is not None or not group:
                 return _guard(lambda: s.annotate(
-                    tok, mid, upto_seq, want, space=space, space_id=space_id))
+                    tok, upto_seq=upto_seq, lines=want, **_ref(mid),
+                    space=space, space_id=space_id))
             return _guard(lambda: s.annotate_grouped(
-                tok, mid, upto_seq, text, space=space, space_id=space_id))
+                tok, upto_seq=upto_seq, include_text=text, **_ref(mid),
+                space=space, space_id=space_id))
 
     @app.get("/memories/{mid}/at/{seq}")
     def at_version(mid: str, seq: int, tok: Optional[str] = Depends(token),
@@ -235,22 +280,26 @@ def create_app(cfg: Optional[Config] = None):
         """The exact body as it was at version `seq` (reconstructed from history)."""
         with pool.connection() as conn:
             body = _guard(lambda: _store(conn).reconstruct(
-                tok, mid, seq, space=space, space_id=space_id))
+                tok, upto_seq=seq, **_ref(mid), space=space, space_id=space_id))
             return {"seq": seq, "body": body}
 
     @app.get("/memories")
     def list_memories(path: Optional[str] = None,
                       tags: Optional[str] = Query(None, description="comma-separated"),
-                      limit: int = 50, offset: int = 0,
-                      space: Optional[str] = None, space_id: Optional[str] = None,
+                      limit: int = 50, offset: int = 0, bodies: bool = False,
+                      space: Optional[List[str]] = Query(
+                          None, description="namespace name(s), or 'all'"),
+                      space_id: Optional[List[str]] = Query(None),
                       tok: Optional[str] = Depends(token)):
         """Browse (enumerate) a subtree — not a search. Lists memories under
-        `path` ordered by path, each with a short first-line `preview`."""
+        `path` ordered by path, each with a short first-line `preview`, or with
+        whole bodies when `bodies=true` (capped in total; rows past the cap are
+        marked `body_omitted`)."""
         taglist = [t for t in (tags.split(",") if tags else []) if t]
         with pool.connection() as conn:
             return _guard(lambda: _store(conn).list(
                 tok, path_prefix=path, tags=taglist or None, limit=limit,
-                offset=offset, space=space, space_id=space_id))
+                offset=offset, bodies=bodies, space=space, space_id=space_id))
 
     @app.get("/info")
     def info():
@@ -264,7 +313,9 @@ def create_app(cfg: Optional[Config] = None):
                tags: Optional[str] = Query(None, description="comma-separated"),
                path_prefix: Optional[str] = None,
                snippet: Optional[bool] = None, full_body: Optional[bool] = None,
-               space: Optional[str] = None, space_id: Optional[str] = None,
+               space: Optional[List[str]] = Query(
+                   None, description="namespace name(s), or 'all'"),
+               space_id: Optional[List[str]] = Query(None),
                tok: Optional[str] = Depends(token)):
         taglist = [t for t in (tags.split(",") if tags else []) if t]
         with pool.connection() as conn:
@@ -278,7 +329,9 @@ def create_app(cfg: Optional[Config] = None):
     def find(q: str, k: int = 10,
              tags: Optional[str] = Query(None, description="comma-separated"),
              path_prefix: Optional[str] = None, match: Optional[str] = None,
-             space: Optional[str] = None, space_id: Optional[str] = None,
+             space: Optional[List[str]] = Query(
+                 None, description="namespace name(s), or 'all'"),
+             space_id: Optional[List[str]] = Query(None),
              tok: Optional[str] = Depends(token)):
         """Locate by curated title (+ tags) — light rows, never the body."""
         taglist = [t for t in (tags.split(",") if tags else []) if t]
@@ -288,95 +341,96 @@ def create_app(cfg: Optional[Config] = None):
                 match=match, space=space, space_id=space_id))
 
     # ─── spaces: what this token can reach ──────────────────────────────────
-    def _me(conn, tok) -> str:
-        """The caller's user id, or 401 if the token has no owning user."""
-        p = identity.resolve(conn, cfg, tok)
-        if p.user_id is None:
-            raise HTTPException(401, "this token has no owning user")
-        return p.user_id
-
-    def _require_admin_on(conn, tok, space_id: str) -> str:
-        """Caller must hold effective admin (membership min token ceiling) on the
-        namespace. Returns the caller's user id."""
-        p = identity.resolve(conn, cfg, tok)
-        if p.user_id is None:
-            raise HTTPException(401, "this token has no owning user")
-        with conn.cursor() as cur:
-            membership = identity._reach(cur, p.user_id, space_id)
-        if membership is None:
-            raise HTTPException(404, "no such namespace")
-        if identity.perm_min(membership, p.permission) != "admin":
-            raise HTTPException(403, "admin on this namespace required")
-        return p.user_id
-
     @app.get("/spaces")
     def spaces(tok: Optional[str] = Depends(token)):
         """List the namespaces this token can reach (identity modes only)."""
         if cfg.key_mode == "single":
             return []
         with pool.connection() as conn:
-            def _list():
-                p = identity.resolve(conn, cfg, tok)
-                if p.user_id is None:      # admin or provisional → nothing to list
-                    return []
-                return identity.list_spaces(conn, p.user_id)
-            return _guard(_list)
+            return _guard(lambda: admin.list_spaces(
+                conn, identity.resolve(conn, cfg, tok)))
+
+    class NewSpace(BaseModel):
+        name: str
+        description: str = ""
+        instruction: str = ""
+
+    class NewAlias(BaseModel):
+        alias: str
+        space_id: str
+
+    @app.post("/spaces", status_code=201)
+    def create_space(req: NewSpace, tok: Optional[str] = Depends(token)):
+        """Create a namespace of your own. Nothing creates one implicitly, so a
+        mistyped `space` is an error rather than a new empty space a write
+        silently lands in."""
+        with pool.connection() as conn, conn.transaction():
+            nsid = _guard(lambda: identity.create_own_namespace(
+                conn, identity.resolve(conn, cfg, tok), req.name,
+                description=req.description, instruction=req.instruction))
+        return {"id": nsid, "name": req.name}
+
+    @app.post("/spaces/aliases", status_code=201)
+    def set_alias(req: NewAlias, tok: Optional[str] = Depends(token)):
+        """Name a reachable namespace for yourself, for when a bare name is
+        ambiguous. Private to you, and grants nothing."""
+        with pool.connection() as conn, conn.transaction():
+            p = identity.resolve(conn, cfg, tok)
+            _guard(lambda: identity.create_alias(
+                conn, p.user_id, req.alias, req.space_id))
+        return {"alias": req.alias, "space_id": req.space_id}
+
+    @app.delete("/spaces/aliases/{alias}", status_code=204)
+    def drop_alias(alias: str, tok: Optional[str] = Depends(token)):
+        with pool.connection() as conn, conn.transaction():
+            p = identity.resolve(conn, cfg, tok)
+            if not _guard(lambda: identity.drop_alias(conn, p.user_id, alias)):
+                raise HTTPException(404, "not found")
 
     # ─── request-access: ask to join a namespace, owner approves ────────────
     class RequestBody(BaseModel):
         permission: str = "read"
 
-    @app.post("/spaces/{space_id}/access-requests", status_code=201)
+    # 202, not 201: the answer deliberately does not say whether anything was
+    # created — an unreachable namespace and a nonexistent one must read the
+    # same, or the status alone becomes the existence oracle the body no longer is.
+    @app.post("/spaces/{space_id}/access-requests", status_code=202)
     def request_access(space_id: str, req: RequestBody,
                        tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
-            def _do():
-                uid = _me(conn, tok)
-                return {"id": identity.request_access(conn, uid, space_id,
-                                                      req.permission)}
-            return _guard(_do)
+            return _guard(lambda: admin.request_access(
+                conn, identity.resolve(conn, cfg, tok),
+                namespace_id=space_id, permission=req.permission))
 
     @app.get("/spaces/{space_id}/access-requests")
     def list_access_requests(space_id: str, tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
-            def _do():
-                _require_admin_on(conn, tok, space_id)
-                return identity.list_requests(conn, space_id)
-            return _guard(_do)
-
-    def _decide_access(conn, tok, req_id: str, approve: bool):
-        with conn.cursor() as cur:
-            cur.execute("SELECT namespace_id FROM access_request WHERE id=%s",
-                        (req_id,))
-            row = cur.fetchone()
-        if row is None:
-            raise HTTPException(404, "no such request")
-        _require_admin_on(conn, tok, str(row[0]))
-        if approve:
-            identity.approve_request(conn, req_id)
-        else:
-            identity.deny_request(conn, req_id)
+            return _guard(lambda: admin.list_requests(
+                conn, identity.resolve(conn, cfg, tok), namespace_id=space_id))
 
     @app.post("/access-requests/{req_id}/approve")
     def approve_access(req_id: str, tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
-            _guard(lambda: _decide_access(conn, tok, req_id, True))
+            _guard(lambda: admin.decide_access(
+                conn, identity.resolve(conn, cfg, tok),
+                request_id=req_id, approve=True))
             return {"approved": req_id}
 
     @app.post("/access-requests/{req_id}/deny")
     def deny_access(req_id: str, tok: Optional[str] = Depends(token)):
         with pool.connection() as conn:
-            _guard(lambda: _decide_access(conn, tok, req_id, False))
+            _guard(lambda: admin.decide_access(
+                conn, identity.resolve(conn, cfg, tok),
+                request_id=req_id, approve=False))
             return {"denied": req_id}
 
     # ─── admin provisioning (service roles + env break-glass) ───────────────
-    # Provisioning is gated by the caller's service role, resolved from its
-    # token — not by a single shared secret. Two tiers:
-    #   require_manage_users — user_manager, superadmin, or the env break-glass
-    #     root: create users/namespaces, (re)issue & revoke tokens.
-    #   require_superadmin   — superadmin or env root only: cross-tenant access
-    #     (add_member) and granting/revoking the superadmin role.
-    def _admin_principal(authorization, x_memgres_token):
+    # The door only says WHO is calling; `admin` decides what they may do, so
+    # the same rules serve the MCP surface (and, later, a web session) without
+    # being restated here. Authentication failure is 403 rather than 401 on
+    # these routes — the credential was offered and rejected.
+    def principal(authorization: Optional[str] = Header(None),
+                  x_memgres_token: Optional[str] = Header(None)):
         tok = identity.bearer_token(authorization, x_memgres_token)
         with pool.connection() as conn:
             try:
@@ -384,25 +438,27 @@ def create_app(cfg: Optional[Config] = None):
             except identity.AuthError as e:
                 raise HTTPException(403, str(e))
 
-    def require_manage_users(authorization: Optional[str] = Header(None),
-                             x_memgres_token: Optional[str] = Header(None)):
-        p = _admin_principal(authorization, x_memgres_token)
-        if not identity.can_manage_users(p):
-            raise HTTPException(403, "user management requires user_manager or "
-                                     "superadmin")
-        return p
-
-    def require_superadmin(authorization: Optional[str] = Header(None),
-                           x_memgres_token: Optional[str] = Header(None)):
-        p = _admin_principal(authorization, x_memgres_token)
-        if not p.is_admin:                       # superadmin user or env root
-            raise HTTPException(403, "superadmin required")
-        return p
-
     class NewUser(BaseModel):
         name: str = ""
         description: str = ""
         role: str = "user"
+        can_create_namespace: bool = False
+        # who the person is — what makes an authorship line readable
+        email: Optional[str] = None
+        full_name: Optional[str] = None
+        department: Optional[str] = None
+        position: Optional[str] = None
+
+    class EditUser(BaseModel):
+        name: Optional[str] = None
+        description: Optional[str] = None
+        email: Optional[str] = None
+        full_name: Optional[str] = None
+        department: Optional[str] = None
+        position: Optional[str] = None
+
+    class NamespaceRight(BaseModel):
+        allowed: bool
 
     class NewNamespace(BaseModel):
         owner_user_id: str
@@ -422,83 +478,150 @@ def create_app(cfg: Optional[Config] = None):
         permission: str = "read"
 
     @app.post("/admin/users", status_code=201)
-    def admin_create_user(req: NewUser,
-                          p=Depends(require_manage_users)):
-        # minting an admin-role user is itself a superadmin act — a user_manager
-        # must not escalate anyone (nor itself, via a fresh admin user).
-        if req.role != "user" and not p.is_admin:
-            raise HTTPException(403, "granting an admin role requires superadmin")
+    def admin_create_user(req: NewUser, p=Depends(principal)):
         with pool.connection() as conn:
-            return {"id": _guard(lambda: identity.create_user(
-                conn, req.name, req.description, role=req.role))}
+            return {"id": _guard(lambda: admin.create_user(
+                conn, p, name=req.name, description=req.description,
+                role=req.role,
+                can_create_namespace=req.can_create_namespace,
+                email=req.email, full_name=req.full_name,
+                department=req.department, position=req.position))}
 
-    @app.post("/admin/namespaces", status_code=201,
-              dependencies=[Depends(require_manage_users)])
-    def admin_create_namespace(req: NewNamespace):
+    @app.patch("/admin/users/{user_id}")
+    def admin_edit_user(user_id: str, req: EditUser, p=Depends(principal)):
+        """Change who a user is. Only the fields sent are touched."""
         with pool.connection() as conn:
-            return {"id": _guard(lambda: identity.create_namespace(
-                conn, req.owner_user_id, req.name, description=req.description,
-                instruction=req.instruction))}
+            return _guard(lambda: admin.edit_user(
+                conn, p, user_id=user_id,
+                **req.model_dump(exclude_none=True)))
 
-    @app.post("/admin/tokens", status_code=201,
-              dependencies=[Depends(require_manage_users)])
-    def admin_issue_token(req: NewToken):
-        import datetime as dt
-        exp = None
-        if req.expires_days:
-            exp = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=req.expires_days)
+    @app.post("/admin/users/{user_id}/can-create-namespace")
+    def admin_set_create_right(user_id: str, req: NamespaceRight,
+                               p=Depends(principal)):
         with pool.connection() as conn:
-            secret, tid = _guard(lambda: identity.issue_token(
-                conn, req.user_id, namespace_id=req.namespace_id,
-                permission=req.permission, label=req.label, expires_at=exp))
-            return {"token": secret, "id": tid,
-                    "note": "store this now — it is not recoverable"}
+            return _guard(lambda: admin.set_can_create_namespace(
+                conn, p, user_id=user_id, allowed=req.allowed))
 
-    @app.post("/admin/tokens/{token_id}/revoke",
-              dependencies=[Depends(require_manage_users)])
-    def admin_revoke_token(token_id: str):
+    @app.get("/whoami")
+    def whoami(tok: Optional[str] = Depends(token)):
+        """Who this credential is and what it may do — the same capabilities the
+        MCP surface reports, so a panel need not re-derive the rules."""
         with pool.connection() as conn:
-            return {"revoked": _guard(lambda: identity.revoke_token(conn, token_id))}
+            return _guard(lambda: admin.whoami(
+                conn, identity.resolve(conn, cfg, tok)))
 
-    @app.get("/admin/users/{user_id}/tokens",
-             dependencies=[Depends(require_manage_users)])
-    def admin_list_tokens(user_id: str):
+    @app.post("/admin/namespaces", status_code=201)
+    def admin_create_namespace(req: NewNamespace, p=Depends(principal)):
         with pool.connection() as conn:
-            return _guard(lambda: identity.list_tokens(conn, user_id))
+            return {"id": _guard(lambda: admin.create_namespace(
+                conn, p, owner_user_id=req.owner_user_id, name=req.name,
+                description=req.description, instruction=req.instruction))}
 
-    @app.post("/admin/namespaces/{space_id}/members", status_code=201,
-              dependencies=[Depends(require_superadmin)])
-    def admin_add_member(space_id: str, req: NewMember):
+    @app.post("/admin/tokens", status_code=201)
+    def admin_issue_token(req: NewToken, p=Depends(principal)):
         with pool.connection() as conn:
-            _guard(lambda: identity.add_member(
-                conn, space_id, req.user_id, req.permission))
-            return {"namespace_id": space_id, "user_id": req.user_id,
-                    "permission": req.permission}
+            return _guard(lambda: admin.issue_token(
+                conn, p, user_id=req.user_id, namespace_id=req.namespace_id,
+                permission=req.permission, label=req.label,
+                expires_days=req.expires_days))
+
+    @app.post("/admin/tokens/{token_id}/revoke")
+    def admin_revoke_token(token_id: str, p=Depends(principal)):
+        with pool.connection() as conn:
+            return {"revoked": _guard(lambda: admin.revoke_token(
+                conn, p, token_id=token_id))}
+
+    @app.get("/admin/users/{user_id}/tokens")
+    def admin_list_tokens(user_id: str, p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.list_tokens(conn, p, user_id=user_id))
+
+    @app.post("/admin/namespaces/{space_id}/members", status_code=201)
+    def admin_add_member(space_id: str, req: NewMember, p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.add_member(
+                conn, p, namespace_id=space_id, user_id=req.user_id,
+                permission=req.permission))
+
+    class SetRole(BaseModel):
+        role: str
+
+    class EditNamespace(BaseModel):
+        description: Optional[str] = None
+        instruction: Optional[str] = None
+
+    # These exist so the HTTP surface offers what the service layer does. They
+    # were reachable over MCP only, which left a panel — the reason this API is
+    # public at all — unable to do half the provisioning it shows.
+    @app.get("/admin/users")
+    def admin_list_users(role: Optional[str] = None, limit: int = 100,
+                         offset: int = 0, p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.list_users(conn, p, role=role,
+                                                   limit=limit, offset=offset))
+
+    @app.post("/admin/users/{user_id}/role")
+    def admin_set_role(user_id: str, req: SetRole, p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.set_role(conn, p, user_id=user_id,
+                                                 role=req.role))
+
+    @app.get("/admin/namespaces")
+    def admin_list_namespaces(owner_user_id: Optional[str] = None,
+                              limit: int = 100, offset: int = 0,
+                              p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.list_namespaces(
+                conn, p, owner_user_id=owner_user_id, limit=limit, offset=offset))
+
+    @app.patch("/admin/namespaces/{space_id}")
+    def admin_edit_namespace(space_id: str, req: EditNamespace,
+                             p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.edit_namespace(
+                conn, p, namespace_id=space_id, description=req.description,
+                instruction=req.instruction))
+
+    @app.get("/admin/namespaces/{space_id}/members")
+    def admin_list_members(space_id: str, p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.list_members(conn, p,
+                                                     namespace_id=space_id))
+
+    class Adopt(BaseModel):
+        namespace_id: str
+
+    @app.get("/admin/orphans")
+    def admin_count_orphans(p=Depends(principal)):
+        """How many memories are stranded in the pre-identity namespace — the
+        only signal a deployment gets that its `single`-mode corpus survived a
+        switch to open/managed, since every read of it simply comes back empty."""
+        with pool.connection() as conn:
+            return _guard(lambda: admin.count_orphans(conn, p))
+
+    @app.post("/admin/adopt-orphans")
+    def admin_adopt_orphans(req: Adopt, p=Depends(principal)):
+        """Move stranded `single`-mode memories into a real namespace. Idempotent."""
+        with pool.connection() as conn, conn.transaction():
+            return _guard(lambda: admin.adopt_orphans(
+                conn, p, namespace_id=req.namespace_id, vectors=_store(conn)._vectors))
 
     # ─── service-role management (superadmin only) ──────────────────────────
-    @app.post("/admin/users/{user_id}/grant-superadmin",
-              dependencies=[Depends(require_superadmin)])
-    def admin_grant_superadmin(user_id: str):
+    @app.post("/admin/users/{user_id}/grant-superadmin")
+    def admin_grant_superadmin(user_id: str, p=Depends(principal)):
         with pool.connection() as conn:
-            _guard(lambda: identity.grant_superadmin(conn, user_id))
-            return {"user_id": user_id, "role": "superadmin"}
+            return _guard(lambda: admin.grant_superadmin(
+                conn, p, user_id=user_id))
 
     class RevokeSuper(BaseModel):
         demote_to: str = "user"
 
-    @app.post("/admin/users/{user_id}/revoke-superadmin",
-              dependencies=[Depends(require_superadmin)])
-    def admin_revoke_superadmin(user_id: str, req: RevokeSuper):
+    @app.post("/admin/users/{user_id}/revoke-superadmin")
+    def admin_revoke_superadmin(user_id: str, req: RevokeSuper,
+                                p=Depends(principal)):
         with pool.connection() as conn:
-            try:
-                identity.revoke_superadmin(conn, user_id, demote_to=req.demote_to)
-            except identity.AuthError as e:      # anti-lockout: last superadmin
-                raise HTTPException(409, str(e))
-            except (identity.SpaceNotFound, KeyError):
-                raise HTTPException(404, "no such user")
-            except ValueError as e:
-                raise HTTPException(422, str(e))
-            return {"user_id": user_id, "role": req.demote_to}
+            return _guard(lambda: admin.revoke_superadmin(
+                conn, p, user_id=user_id, demote_to=req.demote_to))
 
     return app
 

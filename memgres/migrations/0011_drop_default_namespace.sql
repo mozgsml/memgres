@@ -1,0 +1,23 @@
+-- Remove the default namespace (schema v12).
+--
+-- `app_user.default_namespace_id` answered "where does an unaddressed write
+-- land". It is removed rather than fixed, for three reasons:
+--
+--  * a better mechanism already exists. "Where does this client work" is a
+--    property of the CREDENTIAL, not of the person: a namespace-scoped token
+--    says the same thing, but revocably, auditably, and per-credential — so one
+--    person can run an agent on `public` and another on `private` without the
+--    two fighting over a single pointer on their user row.
+--  * it was the only remaining place where something happened silently. With it
+--    gone the rule is one line for reads and writes alike: exactly one reachable
+--    namespace resolves on its own, several must be named.
+--  * it was an authority, not a preference. Resolving it granted `admin` on the
+--    target without checking membership, which made whoever could set the
+--    pointer able to hand out access with it. That hole was closed by checking
+--    reachability, but a concept that has to be guarded is worse than one that
+--    does not exist.
+--
+-- Dropping the column forgets which namespace each user had chosen. That is the
+-- point: the choice no longer means anything, and a dead column named
+-- `default_namespace_id` would go on suggesting that it does.
+ALTER TABLE app_user DROP COLUMN IF EXISTS default_namespace_id;

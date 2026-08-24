@@ -234,3 +234,125 @@ def test_rest_role_gating(managed_client):
 
     # no auth at all → 403
     assert c.post("/admin/users", json={"name": "z"}).status_code == 403
+
+
+def test_user_manager_cannot_reach_an_admin_account(managed_client):
+    """The escalation the service layer was extracted to close.
+
+    A user_manager hands out access without gaining it. Provisioning was gated
+    on the caller's role but never on the *target's*, and every one of these
+    routes takes the target as a parameter — so a manager could mint itself a
+    token for the superadmin's account and be root in one request.
+    """
+    c, admin_tok = managed_client
+    H = {"Authorization": f"Bearer {admin_tok}"}
+
+    mgr = c.post("/admin/users", json={"name": "mgr", "role": "user_manager"},
+                 headers=H).json()["id"]
+    mtok = c.post("/admin/tokens", json={"user_id": mgr, "permission": "admin"},
+                  headers=H).json()["token"]
+    Hm = {"Authorization": f"Bearer {mtok}"}
+
+    with psycopg.connect(DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM app_user WHERE role='superadmin'")
+        root = str(cur.fetchone()[0])
+    root_tokens = c.get(f"/admin/users/{root}/tokens", headers=H).json()
+
+    # the escalation: a fresh credential on the root account
+    assert c.post("/admin/tokens", json={"user_id": root, "permission": "admin"},
+                  headers=Hm).status_code == 403
+    # the lockout: destroying the only credential that can undo any of this
+    assert c.post(f"/admin/tokens/{root_tokens[0]['id']}/revoke",
+                  headers=Hm).status_code == 403
+    # not even reconnaissance
+    assert c.get(f"/admin/users/{root}/tokens", headers=Hm).status_code == 403
+
+    # plain users stay fully manageable — the refusal is targeted, not a ban on
+    # the tier, or a user_manager could no longer do its job.
+    u = c.post("/admin/users", json={"name": "u"}, headers=Hm).json()["id"]
+    issued = c.post("/admin/tokens", json={"user_id": u}, headers=Hm)
+    assert issued.status_code == 201
+    assert c.get(f"/admin/users/{u}/tokens", headers=Hm).status_code == 200
+    assert c.post(f"/admin/tokens/{issued.json()['id']}/revoke",
+                  headers=Hm).status_code == 200
+
+
+def test_a_weakened_token_does_not_open_the_control_plane(managed_client):
+    """A role says who someone IS; a token says what THIS credential may do.
+
+    The recommended way to give an agent a narrow credential is a read-only,
+    namespace-scoped token. If the control plane consults only the role behind
+    it, that narrowing is decorative: the weak token opens provisioning, issues
+    itself a strong one, and the pin is gone. The data plane already honoured the
+    token; this pins that the control plane does too.
+    """
+    c, admin_tok = managed_client
+    H = {"Authorization": f"Bearer {admin_tok}"}
+
+    with psycopg.connect(DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM app_user WHERE role='superadmin'")
+        root = str(cur.fetchone()[0])
+    ns = c.post("/admin/namespaces",
+                json={"owner_user_id": root, "name": "vault"},
+                headers=H).json()["id"]
+
+    # two deliberately-weakened credentials on the ROOT account itself
+    weak = c.post("/admin/tokens", json={"user_id": root, "permission": "read"},
+                  headers=H).json()["token"]
+    pinned = c.post("/admin/tokens",
+                    json={"user_id": root, "permission": "admin",
+                          "namespace_id": ns},
+                    headers=H).json()["token"]
+
+    for tok, why in ((weak, "read-only"), (pinned, "namespace-scoped")):
+        Hw = {"Authorization": f"Bearer {tok}"}
+        # the escalation this closes: minting a full credential for itself
+        assert c.post("/admin/tokens",
+                      json={"user_id": root, "permission": "admin"},
+                      headers=Hw).status_code == 403, why
+        assert c.post("/admin/users", json={"name": "mule"},
+                      headers=Hw).status_code == 403, why
+        assert c.post(f"/admin/users/{root}/grant-superadmin",
+                      headers=Hw).status_code == 403, why
+        # …while the identity itself still reads back fine
+        assert c.get("/whoami", headers=Hw).status_code == 200, why
+
+    # a scoped token may still administer the namespace it IS scoped to
+    Hp = {"Authorization": f"Bearer {pinned}"}
+    assert c.get(f"/spaces/{ns}/access-requests", headers=Hp).status_code == 200
+
+
+def test_a_profile_makes_authorship_readable(managed_client):
+    """`app_user.name` was doing two jobs — the handle a token resolves to, and
+    the thing a person reads in blame. It is neither unique nor required, so an
+    audit line could come back as a bare uuid, which nobody can act on."""
+    c, admin_tok = managed_client
+    H = {"Authorization": f"Bearer {admin_tok}"}
+
+    uid = c.post("/admin/users",
+                 json={"name": "ada", "email": "ada@example.com",
+                       "full_name": "Ada Lovelace", "department": "Analytical",
+                       "position": "Engineer"}, headers=H).json()["id"]
+    ns = c.post("/admin/namespaces",
+                json={"owner_user_id": uid, "name": "work"}, headers=H).json()["id"]
+    tok = c.post("/admin/tokens", json={"user_id": uid, "permission": "write"},
+                 headers=H).json()["token"]
+    Ha = {"Authorization": f"Bearer {tok}"}
+
+    mid = c.post("/memories", json={"body": "a line\n"}, headers=Ha).json()["id"]
+    [row] = c.get(f"/memories/{mid}/history", headers=Ha).json()
+    assert row["author_name"] == "Ada Lovelace"      # not the handle, not a uuid
+    assert row["author_email"] == "ada@example.com"
+
+    # the directory carries the rest, and a partial edit leaves it alone
+    assert c.patch(f"/admin/users/{uid}", json={"position": "Lead Engineer"},
+                   headers=H).status_code == 200
+    [ada] = [u for u in c.get("/admin/users", headers=H).json() if u["id"] == uid]
+    assert ada["position"] == "Lead Engineer"
+    assert ada["department"] == "Analytical"          # untouched by the edit
+    assert ada["full_name"] == "Ada Lovelace"
+
+    # email is the future login, so a duplicate is refused
+    assert c.post("/admin/users", json={"name": "other",
+                                        "email": "ADA@example.com"},
+                  headers=H).status_code == 400
