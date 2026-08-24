@@ -5,7 +5,7 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
-## [Unreleased]
+## [0.5.2] — 2026-08-24
 
 ### Fixed
 - **Container healthcheck is role-aware.** The image's `HEALTHCHECK` probed a
