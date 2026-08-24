@@ -116,6 +116,30 @@ def require_namespace_admin(conn, p: Principal, namespace_id: str) -> Optional[s
     return p.user_id
 
 
+def whoami(p: Principal) -> dict:
+    """Who the caller is and what they may do — capabilities, not just a role.
+
+    A caller has to decide what to attempt: an agent whether to try a tool, a
+    web panel which controls to render. If it were handed a bare role it would
+    have to re-derive the rules — a second copy of the authorization logic, in
+    another language, drifting from this one. So the answers are computed here,
+    by the same predicates that enforce them.
+
+    Never echoes the credential; `token_id` identifies it without revealing it.
+    """
+    return {
+        "user_id": p.user_id,
+        "role": p.role,
+        "permission": p.permission,          # this credential's ceiling
+        "scope_namespace_id": p.scope_namespace_id,
+        "token_id": p.token_id,
+        "capabilities": {
+            "is_admin": p.is_admin,
+            "can_manage_users": identity.can_manage_users(p),
+        },
+    }
+
+
 # ─── users ───────────────────────────────────────────────────────────────────
 
 def create_user(conn, p: Principal, *, name: str = "", description: str = "",
@@ -139,22 +163,52 @@ def list_users(conn, p: Principal, *, role: Optional[str] = None,
     return identity.list_users(conn, role=role, limit=limit, offset=offset)
 
 
+def set_role(conn, p: Principal, *, user_id: str, role: str) -> dict:
+    """Set a user's service role — the general form of promote and demote.
+
+    `identity.set_role` writes the column and, by its own docstring, leaves
+    lockout to the caller. Demoting a superadmin therefore goes through
+    `revoke_superadmin`, which counts the remaining ones: without that detour a
+    superadmin could demote the last superadmin and leave the deployment with no
+    control plane at all.
+
+    It is also the only way to reach `user_manager`. Grant and revoke handle the
+    superadmin role alone, so the middle tier was unreachable through any door.
+    """
+    require_superadmin(p)
+    if role not in identity.SERVICE_ROLES:
+        raise ValueError(f"bad role: {role}")
+    if identity.get_role(conn, user_id) == "superadmin" and role != "superadmin":
+        try:
+            identity.revoke_superadmin(conn, user_id, demote_to=role)
+        except identity.AuthError as e:      # anti-lockout, not a permission call
+            raise Lockout(str(e))
+    else:
+        identity.set_role(conn, user_id, role)   # SpaceNotFound if no such user
+    return {"user_id": user_id, "role": role}
+
+
 def grant_superadmin(conn, p: Principal, *, user_id: str) -> dict:
     """Promote a user to superadmin."""
-    require_superadmin(p)
-    identity.grant_superadmin(conn, user_id)
-    return {"user_id": user_id, "role": "superadmin"}
+    return set_role(conn, p, user_id=user_id, role="superadmin")
 
 
 def revoke_superadmin(conn, p: Principal, *, user_id: str,
                       demote_to: str = "user") -> dict:
-    """Demote a superadmin, refusing to remove the last one."""
+    """Demote a superadmin, refusing to remove the last one.
+
+    A no-op on a user who is not a superadmin — but it reports the role the user
+    actually has now, rather than echoing the requested one back as though the
+    demotion had happened.
+    """
     require_superadmin(p)
+    if demote_to not in identity.SERVICE_ROLES or demote_to == "superadmin":
+        raise ValueError(f"bad demote target: {demote_to}")
     try:
         identity.revoke_superadmin(conn, user_id, demote_to=demote_to)
     except identity.AuthError as e:          # anti-lockout, not a permission call
         raise Lockout(str(e))
-    return {"user_id": user_id, "role": demote_to}
+    return {"user_id": user_id, "role": identity.get_role(conn, user_id)}
 
 
 # ─── namespaces ──────────────────────────────────────────────────────────────
@@ -166,6 +220,35 @@ def create_namespace(conn, p: Principal, *, owner_user_id: str, name: str,
     return identity.create_namespace(conn, owner_user_id, name,
                                      description=description,
                                      instruction=instruction)
+
+
+def edit_namespace(conn, p: Principal, *, namespace_id: str,
+                   description: Optional[str] = None,
+                   instruction: Optional[str] = None) -> dict:
+    """Amend a namespace's description or routing instruction.
+
+    `create_namespace` is an idempotent upsert that ignores conflicts, so
+    re-creating with corrected text silently does nothing — until now a typo in
+    the instruction agents read to choose a namespace could not be fixed through
+    any door at all.
+    """
+    require_namespace_admin(conn, p, namespace_id)
+    identity.edit_namespace(conn, namespace_id, description=description,
+                            instruction=instruction)
+    return {"namespace_id": namespace_id}
+
+
+def set_default_space(conn, p: Principal, *, user_id: str,
+                      namespace_id: str) -> dict:
+    """Point a user at the namespace their unqualified reads and writes land in.
+
+    Creating a user and creating a namespace do not connect the two, so without
+    this a provisioned user's first write lands somewhere nobody chose.
+    """
+    require_manage_users(p)
+    _require_target_is_plain_user(conn, p, user_id, "setting a default namespace")
+    identity.set_default_space(conn, user_id, namespace_id)
+    return {"user_id": user_id, "default_namespace_id": namespace_id}
 
 
 def add_member(conn, p: Principal, *, namespace_id: str, user_id: str,

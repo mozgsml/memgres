@@ -32,7 +32,7 @@ try:  # mcp SDK >= 2.0 renamed the module fastmcp -> mcpserver
 except ImportError:  # mcp SDK 1.x
     from mcp.server.fastmcp import Context
 
-from . import identity
+from . import admin, identity
 from .config import Config, load
 from .embeddings import get_embedder
 from .bootstrap import bootstrap_admin
@@ -110,8 +110,31 @@ def build_server(cfg: Optional[Config] = None):
     else:
         expose_token = cfg.key_mode != "single" and not cfg.default_token
 
+    # The control-plane tools. `auto` registers them wherever there are
+    # identities to administer — that is every mode except `single`, which has
+    # exactly one implicit caller and so nothing to administer. Turn them off on
+    # an agent-facing endpoint to keep the tool list short; that is a context
+    # economy, not a security boundary — each tool authorizes on call.
+    _adm = _os.environ.get("MEMGRES_MCP_ADMIN_TOOLS", "auto").strip().lower()
+    if _adm in ("1", "true", "on", "yes"):
+        admin_surface = True
+    elif _adm in ("0", "false", "off", "no"):
+        admin_surface = False
+    else:
+        admin_surface = cfg.key_mode != "single"
+
     def _store(conn):
         return Store(cfg, embedder=embedder, conn=conn, backend=backend)
+
+    def _iso(rows: List[dict], *keys: str) -> List[dict]:
+        """Stringify datetimes in place — MCP returns JSON, FastAPI encodes."""
+        for d in rows:
+            for k in keys:
+                if d.get(k) is not None:
+                    d[k] = str(d[k])
+        return rows
+
+    _TOKEN_TIMES = ("expires_at", "revoked_at", "last_used_at", "created_at")
 
     def _token(ctx, arg: Optional[str] = None) -> Optional[str]:
         """The caller's token, resolved **authoritatively** so a pin can't be
@@ -160,6 +183,15 @@ def build_server(cfg: Optional[Config] = None):
             raise identity.AuthError(
                 "token management requires an unscoped admin-ceiling token")
         return p.user_id
+
+    def _principal(conn, token: Optional[str]):
+        """Authenticate the caller for a control-plane tool.
+
+        The door's whole job: say who is calling. What they may do is `admin`'s
+        to decide, with the same rules the HTTP surface uses — which is why no
+        permission check appears in this file.
+        """
+        return identity.resolve(conn, cfg, token)
 
     @mcp.tool()
     def memory_write(body: Optional[str] = None, id: Optional[str] = None,
@@ -362,10 +394,7 @@ def build_server(cfg: Optional[Config] = None):
         """List your tokens (metadata only — never the secret)."""
         with pool.connection() as conn, conn.transaction():
             out = identity.list_tokens(conn, _admin_uid(conn, _token(ctx, token)))
-        for d in out:                                  # make timestamps JSON-safe
-            for key in ("expires_at", "revoked_at", "last_used_at", "created_at"):
-                d[key] = str(d[key]) if d[key] else None
-        return out
+        return _iso(out, *_TOKEN_TIMES)
 
     @mcp.tool()
     def memory_revoke_token(token_id: str, token: Optional[str] = None,
@@ -377,6 +406,171 @@ def build_server(cfg: Optional[Config] = None):
             if token_id not in owned:
                 raise identity.AuthError("not your token")
             return {"revoked": identity.revoke_token(conn, token_id)}
+
+    @mcp.tool()
+    def memory_whoami(token: Optional[str] = None, ctx: Context = None) -> dict:
+        """Who you are and what you may do: user id, service role, this
+        credential's permission ceiling and namespace scope, plus the
+        capabilities that follow from them. Check here before assuming an admin
+        tool will refuse you — or explaining to someone why it did."""
+        with pool.connection() as conn:
+            return admin.whoami(_principal(conn, _token(ctx, token)))
+
+    # ─── control plane: provisioning (authorized in `admin`, not here) ───────
+    if admin_surface:
+
+        @mcp.tool()
+        def memory_admin_list_users(role: Optional[str] = None, limit: int = 50,
+                                    offset: int = 0, token: Optional[str] = None,
+                                    ctx: Context = None) -> List[dict]:
+            """The user directory: id, name, service role, default namespace.
+            `role` filters to one tier (user | user_manager | superadmin)."""
+            with pool.connection() as conn:
+                out = admin.list_users(conn, _principal(conn, _token(ctx, token)),
+                                       role=role, limit=limit, offset=offset)
+            return _iso(out, "created_at")
+
+        @mcp.tool()
+        def memory_admin_create_user(name: str = "", description: str = "",
+                                     role: str = "user",
+                                     token: Optional[str] = None,
+                                     ctx: Context = None) -> dict:
+            """Create a user and return its id. A new user owns nothing yet —
+            give it a namespace with `memory_admin_create_namespace` or share one
+            with `memory_admin_add_member`, then mint it a token. Minting an
+            admin-role user requires superadmin."""
+            with pool.connection() as conn, conn.transaction():
+                uid = admin.create_user(conn, _principal(conn, _token(ctx, token)),
+                                        name=name, description=description,
+                                        role=role)
+            return {"id": uid}
+
+        @mcp.tool()
+        def memory_admin_set_role(user_id: str, role: str,
+                                  token: Optional[str] = None,
+                                  ctx: Context = None) -> dict:
+            """Set a user's service role (user | user_manager | superadmin).
+            Superadmin only. Demoting the last superadmin is refused — that
+            would leave the deployment with no control plane."""
+            with pool.connection() as conn, conn.transaction():
+                return admin.set_role(conn, _principal(conn, _token(ctx, token)),
+                                      user_id=user_id, role=role)
+
+        @mcp.tool()
+        def memory_admin_list_namespaces(owner_user_id: Optional[str] = None,
+                                         limit: int = 50, offset: int = 0,
+                                         token: Optional[str] = None,
+                                         ctx: Context = None) -> List[dict]:
+            """Every namespace on the deployment, with its owner and routing
+            instruction. `memory_list_spaces` answers what *you* can reach; this
+            answers what exists."""
+            with pool.connection() as conn:
+                out = admin.list_namespaces(
+                    conn, _principal(conn, _token(ctx, token)),
+                    owner_user_id=owner_user_id, limit=limit, offset=offset)
+            return _iso(out, "created_at")
+
+        @mcp.tool()
+        def memory_admin_create_namespace(name: str, owner_user_id: str,
+                                          description: str = "",
+                                          instruction: str = "",
+                                          token: Optional[str] = None,
+                                          ctx: Context = None) -> dict:
+            """Create a namespace owned by `owner_user_id`. `instruction` is the
+            routing hint agents read to decide what belongs here — write it as
+            guidance, not decoration. Idempotent: an existing name returns it."""
+            with pool.connection() as conn, conn.transaction():
+                nsid = admin.create_namespace(
+                    conn, _principal(conn, _token(ctx, token)),
+                    owner_user_id=owner_user_id, name=name,
+                    description=description, instruction=instruction)
+            return {"id": nsid}
+
+        @mcp.tool()
+        def memory_admin_edit_namespace(space_id: str,
+                                        description: Optional[str] = None,
+                                        instruction: Optional[str] = None,
+                                        token: Optional[str] = None,
+                                        ctx: Context = None) -> dict:
+            """Amend a namespace's description or routing instruction. Creating
+            it again will not: that call ignores conflicts, so this is the only
+            way to correct the text agents route by."""
+            with pool.connection() as conn, conn.transaction():
+                return admin.edit_namespace(
+                    conn, _principal(conn, _token(ctx, token)),
+                    namespace_id=space_id, description=description,
+                    instruction=instruction)
+
+        @mcp.tool()
+        def memory_admin_set_default_space(user_id: str, space_id: str,
+                                           token: Optional[str] = None,
+                                           ctx: Context = None) -> dict:
+            """Point a user at the namespace their unqualified reads and writes
+            land in. Creating a user and creating a namespace do not connect the
+            two — without this their first write lands nowhere you chose."""
+            with pool.connection() as conn, conn.transaction():
+                return admin.set_default_space(
+                    conn, _principal(conn, _token(ctx, token)),
+                    user_id=user_id, namespace_id=space_id)
+
+        @mcp.tool()
+        def memory_admin_add_member(space_id: str, user_id: str,
+                                    permission: str = "read",
+                                    token: Optional[str] = None,
+                                    ctx: Context = None) -> dict:
+            """Share a namespace with another user at read | write | admin.
+            Superadmin only — it grants access across tenants."""
+            with pool.connection() as conn, conn.transaction():
+                return admin.add_member(conn, _principal(conn, _token(ctx, token)),
+                                        namespace_id=space_id, user_id=user_id,
+                                        permission=permission)
+
+        @mcp.tool()
+        def memory_admin_list_members(space_id: str,
+                                      token: Optional[str] = None,
+                                      ctx: Context = None) -> List[dict]:
+            """Who can reach a namespace — the owner first, then everyone shared
+            in. The audit answer to "who can see this?"."""
+            with pool.connection() as conn:
+                out = admin.list_members(conn, _principal(conn, _token(ctx, token)),
+                                         namespace_id=space_id)
+            return _iso(out, "created_at")
+
+        @mcp.tool()
+        def memory_admin_issue_token(user_id: str, permission: str = "write",
+                                     space_id: Optional[str] = None,
+                                     label: str = "",
+                                     expires_days: Optional[int] = None,
+                                     token: Optional[str] = None,
+                                     ctx: Context = None) -> dict:
+            """Mint a token for another user. `permission` is its ceiling,
+            `space_id` scopes it to one namespace (omit for all theirs). The
+            secret is returned ONCE. Issuing for an admin-role account requires
+            superadmin."""
+            with pool.connection() as conn, conn.transaction():
+                return admin.issue_token(
+                    conn, _principal(conn, _token(ctx, token)), user_id=user_id,
+                    namespace_id=space_id, permission=permission, label=label,
+                    expires_days=expires_days)
+
+        @mcp.tool()
+        def memory_admin_list_tokens(user_id: str, token: Optional[str] = None,
+                                     ctx: Context = None) -> List[dict]:
+            """A user's tokens — metadata only, never the secret."""
+            with pool.connection() as conn:
+                out = admin.list_tokens(conn, _principal(conn, _token(ctx, token)),
+                                        user_id=user_id)
+            return _iso(out, *_TOKEN_TIMES)
+
+        @mcp.tool()
+        def memory_admin_revoke_token(token_id: str,
+                                      token: Optional[str] = None,
+                                      ctx: Context = None) -> dict:
+            """Kill any user's token immediately. False means it was already
+            revoked or never existed."""
+            with pool.connection() as conn, conn.transaction():
+                return {"revoked": admin.revoke_token(
+                    conn, _principal(conn, _token(ctx, token)), token_id=token_id)}
 
     # Best-effort: on a pinned/single endpoint drop the (now unused) `token` arg
     # from each tool's advertised schema so the model doesn't even see it. Purely
