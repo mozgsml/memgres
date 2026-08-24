@@ -149,6 +149,19 @@ def require_namespace_admin(conn, p: Principal, namespace_id: str) -> Optional[s
             raise Forbidden(
                 f"administering a namespace requires an admin-ceiling token "
                 f"(this one grants {p.permission})")
+        # A superadmin skips the membership lookup, and with it the only thing
+        # that used to establish the namespace EXISTS. Since access requests are
+        # now recorded whether or not their namespace does, that left the one
+        # caller who could see an orphaned request — and approving it failed on
+        # `namespace_member`'s foreign key, i.e. a raw driver error rather than a
+        # refusal, with the safety of the whole arrangement resting on a
+        # constraint in a different table. Checked here because this is the
+        # single point every per-namespace admin action funnels through.
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM namespace WHERE id=%s",
+                        (identity._as_uuid(namespace_id),))
+            if cur.fetchone() is None:
+                raise identity.SpaceNotFound("no such namespace")
         return p.user_id
     if p.user_id is None:
         raise identity.AuthError("this token has no owning user")

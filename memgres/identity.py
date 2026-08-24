@@ -1146,9 +1146,15 @@ def _as_uuid(value: str) -> str:
         raise ValueError(f"not a namespace id: {value!r}")
 
 
-# How many open requests one account may have outstanding. The row is recorded
+# How many open requests one ACCOUNT may have outstanding. The row is recorded
 # whether or not the namespace exists (see below), so without a cap an account
 # could grow the table one guessed uuid at a time.
+#
+# It bounds an account, not an adversary: in `open` mode anyone can mint a token
+# and materialize a fresh account, so the real bound is the cap times however
+# many accounts they care to create. That is the same shape as
+# MAX_NAMESPACES_PER_USER and inherent to self-service mode — the cap is a
+# guard-rail on a table, not a defence against someone determined to fill it.
 MAX_PENDING_REQUESTS_PER_USER = 100
 
 
@@ -1180,13 +1186,21 @@ def request_access(conn, requester_user_id: str, namespace_id: str,
         raise ValueError(f"bad permission: {permission}")
     namespace_id = _as_uuid(namespace_id)
     with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM access_request "
-                    "WHERE requester_user_id=%s AND status='pending'",
-                    (requester_user_id,))
-        if cur.fetchone()[0] >= MAX_PENDING_REQUESTS_PER_USER:
-            raise ValueError(
-                f"you already have {MAX_PENDING_REQUESTS_PER_USER} requests "
-                "waiting to be decided, which is the cap")
+        # Amending a request you already hold adds no row, so the cap does not
+        # apply to it — otherwise a caller at the limit could not even lower a
+        # pending `admin` request to `read`. This asks about the caller's own
+        # requests, never about what exists.
+        cur.execute("SELECT 1 FROM access_request "
+                    "WHERE requester_user_id=%s AND namespace_id=%s",
+                    (requester_user_id, namespace_id))
+        if cur.fetchone() is None:
+            cur.execute("SELECT count(*) FROM access_request "
+                        "WHERE requester_user_id=%s AND status='pending'",
+                        (requester_user_id,))
+            if cur.fetchone()[0] >= MAX_PENDING_REQUESTS_PER_USER:
+                raise ValueError(
+                    f"you already have {MAX_PENDING_REQUESTS_PER_USER} requests "
+                    "waiting to be decided, which is the cap")
         cur.execute(
             "INSERT INTO access_request (requester_user_id, namespace_id, "
             "requested_permission) VALUES (%s, %s, %s) "

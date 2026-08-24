@@ -75,11 +75,21 @@ patch = fixes).
   a foreign key, migration 0014) and `identity._reach` resolves reachability in
   one query instead of doing strictly less work for a namespace that does not
   exist. Re-measured after the fix: 0.99×, 23/60 paired trials. A row pointing
-  at nothing is inert — `list_requests` selects by namespace and `decide_access`
-  refuses — and `MAX_PENDING_REQUESTS_PER_USER` (100) bounds the table an
-  account could grow by guessing, which also caps request spam at real
-  namespaces. 🔴 The dropped constraint carried `ON DELETE CASCADE`: whatever
-  adds `delete_namespace` must delete that namespace's requests itself.
+  at nothing is inert, and that is now enforced rather than incidental: a
+  superadmin skips the membership lookup that used to establish a namespace
+  exists at all, so it could *list* an orphaned request, and approving one
+  failed on `namespace_member`'s foreign key — a raw driver error instead of a
+  refusal, with the safety of the whole arrangement resting on a constraint in
+  another table. `require_namespace_admin` now checks existence in that branch,
+  which covers every per-namespace admin action at once.
+  `MAX_PENDING_REQUESTS_PER_USER` (100) bounds what one account can add, and
+  caps the request spam that was always possible against real namespaces; it
+  bounds an account rather than an adversary, since `open` mode lets anyone
+  materialize another one. Amending a request you already hold is not capped —
+  it adds no row, and a caller at the limit must still be able to lower a
+  pending `admin` request to `read`. 🔴 The dropped constraint carried
+  `ON DELETE CASCADE`: whatever adds `delete_namespace` must delete that
+  namespace's requests itself.
 - **A read-only superadmin token could administer any namespace.** A role says
   who someone IS; a token says what THIS credential may do — and
   `require_namespace_admin` returned on the role before it ever looked at the
@@ -341,6 +351,9 @@ patch = fixes).
   to be trusted. **Upgrade every client of a shared database together.**
   A version this build does not recognise is now an error naming the version,
   not a "tampered" verdict: an unknown recipe means the row is newer, not bad.
+- `identity.request_access` (exported) returns the request id as `str` rather
+  than `Optional[str]`, and raises `ValueError` at the per-account cap. The
+  None-for-a-missing-namespace case is gone — there is no missing case any more.
 
 ### Known, deliberately not changed here
 - `email` is unique but **not verified** — see the note under Breaking. Whatever

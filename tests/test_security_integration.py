@@ -396,13 +396,17 @@ def test_request_access_tells_you_about_your_own_access(env):
     assert ident.list_requests(setup, ns) == []
 
 
-def test_a_read_only_superadmin_token_cannot_administer_a_namespace(env):
+def test_a_weakened_superadmin_token_cannot_administer_a_namespace(env):
     """A role says who you ARE; a token says what THIS credential may do. The
     superadmin branch returned before any ceiling check, so the credential the
     docs recommend handing an agent — read-only — could rewrite any namespace's
     `instruction` (the routing hint other agents read to decide where memories
     land) and approve access requests, granting strangers write membership
-    anywhere. Neither of those is a read."""
+    anywhere. Neither of those is a read.
+
+    Both weakened ceilings are exercised: `write` as well as `read`, because a
+    guard written as "refuse read" instead of "require admin" passes a
+    write-ceiling token and no test would have noticed."""
     from memgres import admin
 
     setup, make_store = env
@@ -416,26 +420,132 @@ def test_a_read_only_superadmin_token_cannot_administer_a_namespace(env):
     ident.request_access(setup, outsider, ns, "write")
     [req] = ident.list_requests(setup, ns)
 
-    weak, _ = ident.issue_token(setup, root, permission="read")
-    p = ident.resolve(setup, cfg, weak)
-    assert p.is_admin and p.permission == "read"
+    for ceiling in ("read", "write"):
+        weak, _ = ident.issue_token(setup, root, permission=ceiling)
+        p = ident.resolve(setup, cfg, weak)
+        assert p.is_admin and p.permission == ceiling
 
-    with pytest.raises(DENIED):
-        admin.edit_namespace(setup, p, namespace_id=ns, instruction="PWNED")
-    with pytest.raises(DENIED):
-        admin.decide_access(setup, p, request_id=req["id"], approve=True)
-    with pytest.raises(DENIED):
-        admin.list_requests(setup, p, namespace_id=ns)
-    assert ident.reaches(setup, outsider, ns) is None       # nothing was granted
+        with pytest.raises(DENIED):
+            admin.edit_namespace(setup, p, namespace_id=ns, instruction="PWNED")
+        with pytest.raises(DENIED):
+            admin.decide_access(setup, p, request_id=req["id"], approve=True)
+        with pytest.raises(DENIED):
+            admin.list_requests(setup, p, namespace_id=ns)
+        with pytest.raises(DENIED):
+            admin.list_members(setup, p, namespace_id=ns)
+        with pytest.raises(DENIED):
+            admin.adopt_orphans(setup, p, namespace_id=ns)
+        assert ident.reaches(setup, outsider, ns) is None   # nothing was granted
 
     # the same account WITH an admin-ceiling token is allowed, as before
+    weak_p = ident.resolve(setup, cfg,
+                           ident.issue_token(setup, root, permission="read")[0])
     strong, _ = ident.issue_token(setup, root, permission="admin")
-    admin.edit_namespace(setup, ident.resolve(setup, cfg, strong),
-                         namespace_id=ns, instruction="fixed")
+    strong_p = ident.resolve(setup, cfg, strong)
+    admin.edit_namespace(setup, strong_p, namespace_id=ns, instruction="fixed")
+    assert admin.list_members(setup, strong_p, namespace_id=ns) is not None
     # …and the capability report agrees with both answers
-    assert admin.capabilities(setup, p)["has_admin_ceiling"] is False
-    assert admin.capabilities(
-        setup, ident.resolve(setup, cfg, strong))["has_admin_ceiling"] is True
+    assert admin.capabilities(setup, weak_p)["has_admin_ceiling"] is False
+    assert admin.capabilities(setup, strong_p)["has_admin_ceiling"] is True
+
+
+def test_an_orphaned_request_is_refused_rather_than_crashing_on_a_foreign_key(env):
+    """Requests are recorded whether or not their namespace exists, so an
+    orphan row is possible by construction — and a superadmin skips the
+    membership lookup that used to establish existence at all. It could
+    therefore LIST an orphan, and approving it failed on `namespace_member`'s
+    foreign key: a raw driver error rather than a refusal, with the safety of
+    the arrangement resting on a constraint in a different table."""
+    import uuid
+
+    from memgres import admin
+
+    setup, make_store = env
+    make_store("managed")
+    cfg = dataclasses.replace(load(), key_mode="managed")
+
+    root = ident.create_user(setup, name="root", role="superadmin")
+    root_p = ident.resolve(setup, cfg,
+                           ident.issue_token(setup, root, permission="admin")[0])
+    outsider = ident.create_user(setup, name="outsider")
+    ghost = str(uuid.uuid4())
+    rid = ident.request_access(setup, outsider, ghost, "write")
+
+    with pytest.raises(DENIED):
+        admin.list_requests(setup, root_p, namespace_id=ghost)
+    with pytest.raises(DENIED):
+        admin.decide_access(setup, root_p, request_id=rid, approve=True)
+    with pytest.raises(DENIED):
+        admin.edit_namespace(setup, root_p, namespace_id=ghost, instruction="x")
+    with setup.cursor() as cur:                    # and nothing was granted
+        cur.execute("SELECT count(*) FROM namespace_member WHERE user_id=%s",
+                    (outsider,))
+        assert cur.fetchone()[0] == 0
+
+
+def test_the_request_cap_still_lets_you_amend_a_request_you_hold(env):
+    """The count runs before the upsert, so a caller at the cap could not lower
+    a pending `admin` request to `read` — an amendment adds no row."""
+    import uuid
+
+    from memgres import admin
+
+    setup, make_store = env
+    make_store("managed")
+    uid = ident.create_user(setup, name="u")
+    p = ident.resolve(setup, dataclasses.replace(load(), key_mode="managed"),
+                      ident.issue_token(setup, uid)[0])
+
+    keep = ident.MAX_PENDING_REQUESTS_PER_USER
+    ident.MAX_PENDING_REQUESTS_PER_USER = 2
+    try:
+        first = str(uuid.uuid4())
+        admin.request_access(setup, p, namespace_id=first, permission="admin")
+        admin.request_access(setup, p, namespace_id=str(uuid.uuid4()))
+        with pytest.raises(ValueError):                    # a NEW one is capped
+            admin.request_access(setup, p, namespace_id=str(uuid.uuid4()))
+        # …the one already held can still be changed
+        admin.request_access(setup, p, namespace_id=first, permission="read")
+        [row] = [r for r in ident.list_requests(setup, first)]
+        assert row["requested_permission"] == "read"
+
+        # a decided request frees a slot: the cap counts PENDING, not history
+        with setup.cursor() as cur:
+            cur.execute("UPDATE access_request SET status='denied' WHERE id=%s",
+                        (row["id"],))
+        admin.request_access(setup, p, namespace_id=str(uuid.uuid4()))
+    finally:
+        ident.MAX_PENDING_REQUESTS_PER_USER = keep
+
+
+def test_reachability_is_decided_by_one_query(env):
+    """Structural, because the property is a timing one and a clock assertion
+    would be flaky in CI. `_reach` used to do strictly less work for a namespace
+    that does not exist than for one that exists and is unreachable, which is
+    the difference `request_access` must not have."""
+    setup, make_store = env
+    make_store("managed")
+    uid = ident.create_user(setup, name="u")
+    other = ident.create_user(setup, name="other")
+    ns = ident.create_namespace(setup, other, "theirs")
+
+    class Counting:
+        def __init__(self, cur):
+            self._cur, self.n = cur, 0
+
+        def execute(self, *a, **kw):
+            self.n += 1
+            return self._cur.execute(*a, **kw)
+
+        def fetchone(self):
+            return self._cur.fetchone()
+
+    import uuid
+    with setup.cursor() as raw:
+        for target in (ns, str(uuid.uuid4())):
+            c = Counting(raw)
+            assert ident._reach(c, uid, target) is None
+            assert c.n == 1, f"{c.n} queries for {target}"
 
 
 def test_a_request_for_a_nonexistent_namespace_is_recorded_like_any_other(env):
@@ -556,3 +666,13 @@ def test_capabilities_never_advertise_a_door_that_always_closes(env):
     full, _ = ident.issue_token(setup, uid, permission="write")
     assert admin.capabilities(
         setup, ident.resolve(setup, cfg, full))["can_create_namespace"] is True
+
+    # The other direction matters just as much: a False where the door is open
+    # HIDES a tool the caller can use, and a tool nobody can see is a tool
+    # nobody reports as missing. An unscoped admin-ceiling token manages its own
+    # tokens — which is exactly what `mcp_server._admin_uid` enforces.
+    strong, _ = ident.issue_token(setup, uid, permission="admin")
+    strong_p = ident.resolve(setup, cfg, strong)
+    assert admin.capabilities(setup, strong_p)["can_manage_own_tokens"] is True
+    assert ident.list_tokens(setup, strong_p.user_id) != []
+    assert admin.capabilities(setup, strong_p)["can_create_namespace"] is True

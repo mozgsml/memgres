@@ -256,13 +256,15 @@ def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
     # keeps `hash_version` a selector rather than a claim the recipe must trust.
     if version == 2:
         h = _fold(h, "memgres.tags.v2", *tags)
-    elif version > 2:
-        # A version this build does not know is not the same thing as a broken
-        # chain, and must not be reported as one: it means the row was written
-        # by something newer. Say that instead of returning "tampered".
+    elif version != 1:
+        # Any version this build has no branch for — a newer one, or a v3 whose
+        # implementation someone forgot to add here — is not the same thing as a
+        # broken chain and must not be reported as one. Note the test is "not a
+        # version I implement", not "greater than the newest I know": the latter
+        # would silently hash a forgotten version as if it were v1.
         raise ValueError(
-            f"history row uses hash recipe v{version}, and this build knows up "
-            f"to v{HASH_VERSION} — upgrade to verify it")
+            f"history row uses hash recipe v{version}; this build implements "
+            f"v1 and v2 — a newer memgres wrote this row")
     # Each optional dimension folds in ONLY when it was touched on this row. A row
     # that touched neither title nor author — which includes EVERY row written
     # before those features — returns the base digest unchanged and still
