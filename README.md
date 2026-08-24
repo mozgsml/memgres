@@ -186,6 +186,7 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_LIST_PREVIEW_CHARS` | `120` | first-line preview length returned by `memory_list` |
 | `MEMGRES_LIST_BODIES_MAX_BYTES` | `200000` | total body bytes one `bodies=true` browse returns; rows past the cap come back marked `body_omitted`, never dropped |
 | `MEMGRES_MCP_ADMIN_TOOLS` | `auto` | register the `memory_admin_*` control-plane tools over MCP; `auto` = every mode but `single`. A context economy, not a security boundary — each tool authorizes on call |
+| `MEMGRES_MCP_TOOL_VISIBILITY` | `auto` | show each client only the tools its own credential can use, and drop the identity tools where there are no identities (`single`). Display, not authorization — every tool still authorizes on call; `off` lists everything |
 | `MEMGRES_INSTRUCTION` | — | server-side MCP instructions emitted at `initialize` (a client like Claude Code loads it once at connect); unset = omitted; capped at 2 KB |
 | `MEMGRES_VECTOR_BACKEND` | `pgvector` | `pgvector` (same DB) or `qdrant` (set `QDRANT_URL`, `QDRANT_API_KEY`, `MEMGRES_QDRANT_COLLECTION`) |
 | `MEMGRES_EMBED_PROVIDER` | `none` | `none` / `local` / `openai` / `jina` / `openai-compatible` (LM Studio, Ollama, vLLM, TEI…) |
@@ -230,8 +231,10 @@ edit meant for one memory from quietly becoming a second memory beside it.
 Every memory/recall route also takes optional `space` (one of your namespaces by
 name — your own, one shared with you, or an **alias** you set) and `space_id`
 (canonical id, always unambiguous); a search takes a list of either, or
-`space=all`, and each hit says which namespace answered. Addressing a namespace
-that does not exist is an error, never a new one. In
+`space=all` — every namespace you belong to, plus `space=*` for every namespace
+in the deployment if you are a superadmin — and each hit says which namespace
+answered. Addressing a namespace that does not exist is an error, never a new
+one. In
 `open`/`managed` mode
 the token goes in `Authorization: Bearer <token>` or `X-Memgres-Token`; there are
 also request-access and `/admin/*` provisioning routes — see

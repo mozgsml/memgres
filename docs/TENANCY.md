@@ -106,9 +106,28 @@ two combine. Over HTTP they are repeated query parameters:
 curl -s "$BASE/recall?q=pricing&space=work&space=notes"   # two of yours
 curl -s "$BASE/recall?q=pricing&space=all"                 # everything you reach
 curl -s "$BASE/recall?q=pricing&space=work&space_id=<uuid>"  # yours + a shared one
+curl -s "$BASE/recall?q=pricing&space=*"                   # superadmin: everything
 ```
 
 Every hit says which namespace answered, via `space` and `space_id`.
+
+**`all` is refused for a superadmin** whenever it would answer with less than
+that credential can read — that is, whenever namespaces exist outside its
+memberships. A superadmin reaches any namespace by id, so for that one caller
+the word asks two different questions, and the narrow answer looks exactly like
+the wide one: nothing found reads as "there is nothing", not as "not where I
+looked". The refusal names what `all` would have covered and offers `*`, which
+adds no reach — it spends in one call the access `space_id` already gives that
+role one namespace at a time. A token scoped to a single namespace stays scoped
+under either word. For everyone else `all` is unchanged, because for them it is
+genuinely everything.
+
+There is deliberately no keyword for "the namespaces I belong to". Namespace
+names are free text and the obvious candidates are names people use — the first
+draft of this shadowed a namespace literally called `mine` in the test suite.
+`*` survives that objection, and the collision is still checked rather than
+assumed away: if a namespace in play really is named `*`, the keyword is refused
+as ambiguous and you address that one by id.
 
 **If you reach more than one namespace, you must name one** — for a search as
 much as for a write. Searching one of them and answering "nothing found" is
@@ -223,7 +242,9 @@ Tools:
 - `memory_write` / `memory_get` / `memory_recall` / `memory_move` /
   `memory_history` / `memory_blame` / `memory_forget` — all take `space` /
   `space_id`; the id-addressed ones also take `at` (a path);
-- `memory_whoami` — what this token may do, as capabilities;
+- `memory_whoami` — what THIS credential may do, as capabilities. Effective, not
+  aspirational: a superadmin holding a scoped or read-only token is told it
+  cannot provision with it, because it cannot;
 - `memory_list_spaces` — your reachable namespaces (id, name, permission, alias);
 - `memory_create_space` / `memory_set_alias` / `memory_drop_alias` — make one,
   and give it a name of your own;
@@ -236,12 +257,35 @@ Only a genuinely multi-tenant endpoint (`open`/`managed`, **no** pinned token)
 exposes a `token` argument for the model to supply; force it either way with
 `MEMGRES_MCP_TOKEN_ARG=on|off`. In `single` mode no token is needed at all.
 
+### What a client is shown
+
+The tool list is answered per caller: a read-only token is not offered the write
+tools, a plain user does not see the control plane, and a `single`-mode
+deployment — which has no identities — does not advertise namespace, token and
+user management. Each tool is classified by the capability its service function
+already enforces, and those capabilities are the ones `whoami` reports, so the
+list cannot drift from the rules. On an http endpoint each client sees what its
+own token can use; on stdio the pinned token makes the answer constant.
+
+**This is display, not authorization.** Every tool authorizes on call: a client
+that ignores the list and calls a hidden tool is refused by the service layer,
+with a message about permission rather than "unknown tool" — otherwise a change
+of rights would look like a broken server, and the real check would have quietly
+moved into a display table. For the same reason an unclassified tool is shown
+rather than hidden. The list is computed when the client lists, so rights
+changed mid-session appear the next time it does; the call path re-authorizes
+every time regardless. `MEMGRES_MCP_TOOL_VISIBILITY=off` lists everything.
+
+A web panel gets the same answer in its own shape: `whoami` returns the
+capabilities, and the panel renders its controls from them — one computation,
+two interfaces.
+
 ## Sharing a namespace (request-access)
 
 Someone wants into a namespace they don't own:
 
 ```bash
-# requester asks for read on a namespace id
+# requester asks for read on a namespace id  →  202 {"status": "submitted"}
 curl -s $BASE/spaces/<space_id>/access-requests \
   -H "Authorization: Bearer $REQUESTER" -d '{"permission":"read"}'
 
@@ -252,6 +296,13 @@ curl -s $BASE/access-requests/<req_id>/approve  -H "Authorization: Bearer $ADMIN
 
 After approval the requester's tokens reach the shared space **by id**, at the
 granted permission.
+
+The requester's receipt says only that the request was submitted. It carries no
+request id — deciding belongs to whoever administers the namespace, who reads
+ids from the listing — and a namespace that does not exist answers exactly like
+one the requester cannot reach, so the route cannot be used to find out which
+uuids are real. Already reaching it is reported plainly (`already_reachable`):
+that is the caller's own access, which `/spaces` shows them anyway.
 
 ## First admin — bootstrap (managed mode)
 

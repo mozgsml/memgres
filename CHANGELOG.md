@@ -51,6 +51,23 @@ patch = fixes).
   Neither had been caught by the existing matrix, which only ever pointed weak
   credentials at a plain-`user` account — where the role check refuses anyway.
 
+- **The history hash was not injective over tags.** `['a','b']` and `['a,b']`
+  produced the same digest, because the tag list was joined with commas inside
+  an otherwise `\x1f`-separated field list. Anyone able to write the table could
+  therefore rewrite what a memory says about itself — tags are not decoration
+  here, recall can be scoped to them — and `verify_history` would still call the
+  chain intact. Tags now fold through the same domain-separated construction as
+  title and author. Stored rows are **not** rehashed: that would rewrite the
+  record whose immutability is the entire point, so each row records the recipe
+  it was written with (`memory_history.hash_version`, schema v14) and is
+  verified against that one. A chain spanning the upgrade verifies end to end,
+  and relabelling a row to dodge the stronger recipe fails, because the two
+  place the tags differently. The `source`/`reason` case was never affected.
+- **`request_access` was a namespace existence oracle.** An unreachable
+  namespace produced a request and a nonexistent one a foreign-key error, so the
+  difference told an outsider which uuids are real — independent of any access
+  they had. Both answers are now identical.
+
 ### Removed
 - **The default namespace.** `app_user.default_namespace_id` answered "where does
   an unaddressed write land", and a better mechanism already existed: a
@@ -174,6 +191,24 @@ patch = fixes).
   ability, and taking it away silently would break their writes.
 - Directory reads for the control plane: `list_users` (paginated, filterable by
   role), `list_namespaces`, `list_members`, `token_owner`.
+- **An MCP client is shown the tools it can actually use.** Every client used to
+  see all 33: a read-only agent was offered five write tools, a plain user the
+  whole control plane, and a `single`-mode deployment — which has no identities —
+  advertised namespace, token and user management. The list is answered per
+  request, so an http endpoint shows each client what its own token can use;
+  stdio, with its pinned token, gets a constant answer. Each tool is classified
+  by the capability its service function already enforces, and the capabilities
+  come from `admin.capabilities()` — the same predicates that do the enforcing,
+  so what is displayed cannot drift from what is allowed. **It is not an
+  authorization boundary:** every tool still authorizes on call, and a client
+  that calls a hidden one is refused there, with a message about permission
+  rather than "unknown tool". An unclassified tool is shown rather than hidden,
+  since a vanished tool is the failure nobody notices. Turn it off with
+  `MEMGRES_MCP_TOOL_VISIBILITY=off`.
+- **`space="*"`** — every namespace in the deployment, for a superadmin. The
+  explicit counterpart to `all` no longer answering for that role (below). It
+  adds no reach: the same role already opens any namespace by `space_id`, one
+  call at a time. A token scoped to one namespace stays scoped.
 
 ### Changed
 - **A subtree move is now recorded on every node it moves.** Moving a node
@@ -197,6 +232,14 @@ patch = fixes).
 - `admin.py` takes a `Principal`, never a token: authentication belongs to the
   transport, authorization to the service. A future web login is then one more
   authenticator producing the same `Principal`, with no change to the core.
+- **`whoami` reports what THIS credential may do, not what the role could.** A
+  superadmin holding a scoped or read-only token cannot provision with it, and
+  the old answer said it could — sending a caller, or a UI rendering itself from
+  the answer, at doors that refuse them. Two new keys separate the halves of
+  "admin" that are actually independent: `has_admin_ceiling` (this credential)
+  and `can_administer_deployment` (the role *and* an unscoped admin credential).
+  `can_write` and `can_manage_own_tokens` join them; `is_admin` stays the plain
+  role fact, since per-namespace authorization consults the role.
 
 ### Breaking
 - **Reaching several namespaces and naming none is an error**, for reads and
@@ -239,22 +282,28 @@ patch = fixes).
   any address on a plain-user account, so an address can be claimed before its
   owner has one. Harmless while email is a label; whatever adds email login must
   add ownership verification in the same change.
+- **`space="all"` is refused for a superadmin** when it would answer with less
+  than that credential can read — that is, when namespaces exist outside its
+  memberships. For every other caller `all` is unchanged, because for them it
+  genuinely is everything. The refusal names what `all` would have covered and
+  offers `space="*"`. Widening the word instead would have pulled other tenants
+  into a routine agent search; leaving it was the silent partial answer this
+  project weighs as heavily as a leak. There is deliberately no second word for
+  "the ones I belong to": namespace names are free text and the obvious
+  candidates are names people use — `mine` shadowed a namespace in this repo's
+  own tests on the first attempt.
+- **`POST /spaces/{id}/access-requests` answers `202` with `{"status": …}`**,
+  not `201` with the request id. The id is gone because the requester has no use
+  for it — deciding belongs to whoever administers the namespace, who reads ids
+  from `list_requests` — and because returning one is half of what made the
+  route an existence oracle. `already_reachable` is still reported: that is the
+  caller's own access, which `list_spaces` shows them anyway.
+- **`whoami` capabilities gained keys and changed meaning** (see Changed).
+  Anything asserting the exact three-key dict will notice.
 
 ### Known, deliberately not changed here
-- **`space="all"` means "every namespace you are a member of"**, which for a
-  *superadmin* — who reaches any namespace by id — is less than the credential
-  can reach. Widening it would quietly pull other tenants' data into a routine
-  search, and narrowing it later would be breaking; the operator should decide,
-  so for now it is written down rather than changed.
-- **Tag sets are joined with `,` inside the history row hash**, so `['a','b']`
-  and `['a,b']` hash alike: someone with direct database access could rewrite a
-  tag set without `verify_history` noticing. Fixing it changes how every row
-  hashes and would invalidate existing chains, so it belongs in a release that
-  can carry that migration. The `source`/`reason` case is *not* affected — the
-  fixed field arity makes a repartition change the digest.
-- **`request_access` distinguishes an unreachable namespace from a nonexistent
-  one** (201 vs a foreign-key failure), which is a uuid existence oracle. It
-  requires guessing a uuid to exploit.
+- `email` is unique but **not verified** — see the note under Breaking. Whatever
+  adds email login must add ownership verification in the same change.
 
 ## [0.5.2] — 2026-08-24
 
