@@ -92,6 +92,12 @@ have meant, and you pick — or say `all`.
 (If you happen to own a namespace literally named `all`, the keyword is refused
 as ambiguous rather than guessed at; address that one by `space_id`.)
 
+One asymmetry worth knowing: `all` means *every namespace you are a member or
+owner of*. A **superadmin** additionally reaches any namespace by id, so for that
+one caller `all` covers less than the credential could — deliberately, since a
+routine search should not sweep other tenants' data into a context by default.
+Address those by `space_id`.
+
 ## Addressing a memory
 
 Within a namespace a memory has two addresses: its **id** (a uuid) and its
@@ -282,12 +288,27 @@ authorizes when it is called.
 
 ### Who may act on whom
 
+**Authority is the role AND the token, never just the role.** A deployment-wide
+control-plane act needs an *unscoped, admin-ceiling* token; a per-namespace one
+refuses a token scoped to a different namespace. So handing an agent a read-only
+or namespace-pinned token really does narrow it, even when the account behind it
+is an admin — otherwise the agent could simply issue itself a better credential.
+
 A `user_manager` provisions ordinary accounts: it may act on accounts holding the
 plain `user` role, and nothing else. Issuing, revoking or listing tokens for an
 account that holds an admin role requires `superadmin` — without that rule, a
 `user_manager` could mint a token for a superadmin's account and become data-root
 in one request. The last superadmin also cannot be demoted or have their last
 token revoked, since that would leave the control plane with nobody in charge.
+
+### The default namespace is a preference, not a grant
+
+A user's default namespace says where their unqualified writes land. It is chosen
+from namespaces they can **already** reach: setting it requires that the caller
+administer the namespace and that the target be a member or owner. Resolving a
+default that is no longer reachable (namespace deleted, membership revoked) is
+treated as *unset* rather than fatal, so a stale pointer never bricks an account
+— and never grants one anything either.
 
 ### Creating namespaces
 

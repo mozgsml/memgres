@@ -21,7 +21,41 @@ patch = fixes).
   touching an admin-role account requires superadmin. Not exploitable in a
   single-user deployment; live from the first account anyone provisions.
 
+- **A weakened credential still opened the control plane.** A role says who
+  someone IS; a token says what THIS credential may do. The gates consulted only
+  the role, so the recommended way to hand an agent a narrow credential — a
+  read-only, namespace-scoped token — protected nothing whenever the account
+  behind it held an admin role: the weak token opened provisioning and issued
+  itself an unscoped admin one. The data plane honoured the pin the whole time,
+  which is exactly what made it look safe. Deployment-wide acts now require an
+  unscoped, admin-ceiling token; per-namespace acts refuse a token scoped
+  elsewhere.
+- **A default namespace was an authority rather than a preference.** Resolving
+  `default_namespace_id` returned `admin` on it with no reachability check, and
+  the new `set_default_space` let a `user_manager` aim that pointer anywhere — so
+  the tier defined as "hands out access without gaining it" could mint a
+  throwaway user, point it at any namespace on the deployment, and read, write and
+  irreversibly erase there with no membership row anywhere. Setting a default now
+  requires that the caller administer the namespace and that the target already
+  reach it; resolving one that is not reachable falls through to the
+  reachable-set logic instead of granting, so a stale pointer degrades to "unset"
+  rather than bricking an account.
+- **Result size is bounded on the search path too.** `k` went straight into
+  `LIMIT`, so one call could ask for a whole namespace and — with
+  `full_body=true` — be answered with it, plus a `ts_headline` over every row.
+  Search now clamps to the same ceiling browse always used.
+- `memory_issue_token(space=…)` created a namespace unconditionally, walking past
+  the right that governs creation everywhere else.
+- Both control-plane findings were demonstrated end to end against a live
+  deployment, and both fixes are pinned by tests verified to fail without them.
+  Neither had been caught by the existing matrix, which only ever pointed weak
+  credentials at a plain-`user` account — where the role check refuses anyway.
+
 ### Added
+- **HTTP routes for six operations the service layer already offered** —
+  `set_role`, `set_default_space`, `edit_namespace` and the three directory reads
+  were reachable over MCP only, which left a web panel unable to do half the
+  provisioning it would show.
 - **The control plane is reachable over MCP.** Twelve `memory_admin_*` tools plus
   `memory_whoami`, over the same service layer the HTTP admin routes use — so an
   operator working through an MCP client is no longer forced onto curl. Three
@@ -130,6 +164,22 @@ patch = fixes).
   Subtrees moved by an earlier version left no trail — the bulk update wrote none
   — and it cannot be reconstructed: after several moves the current shape of the
   tree does not determine the addresses a node held before.
+
+### Known, deliberately not changed here
+- **`space="all"` means "every namespace you are a member of"**, which for a
+  *superadmin* — who reaches any namespace by id — is less than the credential
+  can reach. Widening it would quietly pull other tenants' data into a routine
+  search, and narrowing it later would be breaking; the operator should decide,
+  so for now it is written down rather than changed.
+- **Tag sets are joined with `,` inside the history row hash**, so `['a','b']`
+  and `['a,b']` hash alike: someone with direct database access could rewrite a
+  tag set without `verify_history` noticing. Fixing it changes how every row
+  hashes and would invalidate existing chains, so it belongs in a release that
+  can carry that migration. The `source`/`reason` case is *not* affected — the
+  fixed field arity makes a repartition change the digest.
+- **`request_access` distinguishes an unreachable namespace from a nonexistent
+  one** (201 vs a foreign-key failure), which is a uuid existence oracle. It
+  requires guessing a uuid to exploit.
 
 ## [0.5.2] — 2026-08-24
 
