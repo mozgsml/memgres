@@ -21,6 +21,7 @@ is built once and shared. Requires the `[server]` extra (fastapi, uvicorn,
 psycopg_pool).
 """
 
+import uuid
 from typing import List, Optional
 
 import psycopg
@@ -168,11 +169,23 @@ def create_app(cfg: Optional[Config] = None):
     def _ref(mid: str) -> dict:
         """Turn the URL's memory segment into the store's address argument.
 
-        It may be a uuid or a tree path, and the two cannot be confused: an ltree
-        label is `[A-Za-z0-9_]`, so a path never contains the dashes a uuid
-        always has. One route set therefore serves both addresses, instead of a
-        parallel `/by-path/...` tree that would have to be kept in step."""
-        return {"id": mid} if "-" in mid else {"at": mid}
+        It may be a memory's uuid or its tree path, so one route set serves both
+        instead of a parallel `/by-path/...` tree that would have to be kept in
+        step. The test is whether the segment PARSES as a uuid — not whether it
+        looks unlike a path. Modern ltree labels accept hyphens and non-ASCII
+        (verified on PG 17), so `ops.rate-limits` is a perfectly ordinary path and
+        any "contains a dash ⇒ it's an id" shortcut would send it down the wrong
+        branch and answer 400.
+
+        A path that is itself uuid-shaped would be read as an id. That is a
+        deliberate, fixed precedence rather than a guess that changes with what
+        happens to exist.
+        """
+        try:
+            uuid.UUID(mid)
+        except ValueError:
+            return {"at": mid}
+        return {"id": mid}
 
     # ─── routes ─────────────────────────────────────────────────────────────
     @app.get("/healthz")

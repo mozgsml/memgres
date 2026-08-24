@@ -392,3 +392,18 @@ def test_creating_at_an_occupied_path_is_a_conflict(client):
     r = client.post("/memories", json={"body": "also\n", "path": "ops.a"})
     assert r.status_code == 409 and mid in r.text
     assert client.get(f"/memories/{mid}").json()["body"] == "mine\n"
+
+
+def test_a_hyphenated_path_is_still_a_path(client):
+    """ltree labels accept hyphens (and non-ASCII) on modern Postgres, so the
+    URL segment cannot be classified by "looks like it has a dash" — it is
+    classified by whether it parses as a uuid."""
+    mid = client.post("/memories", json={"body": "rate limits\n",
+                                         "path": "ops.rate-limits"}).json()["id"]
+    assert client.get("/memories/ops.rate-limits").json()["id"] == mid
+    assert client.patch("/memories/ops.rate-limits",
+                        json={"body": "two\n"}).status_code == 200
+
+    mid2 = client.post("/memories", json={"body": "unicode\n",
+                                          "path": "ops.тариф"}).json()["id"]
+    assert client.get("/memories/ops.тариф").json()["id"] == mid2
