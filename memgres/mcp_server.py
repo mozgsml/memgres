@@ -74,6 +74,7 @@ TOOL_VISIBILITY = {
     "memory_get": (),
     "memory_list": (),
     "memory_tags": (),
+    "memory_links": (),
     "memory_blame": (),
     "memory_history": (),
     "memory_server_info": (),
@@ -336,6 +337,9 @@ def build_server(cfg: Optional[Config] = None):
 
         `tags` labels it; `title` is a short curated caption (set whole,
         searchable via `memory_recall`); `source`/`reason` record provenance.
+        Link other memories from the body as `[[path]]` (or
+        `[[path#anchor|label]]`) — they become a real graph you can walk with
+        `memory_links`, including backwards.
 
         `valid_at` (YYYY-MM-DD) is the day this content was last known to be
         ACCURATE — not the day you wrote it. Set it when the fact comes from a
@@ -468,6 +472,27 @@ def build_server(cfg: Optional[Config] = None):
         with pool.connection() as conn:
             return _store(conn).tags(_token(ctx, token), prefix=prefix, k=k,
                                      space=space, space_id=space_id)
+
+    @mcp.tool()
+    def memory_links(id: Optional[str] = None, at: Optional[str] = None,
+                     direction: Literal["in", "out", "both"] = "both",
+                     space: Optional[str] = None, space_id: Optional[str] = None,
+                     token: Optional[str] = None, ctx: Context = None) -> dict:
+        """What this memory links to, and WHAT LINKS TO IT. Address it by `id` or
+        `at` (its path).
+
+        `in` is the half you cannot get by reading the memory: before you change
+        a fact, this is who is relying on it. `out` lists its `[[links]]` and is
+        where a DANGLING one shows up — `resolved: false` means the target has
+        not been written yet, or was erased.
+
+        Write a link as `[[path]]`, or `[[path#anchor|label]]`. Pointers at other
+        stores use a scheme (`[[idea:some-slug]]`); anything else in double
+        brackets is left as plain text."""
+        with pool.connection() as conn:
+            return _store(conn).links(_token(ctx, token), id=id or None,
+                                      at=at or None, direction=direction,
+                                      space=space, space_id=space_id)
 
     @mcp.tool()
     def memory_server_info(ctx: Context = None) -> dict:

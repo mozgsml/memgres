@@ -304,6 +304,17 @@ def create_app(cfg: Optional[Config] = None):
                 offset=offset, bodies=bodies, match_tags=match_tags,
                 space=space, space_id=space_id))
 
+    @app.get("/memories/{mid}/links")
+    def links(mid: str, direction: str = "both",
+              space: Optional[str] = None, space_id: Optional[str] = None,
+              tok: Optional[str] = Depends(token)):
+        """What this memory links to, and what links to it. Inbound is the half
+        the body cannot answer: who is relying on this fact."""
+        with pool.connection() as conn:
+            return _guard(lambda: _store(conn).links(
+                tok, **_ref(mid), direction=direction,
+                space=space, space_id=space_id))
+
     @app.get("/tags")
     def tags_in_use(prefix: Optional[str] = None, k: int = 50,
                     space: Optional[List[str]] = Query(

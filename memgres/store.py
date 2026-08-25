@@ -36,6 +36,7 @@ from .delimiters import write_warnings
 from .lines import parse_line_spec
 from .diffing import DiffConflict, apply_diff, byte_len, content_hash, make_diff
 from .embeddings import Embedder, get_embedder
+from .links import parse_links
 from .tags import check_tag_match, normalize_tags
 from .vector import make_backend
 
@@ -696,6 +697,8 @@ class Store:
         # store create as a diff-from-empty so the whole history is a self-contained
         # chain (empty → current), replayable forward for reconstruct/annotate. A
         # non-empty title at creation is audited (title_before None → title_after).
+        self._sync_links(cur, ns, str(mid), body)
+        self._bind_pending_links(cur, ns, str(mid), path)
         self._append_history(str(mid), 1, "create", make_diff("", body), None, chash,
                              None, path, None, tags, source, reason, author,
                              title_after=(title or None), valid_at=valid_at)
@@ -858,6 +861,12 @@ class Store:
              new_title, self.cfg.fts_language, new_title,
              (body_changed and self._vectors is not None), id])
         new_seq, created_at, updated_at, expires_at = cur.fetchone()
+        if body_changed:
+            self._sync_links(cur, ns, str(id), new_body)
+        if path_changed:
+            # The memory's own edges are pinned by id and follow it; what needs
+            # attention is edges that were WAITING for the path it just took.
+            self._bind_pending_links(cur, ns, str(id), new_path)
         if body_changed and self._vectors is not None:
             # only a body change re-chunks; path/tag/title edits leave vectors be.
             self._index_now(str(id), new_body, ns, new_hash)   # inline unless async
@@ -998,6 +1007,103 @@ class Store:
         for h in hits:
             h.space = names.get(h.namespace)
         return hits
+
+    # ─── links: the graph between memories ──────────────────────────────────
+    def _sync_links(self, cur, ns: str, memory_id: str,
+                    body: Optional[str]) -> None:
+        """Re-derive this memory's outgoing edges from its body.
+
+        Resolution is scoped to the memory's OWN namespace: `[[ops.x]]` written by
+        one tenant must never bind to another tenant's `ops.x`. Paths are not a
+        global address space, and an edge is a read path like any other.
+
+        Rewritten wholesale rather than diffed — the body is the source of truth
+        for its own links, and reconciling insert/update/delete against it would
+        be more code with more ways to drift."""
+        links = parse_links(body)
+        cur.execute("DELETE FROM memory_link WHERE src_id=%s", (memory_id,))
+        if not links:
+            return
+        wanted = [l.raw_target for l in links if l.scheme is None]
+        found: dict = {}
+        if wanted:
+            cur.execute(
+                "SELECT path::text, id FROM memory "
+                "WHERE namespace=%s AND path = ANY(%s::ltree[])", (ns, wanted))
+            found = {p: str(i) for p, i in cur.fetchall()}
+        cur.executemany(
+            "INSERT INTO memory_link (src_id, ord, dst_id, raw_target, label, "
+            "anchor, scheme) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            [(memory_id, l.ord,
+              found.get(l.raw_target) if l.scheme is None else None,
+              l.raw_target, l.label, l.anchor, l.scheme) for l in links])
+
+    def _bind_pending_links(self, cur, ns: str, memory_id: str,
+                            path: Optional[str]) -> None:
+        """Attach edges that were written pointing at `path` before anything lived
+        there. A link to something not yet written is a deliberate marker, so it
+        stays dangling until the target appears — and then it must actually bind,
+        or the marker was a lie."""
+        if not path:
+            return
+        cur.execute(
+            "UPDATE memory_link l SET dst_id=%s "
+            "FROM memory src "
+            "WHERE src.id = l.src_id AND src.namespace = %s "
+            "  AND l.dst_id IS NULL AND l.scheme IS NULL AND l.raw_target = %s",
+            (memory_id, ns, path))
+
+    def links(self, token: Optional[str], id: Optional[str] = None, *,
+              at: Optional[str] = None, direction: str = "both",
+              space=None, space_id=None) -> dict:
+        """This memory's links: `out` (what it points at) and/or `in` (what points
+        at it). Returns ``{"out": [...], "in": [...]}``.
+
+        Inbound is the half a body cannot answer: "who relies on this?" is the
+        question that matters when a fact changes, and reading the memory itself
+        never tells you. Outbound is here too because it is where a DANGLING edge
+        shows up — a link whose target was never written, or has since been
+        erased."""
+        if direction not in ("in", "out", "both"):
+            raise ValueError(
+                f"direction must be 'in', 'out' or 'both' (got {direction!r})")
+        # One memory is addressed, so this authorizes like `get`/`history` (a
+        # single namespace) rather than like `recall` (a set). That is also
+        # exactly the right scope for the inbound half: an edge is only ever
+        # bound within its source's namespace, so every backlink to this memory
+        # lives in this namespace by construction.
+        ns, _ = self._authorize(token, space=space, space_id=space_id,
+                                need="read")
+        mid, _moved = self._address(ns, id, at, follow=True)
+        cur = self._conn.cursor()
+        out: dict = {}
+        if direction in ("out", "both"):
+            cur.execute(
+                "SELECT l.ord, l.raw_target, l.label, l.anchor, l.scheme, "
+                "       l.dst_id::text, m.path::text, m.title "
+                "FROM memory_link l LEFT JOIN memory m ON m.id = l.dst_id "
+                "WHERE l.src_id = %s ORDER BY l.ord", (mid,))
+            out["out"] = [
+                {"target": r[1], "label": r[2], "anchor": r[3], "scheme": r[4],
+                 "id": r[5], "path": r[6], "title": r[7],
+                 "resolved": r[5] is not None}
+                for r in cur.fetchall()]
+        if direction in ("in", "both"):
+            # The namespace predicate is re-applied rather than trusted to the
+            # binding rule — a backlink names a memory, and naming one from a
+            # namespace the caller cannot read would leak that it exists, where
+            # it lives and what it is called. Same defence in depth as
+            # `fetch_hit_rows` re-checking every vector candidate.
+            cur.execute(
+                "SELECT src.id::text, src.path::text, src.title, l.label, l.anchor "
+                "FROM memory_link l JOIN memory src ON src.id = l.src_id "
+                "WHERE l.dst_id = %s AND src.namespace = %s "
+                "  AND (src.expires_at IS NULL OR src.expires_at > now()) "
+                "ORDER BY src.path, src.id", (mid, ns))
+            out["in"] = [{"id": r[0], "path": r[1], "title": r[2],
+                          "label": r[3], "anchor": r[4]}
+                         for r in cur.fetchall()]
+        return out
 
     # ─── tags: the vocabulary actually in use ───────────────────────────────
     def tags(self, token: Optional[str], *, prefix: Optional[str] = None,

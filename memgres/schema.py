@@ -18,7 +18,7 @@ from pathlib import Path
 from .config import Config
 
 # The version this build migrates the database TO (the latest migration it carries).
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 # The compatibility FLOOR: the schema version of the most recent backward-
 # INCOMPATIBLE migration — one that changed the shape/semantics old code relied on
@@ -63,6 +63,10 @@ SCHEMA_VERSION = 17
 #     client that can reach such a row already knows the dimension. Shipping an
 #     optional dimension separately from a floor bump would NOT be safe: that is
 #     the case where an older reader calls an untouched chain tampered.
+#   v18 (0017): added the memory_link table → additive, floor stays 16. An older
+#     client neither writes nor reads it; the edges it fails to record simply go
+#     missing until something re-writes those bodies, which costs completeness of
+#     a new feature, not correctness of an old one.
 SCHEMA_BREAKING_VERSION = 16
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are
