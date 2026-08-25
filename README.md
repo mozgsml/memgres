@@ -170,8 +170,9 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_MAX_BODY_BYTES` | `262144` | ceiling for a whole record body (256 KB) |
 | `MEMGRES_MAX_WRITE_BYTES` | `16384` | ceiling for one write/diff payload (≤ body) |
 | `MEMGRES_MAX_SOURCE_BYTES` / `_MAX_REASON_BYTES` | `2048` / `1024` | ceilings for a write's `source` / `reason` provenance |
-| `MEMGRES_RETENTION_DAYS` | `0` | `0` = keep forever (TTL off); `>0` = expire N days after last touch |
+| `MEMGRES_RETENTION_DAYS` | `0` | how long data is kept: `0` = forever (off); `>0` = expire N days after last touch. Operator-only — there is no per-write TTL, so a caller cannot lengthen or clear the window |
 | `MEMGRES_RENEW_ON_READ` | `true` | a read pushes the expiry clock forward |
+| `MEMGRES_RETENTION_SWEEP_INTERVAL` | `3600` | seconds between sweeps that DELETE expired rows (and their vectors). Only runs when `RETENTION_DAYS > 0` |
 | `MEMGRES_KEY_MODE` | `single` | `single` (no auth, one space) · `open` (bring-your-own token, self-registers) · `managed` (admin-provisioned). See [docs/TENANCY.md](docs/TENANCY.md) |
 | `MEMGRES_ADMIN_TOKEN` | — | global admin bearer for provisioning (managed mode) |
 | `MEMGRES_TOKEN` | — | default token used when a call passes none (single-tenant endpoints) |

@@ -401,9 +401,22 @@ class Store:
                     (list(ns_ids),))
         return {str(r[0]): r[1] for r in cur.fetchall()}
 
-    def _expiry_sql(self, ttl_days: Optional[int]) -> str:
-        days = ttl_days if ttl_days is not None else self.cfg.retention_days
-        return "NULL" if not days or days <= 0 else f"now() + interval '{int(days)} days'"
+    def _expiry_sql(self) -> str:
+        """The ``expires_at`` every write stamps, from the DEPLOYMENT's retention
+        policy alone.
+
+        There is deliberately no per-write override. Retention is the operator's
+        promise about how long a client's data is kept, so a caller must not be
+        able to lengthen it — and the `ttl_days` argument this replaced could, in
+        three separate ways: `0` was read as "keep forever", a large value simply
+        outran the policy, and an edit that merely omitted it silently cleared an
+        expiry already set. Deriving the value from config alone makes all three
+        impossible by construction rather than by validation.
+
+        `retention_days <= 0` means the deployment keeps everything; that is the
+        operator's choice too, and it is the default."""
+        days = self.cfg.retention_days
+        return "NULL" if days <= 0 else f"now() + interval '{int(days)} days'"
 
     def _check_parent(self, cur, ns: str, path: Optional[str]):
         """When MEMGRES_REQUIRE_PARENT is on, a non-root node's parent path must
@@ -437,7 +450,7 @@ class Store:
               body: Optional[str] = None, diff: Optional[str] = None,
               base_hash: Optional[str] = None, path: Optional[str] = None,
               tags: Optional[Sequence[str]] = None, source: Optional[str] = None,
-              reason: Optional[str] = None, ttl_days: Optional[int] = None,
+              reason: Optional[str] = None,
               title: Optional[str] = None,
               replace: Optional[Sequence[str]] = None, replace_all: bool = False,
               space: Optional[str] = None, space_id: Optional[str] = None) -> Memory:
@@ -470,12 +483,12 @@ class Store:
             if id is None and at is None:
                 self._check_path_free(ns, path, if_moved)
                 m = self._create(ns, author, body, path, tags, source, reason,
-                                 ttl_days, title)
+                                 title)
             else:
                 id, moved_from = self._address(ns, id, at,
                                                follow=if_moved == "follow")
                 m = self._update(ns, author, id, body, diff, base_hash, path,
-                                 tags, source, reason, ttl_days, title=title,
+                                 tags, source, reason, title=title,
                                  replace=replace, replace_all=replace_all)
                 m.moved_from = moved_from
             # Checked on the STORED body, not the request: a substring edit or a
@@ -553,7 +566,7 @@ class Store:
                 f"title is {byte_len(title)}B > MEMGRES_MAX_TITLE_BYTES "
                 f"{self.cfg.max_title_bytes}")
 
-    def _create(self, ns, author, body, path, tags, source, reason, ttl_days,
+    def _create(self, ns, author, body, path, tags, source, reason,
                 title=None) -> Memory:
         if body is None:
             raise ValueError("create needs a body (diffs apply to an existing memory)")
@@ -571,7 +584,7 @@ class Store:
                 VALUES (%s, %s, %s, %s, %s::ltree,
                         to_tsvector(%s::regconfig, %s),
                         %s, to_tsvector(%s::regconfig, %s),
-                        1, %s, {self._expiry_sql(ttl_days)})
+                        1, %s, {self._expiry_sql()})
                 RETURNING id, created_at, updated_at, expires_at""",
             [ns, body, chash, tags, path, self.cfg.fts_language, body,
              title, self.cfg.fts_language, title, pending],
@@ -668,7 +681,7 @@ class Store:
         return cur_body, None             # metadata-only
 
     def _update(self, ns, author, id, body, diff, base_hash, path, tags,
-                source, reason, ttl_days, *, title=None,
+                source, reason, *, title=None,
                 replace=None, replace_all=False) -> Memory:
         cur = self._conn.cursor()
         cur_body, cur_hash, cur_tags, cur_path, seq, cur_title = self._load(cur, ns, id)
@@ -696,7 +709,7 @@ class Store:
             else:
                 # pure touch: renew TTL, no history row
                 cur.execute(
-                    f"UPDATE memory SET updated_at=now(), expires_at={self._expiry_sql(ttl_days)} "
+                    f"UPDATE memory SET updated_at=now(), expires_at={self._expiry_sql()} "
                     "WHERE id=%s", (id,))
                 touched = self.get(None, id, _ns=ns, renew=False)
                 touched.created = False
@@ -730,7 +743,7 @@ class Store:
                     title=%s, title_fts=to_tsvector(%s::regconfig, %s),
                     seq=seq+1, updated_at=now(),
                     embed_pending=(embed_pending OR %s),
-                    expires_at={self._expiry_sql(ttl_days)}
+                    expires_at={self._expiry_sql()}
                 WHERE id=%s
                 RETURNING seq, created_at, updated_at, expires_at""",
             [new_body, new_hash, new_tags, new_path,
@@ -1075,7 +1088,7 @@ class Store:
         if renew and self.cfg.renew_on_read and self.cfg.retention_days > 0:
             with self._conn.transaction():
                 cur.execute(
-                    f"UPDATE memory SET expires_at={self._expiry_sql(None)} WHERE id=%s",
+                    f"UPDATE memory SET expires_at={self._expiry_sql()} WHERE id=%s",
                     (id,))
         m = Memory(str(row[0]), row[1], row[2], list(row[3]), row[4], row[5],
                    row[6], row[7], row[8], row[9], moved_from=moved_from)
@@ -1197,8 +1210,24 @@ class Store:
         return deleted
 
     def purge_expired(self) -> int:
+        """Delete the memories whose retention window has closed; returns how many.
+
+        ``build_filters`` already hides expired rows from every read, so this is
+        not what makes them invisible — it is what makes them GONE, and the two
+        are not interchangeable. A retention promise is about no longer HOLDING
+        the data; a row that is merely filtered out of results is still held.
+
+        Chunk vectors go with them, exactly as in :meth:`forget`. pgvector
+        cascades on the foreign key, but qdrant is an out-of-band collection:
+        skip this and its points outlive the memory, keep taking candidate slots
+        in every search, and are then dropped when ``fetch_hit_rows`` finds no
+        row behind them — recall quietly thinning out rather than an error."""
         with self._conn.transaction():
             cur = self._conn.cursor()
             cur.execute("DELETE FROM memory WHERE expires_at IS NOT NULL "
-                        "AND expires_at < now()")
-            return cur.rowcount
+                        "AND expires_at < now() RETURNING id, namespace")
+            gone = [(str(r[0]), r[1]) for r in cur.fetchall()]
+        if gone and self._vectors is not None:
+            for mid, ns in gone:
+                self._vectors.delete_chunks(self._conn, mid, ns)
+        return len(gone)

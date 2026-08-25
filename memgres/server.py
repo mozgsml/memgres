@@ -74,7 +74,6 @@ def create_app(cfg: Optional[Config] = None):
         title: Optional[str] = None
         source: Optional[str] = None
         reason: Optional[str] = None
-        ttl_days: Optional[int] = None
         space: Optional[str] = None          # namespace name (your own)
         space_id: Optional[str] = None       # namespace id (canonical; shared spaces)
         if_moved: str = "error"              # a vacated `path`: refuse, or "create"
@@ -96,7 +95,6 @@ def create_app(cfg: Optional[Config] = None):
         title: Optional[str] = None
         source: Optional[str] = None
         reason: Optional[str] = None
-        ttl_days: Optional[int] = None
         space: Optional[str] = None
         space_id: Optional[str] = None
         if_moved: str = "error"              # a stale address: refuse, or "follow"
@@ -194,7 +192,7 @@ def create_app(cfg: Optional[Config] = None):
         with pool.connection() as conn:
             m = _guard(lambda: _store(conn).write(
                 tok, body=req.body, path=req.path, tags=req.tags, title=req.title,
-                source=req.source, reason=req.reason, ttl_days=req.ttl_days,
+                source=req.source, reason=req.reason,
                 if_moved=req.if_moved, space=req.space, space_id=req.space_id))
             return _mem(m)
 
@@ -224,7 +222,7 @@ def create_app(cfg: Optional[Config] = None):
                 replace_all=req.replace_all,
                 path=req.path, tags=req.tags, title=req.title,
                 source=req.source, reason=req.reason,
-                ttl_days=req.ttl_days, space=req.space, space_id=req.space_id))
+                space=req.space, space_id=req.space_id))
             return _mem(m)
 
     @app.post("/memories/{mid}/move")

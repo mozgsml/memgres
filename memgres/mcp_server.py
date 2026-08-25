@@ -299,7 +299,6 @@ def build_server(cfg: Optional[Config] = None):
                      path: Optional[str] = None, tags: Optional[List[str]] = None,
                      title: Optional[str] = None,
                      source: Optional[str] = None, reason: Optional[str] = None,
-                     ttl_days: Optional[int] = None,
                      space: Optional[str] = None, space_id: Optional[str] = None,
                      token: Optional[str] = None, ctx: Context = None) -> dict:
         """Create or edit a memory.
@@ -345,7 +344,7 @@ def build_server(cfg: Optional[Config] = None):
                 if_moved=if_moved, body=body, diff=diff,
                 base_hash=base_hash, replace=replace, replace_all=replace_all,
                 path=path, tags=tags, title=title, source=source,
-                reason=reason, ttl_days=ttl_days, space=space, space_id=space_id))
+                reason=reason, space=space, space_id=space_id))
 
     @mcp.tool()
     def memory_get(id: Optional[str] = None, at: Optional[str] = None,
