@@ -56,6 +56,18 @@ class TooLarge(ValueError):
     """A write or resulting body exceeds the configured ceiling."""
 
 
+class MissingTitle(ValueError):
+    """A write stored content without a caption, and the deployment requires one
+    (``MEMGRES_REQUIRE_TITLE``, default on).
+
+    Raised BEFORE the write, so the caller retries with a title rather than
+    leaving a memory it cannot address later. An untitled memory is not broken,
+    it is merely poorer: nothing captions it in a result list, and title-weighted
+    ranking has nothing to weigh. Enforcing it at the moment content is written
+    is also what migrates an existing corpus — each memory gains a title the next
+    time someone actually edits it, with no bulk pass."""
+
+
 class NoParent(ValueError):
     """MEMGRES_REQUIRE_PARENT is on and the node's parent path doesn't exist."""
 
@@ -560,6 +572,24 @@ class Store:
                 f"reason is {byte_len(reason)}B > MEMGRES_MAX_REASON_BYTES "
                 f"{self.cfg.max_reason_bytes}")
 
+    def _require_title(self, title: Optional[str], path: Optional[str],
+                       body: Optional[str]) -> None:
+        """Refuse content with no caption, naming enough of the memory that the
+        caller can write one without re-reading it.
+
+        Checked only where content is STORED — a create, or an edit that changes
+        the body. Re-addressing (`move`) and relabelling (`retag`) leave the
+        content alone, and demanding a caption there would make an untitled
+        memory unmovable, which is friction unrelated to the point."""
+        if not self.cfg.require_title or (title or "").strip():
+            return
+        first = ((body or "").strip().splitlines() or [""])[0][:120]
+        where = f" at '{path}'" if path else ""
+        raise MissingTitle(
+            f"this memory{where} has no title — give `title` a short caption "
+            f"(it is what names the memory in results and what title search "
+            f"matches). Its first line is: {first!r}")
+
     def _check_title_size(self, title: Optional[str]):
         if title is not None and byte_len(title) > self.cfg.max_title_bytes:
             raise TooLarge(
@@ -568,6 +598,7 @@ class Store:
 
     def _create(self, ns, author, body, path, tags, source, reason,
                 title=None) -> Memory:
+        self._require_title(title, path, body)
         if body is None:
             raise ValueError("create needs a body (diffs apply to an existing memory)")
         self._check_write_size(body)
@@ -716,6 +747,7 @@ class Store:
                 return touched
 
         if body_changed:
+            self._require_title(new_title, new_path, new_body)
             self._check_body_size(new_body)
 
         if path_changed:

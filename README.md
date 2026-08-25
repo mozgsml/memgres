@@ -177,6 +177,7 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_ADMIN_TOKEN` | — | global admin bearer for provisioning (managed mode) |
 | `MEMGRES_TOKEN` | — | default token used when a call passes none (single-tenant endpoints) |
 | `MEMGRES_TREE` | `true` | `ltree` path column + GiST index (fast subtree select) |
+| `MEMGRES_REQUIRE_TITLE` | `true` | `true` = a write that stores content must supply `title`. Captions are what name a memory in results and what title-weighted ranking weighs; `move`/`retag` are exempt (they store no content) |
 | `MEMGRES_REQUIRE_PARENT` | `false` | `true` = a node's parent path must already exist |
 | `MEMGRES_HISTORY` | `true` | keep the hash-chained diff history (deleted with the record) |
 | `MEMGRES_FTS_LANGUAGE` | `simple` | Postgres FTS dictionary (`simple`/`english`/…) |
