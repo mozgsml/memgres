@@ -106,7 +106,8 @@ def as_namespaces(ns) -> List[str]:
     return [str(n) for n in ns]
 
 
-def build_filters(ns, tags: Optional[Sequence[str]], path_prefix: Optional[str]):
+def build_filters(ns, tags: Optional[Sequence[str]], path_prefix: Optional[str],
+                  tags_match: str = "all"):
     """Return (sql_fragment, params) for the shared WHERE tail.
 
     ``ns`` is one namespace id or several. The tenant predicate is ``= ANY`` in
@@ -118,8 +119,12 @@ def build_filters(ns, tags: Optional[Sequence[str]], path_prefix: Optional[str])
     sql = ["namespace = ANY(%s)", "(expires_at IS NULL OR expires_at > now())"]
     params: list = [as_namespaces(ns)]
     if tags:
-        sql.append("tags @> %s")           # row must contain all requested tags
-        params.append(list(tags))
+        from ..tags import check_tag_match, normalize_tags
+        # Normalised on BOTH sides — a filter written `X402` has to find a row
+        # stored as `x402`, and neither side can be trusted to have done it.
+        op = "@>" if check_tag_match(tags_match) == "all" else "&&"
+        sql.append(f"tags {op} %s")        # @> every requested tag · && any of them
+        params.append(normalize_tags(tags))
     if path_prefix:
         sql.append("path <@ %s::ltree")     # subtree of the prefix
         params.append(path_prefix)
@@ -128,7 +133,8 @@ def build_filters(ns, tags: Optional[Sequence[str]], path_prefix: Optional[str])
 
 def fetch_hit_rows(conn, ns, memory_ids: Sequence[str],
                    tags: Optional[Sequence[str]],
-                   path_prefix: Optional[str]) -> dict:
+                   path_prefix: Optional[str],
+                   tags_match: str = "all") -> dict:
     """Bodies (HIT_COLUMNS) for the given memory ids, applying the shared
     tag/tree/expiry/namespace filters in Postgres. Returns ``{id: row}`` for
     exactly the rows that pass — a candidate whose tags/subtree/expiry excludes it
@@ -136,7 +142,7 @@ def fetch_hit_rows(conn, ns, memory_ids: Sequence[str],
     lives here once."""
     if not memory_ids:
         return {}
-    where, params = build_filters(ns, tags, path_prefix)
+    where, params = build_filters(ns, tags, path_prefix, tags_match)
     sql = f"SELECT {HIT_COLUMNS} FROM memory WHERE {where} AND id = ANY(%s)"
     with conn.cursor() as cur:
         cur.execute(sql, params + [list(memory_ids)])
@@ -146,8 +152,8 @@ def fetch_hit_rows(conn, ns, memory_ids: Sequence[str],
 def grouped_chunk_search(conn, ns, k: int,
                          tags: Optional[Sequence[str]],
                          path_prefix: Optional[str],
-                         fetch_chunks: Callable[[int, List[str]], List[tuple]]
-                         ) -> List[Hit]:
+                         fetch_chunks: Callable[[int, List[str]], List[tuple]],
+                         tags_match: str = "all") -> List[Hit]:
     """Rank over chunk vectors and return at most ``k`` hits, one per memory (its
     best chunk), tag/tree/expiry filtered.
 
@@ -176,7 +182,8 @@ def grouped_chunk_search(conn, ns, k: int,
         if not best:
             exhausted = True     # everything returned was already excluded
             break
-        rows = fetch_hit_rows(conn, ns, list(best.keys()), tags, path_prefix)
+        rows = fetch_hit_rows(conn, ns, list(best.keys()), tags, path_prefix,
+                              tags_match)
         for memid, (sc, s, e) in best.items():
             seen.add(memid)
             row = rows.get(memid)
@@ -224,8 +231,8 @@ class VectorBackend(Protocol):
         ...
 
     def search(self, conn, cfg, query_vec: Sequence[float], k: int, ns: str,
-               tags: Optional[Sequence[str]], path_prefix: Optional[str]
-               ) -> List[Hit]:
+               tags: Optional[Sequence[str]], path_prefix: Optional[str],
+               tags_match: str = "all") -> List[Hit]:
         """Top-``k`` memories by best-chunk similarity, tag/tree/expiry filtered,
         each hit carrying its winning chunk's ``chunk_span``."""
         ...

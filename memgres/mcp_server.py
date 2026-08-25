@@ -73,6 +73,7 @@ TOOL_VISIBILITY = {
     "memory_recall": (),
     "memory_get": (),
     "memory_list": (),
+    "memory_tags": (),
     "memory_blame": (),
     "memory_history": (),
     "memory_server_info": (),
@@ -377,14 +378,17 @@ def build_server(cfg: Optional[Config] = None):
                       snippet: Optional[bool] = None,
                       full_body: Optional[bool] = None,
                       bodies: bool = True,
+                      match_tags: Optional[Literal["all", "any"]] = None,
                       space: Spaces = None, space_id: Spaces = None,
                       token: Optional[str] = None, ctx: Context = None) -> List[dict]:
         """Search memories — bodies AND curated titles, with a title match
         weighted higher. `mode`: lexical | semantic | hybrid | auto. `match`
         governs lexical word combination — defaults to OR-any (any query word
         matches, forgiving recall); set 'all' to require every word (narrow).
-        Optionally scope to a tag set (`tags`) or a subtree (`path_prefix`, e.g.
-        'ops.postgres'). Each hit carries a `snippet` plus `kind` and `lines`:
+        Optionally scope to a tag set (`tags` — `match_tags="all"`, the default,
+        needs every one; `"any"` needs at least one) or a subtree (`path_prefix`,
+        e.g. 'ops.postgres'). `memory_tags` lists the vocabulary in use, so you
+        can reuse an existing tag instead of inventing a near-duplicate. Each hit carries a `snippet` plus `kind` and `lines`:
         `kind="snippet"` is the most relevant slice (semantic/hybrid pick the
         best-matching segment, lexical uses ts_headline) with `lines`=[start,end];
         `kind="full"` means the snippet IS the whole body (short body, or
@@ -407,19 +411,21 @@ def build_server(cfg: Optional[Config] = None):
                         _token(ctx, token), query, k=k, tags=tags,
                         path_prefix=path_prefix, mode=mode, match=match,
                         snippet=snippet, full_body=full_body, bodies=bodies,
-                        space=space, space_id=space_id)]
+                        match_tags=match_tags, space=space, space_id=space_id)]
 
     @mcp.tool()
     def memory_list(path_prefix: Optional[str] = None,
                     tags: Optional[List[str]] = None, limit: int = 50,
-                    offset: int = 0, bodies: bool = False, space: Spaces = None,
-                    space_id: Spaces = None,
+                    offset: int = 0, bodies: bool = False,
+                    match_tags: Optional[Literal["all", "any"]] = None,
+                    space: Spaces = None, space_id: Spaces = None,
                     token: Optional[str] = None, ctx: Context = None) -> List[dict]:
         """BROWSE (enumerate) a subtree — NOT a search. Lists memories under
         `path_prefix` (e.g. survey all of 'decisions.*') ordered by path, with a
         short first-line `preview` of each. No query, no ranking; use
         `memory_recall` when you want relevance search. Optionally narrow by
-        `tags`; `limit`/`offset` paginate. `bodies=true` returns whole bodies
+        `tags` (`match_tags="all"` needs every one, `"any"` at least one);
+        `limit`/`offset` paginate. `bodies=true` returns whole bodies
         instead of previews — read a subtree in ONE call instead of a browse plus
         a fetch per row; it is capped in total, and rows past the cap come back
         with `body_omitted=true` rather than being silently dropped.
@@ -429,7 +435,22 @@ def build_server(cfg: Optional[Config] = None):
             return _store(conn).list(
                 _token(ctx, token), path_prefix=path_prefix, tags=tags,
                 limit=limit, offset=offset, bodies=bodies,
-                space=space, space_id=space_id)
+                match_tags=match_tags, space=space, space_id=space_id)
+
+    @mcp.tool()
+    def memory_tags(prefix: Optional[str] = None, k: int = 50,
+                    space: Spaces = None, space_id: Spaces = None,
+                    token: Optional[str] = None, ctx: Context = None) -> List[dict]:
+        """The tag vocabulary in use, most-used first: `{tag, count}`.
+
+        READ THIS BEFORE TAGGING A NEW MEMORY. Tags match exactly, so a label you
+        invent that already exists in another spelling becomes a second, unrelated
+        tag and neither filter finds both. `prefix` narrows (e.g. "ops"), `k`
+        caps the list. Tags are stored lowercased and Unicode-normalised, so case
+        and accent form are not what makes two tags different — wording is."""
+        with pool.connection() as conn:
+            return _store(conn).tags(_token(ctx, token), prefix=prefix, k=k,
+                                     space=space, space_id=space_id)
 
     @mcp.tool()
     def memory_server_info(ctx: Context = None) -> dict:

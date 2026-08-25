@@ -48,7 +48,7 @@ TITLE_WEIGHT = 2.0
 
 
 def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
-             match: Optional[str] = None) -> List[Hit]:
+             match: Optional[str] = None, tags_match: str = "all") -> List[Hit]:
     """Rank by the query against BOTH the body and the curated title.
 
     Titles used to be searchable only through a separate `find` tool, which meant
@@ -56,7 +56,7 @@ def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
     guess which to reach for — and an untitled corpus made the title half answer
     "nothing found" to everything. One query over both, with the title weighted."""
     tsq, qtext = _tsquery(cfg, match, query)
-    where, params = build_filters(ns, tags, path_prefix)
+    where, params = build_filters(ns, tags, path_prefix, tags_match)
     lang = cfg.fts_language
     sql = (
         f"SELECT {HIT_COLUMNS}, "
@@ -184,24 +184,27 @@ def recall(conn, cfg, embedder, ns, query: str, *, k: int = 10,
            tags: Optional[Sequence[str]] = None, path_prefix: Optional[str] = None,
            mode: str = "auto", match: Optional[str] = None,
            backend=None, snippet: Optional[bool] = None,
-           full_body: Optional[bool] = None, bodies: bool = True) -> List[Hit]:
+           full_body: Optional[bool] = None, bodies: bool = True,
+           tags_match: str = "all") -> List[Hit]:
     if mode == "auto":
         mode = "semantic" if backend else "lexical"
     if mode == "lexical":
-        hits = _lexical(conn, cfg, ns, query, k, tags, path_prefix, match)
+        hits = _lexical(conn, cfg, ns, query, k, tags, path_prefix, match,
+                        tags_match)
     elif mode == "semantic":
         if backend is None:
             raise RuntimeError(
                 "semantic recall needs an embedder (MEMGRES_EMBED_PROVIDER)")
         hits = backend.search(conn, cfg, embedder.embed_query(query), k, ns,
-                              tags, path_prefix)
+                              tags, path_prefix, tags_match)
     elif mode == "hybrid":
         if backend is None:
             raise RuntimeError(
                 "semantic recall needs an embedder (MEMGRES_EMBED_PROVIDER)")
-        lex = _lexical(conn, cfg, ns, query, k, tags, path_prefix, match)
+        lex = _lexical(conn, cfg, ns, query, k, tags, path_prefix, match,
+                       tags_match)
         sem = backend.search(conn, cfg, embedder.embed_query(query), k, ns,
-                             tags, path_prefix)
+                             tags, path_prefix, tags_match)
         hits = _rrf([sem, lex], k)
     else:
         raise ValueError(

@@ -184,24 +184,29 @@ def test_schema_version_tracks_the_migrations_on_disk():
     assert SCHEMA_VERSION == numbers[-1] + 1
 
 
-def test_a_client_that_predates_the_hash_recipe_is_locked_out(conn, monkeypatch):
-    """The floor's whole job, stated as behaviour rather than as a constant.
-    0013 changed what a stored `row_hash` MEANS, so a client from before it
-    recomputes v2 rows with the v1 recipe and calls an untouched chain tampered
-    — the kind of wrong answer that is worse than a refusal to start. (0011
-    dropped a column every 0.5.x read path selects, which is the other half.)"""
+def test_a_client_below_the_floor_is_locked_out(conn, monkeypatch):
+    """The floor's whole job, stated as behaviour rather than as a constant: one
+    version below it is refused, at it runs.
+
+    Every bump so far has been about a SILENT wrong answer rather than a crash,
+    which is why refusing to start is the lesser evil. 0011 dropped a column
+    every 0.5.x read path selects (that one does crash); 0013 changed what a
+    stored `row_hash` MEANS, so an older client recomputes v2 rows with the v1
+    recipe and calls an untouched chain tampered; 0015 normalised stored tags, so
+    an older client's filter for `X402` silently misses a row now stored as
+    `x402`."""
     from memgres import schema
-    from memgres.schema import SchemaMismatch, migrate
+    from memgres.schema import SCHEMA_BREAKING_VERSION, SchemaMismatch, migrate
 
     cfg = _fresh_full_schema(conn)                   # stamps the current floor
     conn.commit()
 
-    monkeypatch.setattr(schema, "SCHEMA_VERSION", 13)    # a pre-0013 build
+    monkeypatch.setattr(schema, "SCHEMA_VERSION", SCHEMA_BREAKING_VERSION - 1)
     with pytest.raises(SchemaMismatch, match="Update this client"):
         migrate(conn, cfg)
     conn.rollback()
 
-    monkeypatch.setattr(schema, "SCHEMA_VERSION", 14)    # the build that carries it
+    monkeypatch.setattr(schema, "SCHEMA_VERSION", SCHEMA_BREAKING_VERSION)
     migrate(conn, cfg)                                   # runs
     conn.rollback()
     conn.autocommit = True

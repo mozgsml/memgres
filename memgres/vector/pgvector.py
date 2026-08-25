@@ -53,7 +53,8 @@ class PgvectorBackend:
 
     # ─── grouped semantic ranking ─────────────────────────────────────────────
     def search(self, conn, cfg, query_vec: Sequence[float], k: int, ns,
-               tags: Optional[Sequence[str]], path_prefix: Optional[str]) -> List[Hit]:
+               tags: Optional[Sequence[str]], path_prefix: Optional[str],
+               tags_match: str = "all") -> List[Hit]:
         qv = _vec_literal(query_vec)
 
         def fetch_chunks(overfetch: int, exclude: List[str]):
@@ -76,4 +77,5 @@ class PgvectorBackend:
                 return [(str(r[0]), int(r[1]), int(r[2]), float(r[3]))
                         for r in cur.fetchall()]
 
-        return grouped_chunk_search(conn, ns, k, tags, path_prefix, fetch_chunks)
+        return grouped_chunk_search(conn, ns, k, tags, path_prefix, fetch_chunks,
+                                    tags_match)

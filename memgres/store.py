@@ -36,6 +36,7 @@ from .delimiters import write_warnings
 from .lines import parse_line_spec
 from .diffing import DiffConflict, apply_diff, byte_len, content_hash, make_diff
 from .embeddings import Embedder, get_embedder
+from .tags import check_tag_match, normalize_tags
 from .vector import make_backend
 
 
@@ -492,6 +493,10 @@ class Store:
                                          need="write", for_write=True)
             self._check_provenance_size(source, reason)
             self._check_title_size(title)
+            # One spelling per tag, decided here rather than in `_create` and
+            # `_update` separately — two normalisation sites is how a tag ends up
+            # stored one way and filtered another.
+            tags = normalize_tags(tags)
             if id is None and at is None:
                 self._check_path_free(ns, path, if_moved)
                 m = self._create(ns, author, body, path, tags, source, reason,
@@ -901,7 +906,8 @@ class Store:
                path_prefix: Optional[str] = None, mode: str = "auto",
                match: Optional[str] = None,
                snippet: Optional[bool] = None, full_body: Optional[bool] = None,
-               bodies: bool = True, space=None, space_id=None):
+               bodies: bool = True, match_tags: Optional[str] = None,
+               space=None, space_id=None):
         """Search bodies AND curated titles. ``space``/``space_id`` may name one
         namespace, several, or ``'all'`` — see :func:`identity.resolve_spaces`.
 
@@ -916,15 +922,31 @@ class Store:
         hits = _recall(self._conn, self.cfg, self.embedder, ns,
                        query, k=k, tags=tags, path_prefix=path_prefix, mode=mode,
                        match=match, backend=self._vectors,
-                       snippet=snippet, full_body=full_body, bodies=bodies)
+                       snippet=snippet, full_body=full_body, bodies=bodies,
+                       tags_match=check_tag_match(match_tags))
         for h in hits:
             h.space = names.get(h.namespace)
         return hits
+
+    # ─── tags: the vocabulary actually in use ───────────────────────────────
+    def tags(self, token: Optional[str], *, prefix: Optional[str] = None,
+             k: int = 50, space=None, space_id=None) -> List[dict]:
+        """The tags in use across the namespaces you reach, most-used first.
+
+        A caller cannot reuse a label it has never seen. Without this, every
+        writer invents its own spelling and the tag filter decays into a pile of
+        single-use labels — which is exactly what happened here (265 distinct
+        tags across 97 memories) before normalisation and this call existed."""
+        from .tags import tag_counts
+        ns, _ = self._authorize_read(token, space=space, space_id=space_id)
+        return tag_counts(self._conn, ns, prefix=prefix,
+                          k=max(1, min(int(k), MAX_RESULTS)))
 
     # ─── list: enumerate a subtree (no query, no ranking) ───────────────────
     def list(self, token: Optional[str], *, path_prefix: Optional[str] = None,
              tags: Optional[Sequence[str]] = None, limit: int = 50,
              offset: int = 0, bodies: bool = False,
+             match_tags: Optional[str] = None,
              space=None, space_id=None) -> List[dict]:
         """Browse (enumerate) memories under a subtree — NOT a search: no FTS, no
         vectors, no scoring. Rows are ordered by path so a subtree reads in tree
@@ -942,7 +964,8 @@ class Store:
         ns, names = self._authorize_read(token, space=space, space_id=space_id)
         limit = max(1, min(int(limit), MAX_RESULTS))
         offset = max(0, int(offset))
-        where, params = build_filters(ns, tags, path_prefix)
+        where, params = build_filters(ns, tags, path_prefix,
+                                      check_tag_match(match_tags))
         cur = self._conn.cursor()
         # The page itself never carries bodies: in `bodies` mode it carries each
         # body's SIZE instead. Deciding what fits from the sizes means the bodies

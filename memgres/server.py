@@ -285,6 +285,8 @@ def create_app(cfg: Optional[Config] = None):
     def list_memories(path: Optional[str] = None,
                       tags: Optional[str] = Query(None, description="comma-separated"),
                       limit: int = 50, offset: int = 0, bodies: bool = False,
+                      match_tags: Optional[str] = Query(
+                          None, description="'all' (default) or 'any'"),
                       space: Optional[List[str]] = Query(
                           None, description="namespace name(s), or 'all'"),
                       space_id: Optional[List[str]] = Query(None),
@@ -297,7 +299,20 @@ def create_app(cfg: Optional[Config] = None):
         with pool.connection() as conn:
             return _guard(lambda: _store(conn).list(
                 tok, path_prefix=path, tags=taglist or None, limit=limit,
-                offset=offset, bodies=bodies, space=space, space_id=space_id))
+                offset=offset, bodies=bodies, match_tags=match_tags,
+                space=space, space_id=space_id))
+
+    @app.get("/tags")
+    def tags_in_use(prefix: Optional[str] = None, k: int = 50,
+                    space: Optional[List[str]] = Query(
+                        None, description="namespace name(s), or 'all'"),
+                    space_id: Optional[List[str]] = Query(None),
+                    tok: Optional[str] = Depends(token)):
+        """The tag vocabulary in use, most-used first. Tags match exactly, so a
+        writer that cannot see the existing labels invents near-duplicates."""
+        with pool.connection() as conn:
+            return _guard(lambda: _store(conn).tags(
+                tok, prefix=prefix, k=k, space=space, space_id=space_id))
 
     @app.get("/info")
     def info():
@@ -313,6 +328,8 @@ def create_app(cfg: Optional[Config] = None):
                snippet: Optional[bool] = None, full_body: Optional[bool] = None,
                bodies: bool = Query(
                    True, description="false = light 'where is it' rows, no text"),
+               match_tags: Optional[str] = Query(
+                   None, description="'all' (default) or 'any'"),
                space: Optional[List[str]] = Query(
                    None, description="namespace name(s), or 'all'"),
                space_id: Optional[List[str]] = Query(None),
@@ -322,7 +339,7 @@ def create_app(cfg: Optional[Config] = None):
             hits = _guard(lambda: _store(conn).recall(
                 tok, q, k=k, tags=taglist or None, path_prefix=path_prefix,
                 mode=mode, snippet=snippet, full_body=full_body, bodies=bodies,
-                space=space, space_id=space_id))
+                match_tags=match_tags, space=space, space_id=space_id))
             return [h.to_recall_dict() for h in hits]
 
     @app.get("/spaces")

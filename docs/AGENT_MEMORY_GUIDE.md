@@ -95,6 +95,9 @@ retrieve from the transcript firehose.
   edits possible — you can't cleanly update a fact buried in a 60 KB page.
 - **Attribute everything.** Set `source` on every write. A fact you can't trace you
   can't verify or safely supersede.
+- **Reuse the tag vocabulary.** `memory_tags` lists what is already in use;
+  a label you invent that exists in another wording becomes a second, unrelated
+  tag. Case and Unicode form are normalised for you — wording is not.
 - **Dedup before you write.** `memory_recall` the topic (`bodies=false` for a cheap scan)
   first; if it exists, **edit that memory** (`replace_old`→`replace_new` for a
   surgical change, or a `diff`) instead of creating a second copy. *One fact, one

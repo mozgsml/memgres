@@ -18,7 +18,7 @@ from pathlib import Path
 from .config import Config
 
 # The version this build migrates the database TO (the latest migration it carries).
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 # The compatibility FLOOR: the schema version of the most recent backward-
 # INCOMPATIBLE migration — one that changed the shape/semantics old code relied on
@@ -49,7 +49,12 @@ SCHEMA_VERSION = 15
 #     (an old client writes v1 rows, which the column defaults to), so this is
 #     the floor purely because of what verification would claim.
 #   v15 (0014): dropped a foreign key → nothing old code reads changes.
-SCHEMA_BREAKING_VERSION = 14
+#   v16 (0015): normalised stored tags to one spelling (NFC + lower) → BREAKING,
+#     and the reasoning is the same as v14's. Nothing about the SHAPE changes; a
+#     pre-0015 client neither normalises nor knows to, so its filter for `X402`
+#     stops matching a row now stored as `x402` and it gets an empty result where
+#     rows exist. Silence shaped like an answer, from a filter that looks fine.
+SCHEMA_BREAKING_VERSION = 16
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are
 # shipped inside the package (see pyproject) and this still resolves.
