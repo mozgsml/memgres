@@ -32,6 +32,13 @@ pytestmark = pytest.mark.skipif(not _reachable(), reason="no test Postgres")
 
 def _reset():
     with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        # Close out anything still holding the schema before dropping it. Tests
+        # in this file close their connection on the LAST line, so a failing
+        # assertion leaks one — and the next test's DROP then blocks on its
+        # locks, turning one red test into a hung suite. Fail fast instead.
+        cur.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = current_database() "
+                    "  AND pid <> pg_backend_pid()")
         cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
 
 
@@ -133,3 +140,56 @@ def test_auto_mode_picks_lexical_without_embedder(monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ─── a tsvector column can be NULL, and NULL is not empty ────────────────────
+def test_a_legacy_row_without_a_title_vector_does_not_break_recall(monkeypatch):
+    """`0004_title.sql` left pre-existing rows at title='' with title_fts NULL,
+    judged harmless because nothing read the column. Recall reads it now:
+    `ts_rank(NULL, q)` is NULL, a summed score becomes NULL, NULL sorts FIRST
+    under `ORDER BY score DESC`, and `float(None)` is a TypeError that no
+    transport converts into anything but a 500. One legacy row would take down
+    lexical recall for the whole deployment — and 50 of 95 rows in this repo's
+    own corpus carried that NULL."""
+    _reset()
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
+    conn = psycopg.connect(DSN)
+    from memgres.schema import migrate as _migrate
+    _migrate(conn, load())
+    store = Store(load(), conn=conn)
+    a = store.write(body="apples are sweet", title="Fruit")
+    legacy = store.write(body="apples grow on trees", title="Tree")
+    with store._conn.cursor() as cur:
+        cur.execute("UPDATE memory SET title_fts = NULL WHERE id=%s", (legacy.id,))
+    store._conn.commit()
+
+    hits = store.recall(None, "apples", mode="lexical")
+    assert {h.id for h in hits} == {a.id, legacy.id}
+    assert all(isinstance(h.score, float) for h in hits)
+    conn.close()
+
+
+def test_the_migration_leaves_no_null_title_vectors(monkeypatch):
+    from memgres.schema import migrate
+    _reset()
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
+    conn = psycopg.connect(DSN)
+    migrate(conn, load())
+    store = Store(load(), conn=conn)
+    m = store.write(body="one", title="One")
+    with store._conn.cursor() as cur:
+        cur.execute("UPDATE memory SET title_fts = NULL WHERE id=%s", (m.id,))
+    store._conn.commit()
+
+    migrate(store._conn, store.cfg)
+    store._conn.commit()
+    with store._conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM memory WHERE title_fts IS NULL")
+        assert cur.fetchone()[0] == 0
+        # and it is the TITLE that was indexed, not an empty vector
+        cur.execute("SELECT title_fts @@ plainto_tsquery(%s::regconfig, 'One') "
+                    "FROM memory WHERE id=%s", (store.cfg.fts_language, m.id))
+        assert cur.fetchone()[0] is True
+    conn.close()

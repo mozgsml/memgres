@@ -139,7 +139,15 @@ def maybe_start_sweeper(cfg, connect: Callable[[], "object"],
     """Start a :class:`RetentionSweeper` when the deployment actually has a
     retention policy. ``retention_days <= 0`` means "keep everything", and then
     there is nothing to sweep — no thread, no connection held open for a table
-    scan that can never match."""
-    if cfg.retention_days <= 0:
+    scan that can never match.
+
+    ``MEMGRES_RETENTION_SWEEP=false`` turns it off for THIS process. Every server
+    process starts one otherwise, and in a stdio-MCP deployment a process is a
+    client session — so a dozen sessions would mean a dozen threads issuing the
+    same deployment-wide DELETE. They do not corrupt anything (the delete is
+    bounded and idempotent, and each row can only be deleted once), but the work
+    is redundant, so a deployment that runs a dedicated sweeper can silence the
+    rest."""
+    if cfg.retention_days <= 0 or not cfg.retention_sweep:
         return None
     return RetentionSweeper(cfg, connect, embedder, backend).start()

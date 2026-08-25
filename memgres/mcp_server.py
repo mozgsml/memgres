@@ -346,8 +346,12 @@ def build_server(cfg: Optional[Config] = None):
         to edit it at its new address, or `if_moved="create"` to claim the vacated
         path for something genuinely new.
 
-        `tags` labels it; `title` is a short curated caption (set whole,
-        searchable via `memory_recall`); `source`/`reason` record provenance.
+        **`title` is REQUIRED** for any write that stores content — a create, or
+        an edit that changes the body. (Re-addressing with `path` and relabelling
+        with `tags` are exempt.) It is a short curated caption, set whole; it
+        names the memory in results, and recall weights a match there above one in
+        the body. Omit it and the write is refused, naming the memory so you can
+        caption it from the error. `source`/`reason` record provenance.
         Link other memories from the body as `[[path]]` (or
         `[[path#anchor|label]]`) — they become a real graph you can walk with
         `memory_links`, including backwards.

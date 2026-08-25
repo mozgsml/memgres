@@ -212,3 +212,57 @@ def test_like_wildcards_in_a_prefix_are_literal(store):
     store.write(body="z", tags=["ops_run"])
     assert [r["tag"] for r in store.tags(None, prefix="ops_")] == ["ops_run"]
     assert store.tags(None, prefix="%") == []
+
+
+# ─── a re-run must be a no-op, and order is part of the value ────────────────
+def test_the_migration_keeps_the_writer_s_order(store):
+    """`normalize_tags` preserves first-seen order, so the migration must too.
+    Sorting instead would make stored tags diverge from `memory_history.
+    tags_after` — with `verify_history` still reporting True, so nothing would
+    flag it."""
+    m = store.write(body="one", tags=["Zeta", "Alpha"])
+    assert m.tags == ["zeta", "alpha"]
+
+    from memgres.schema import migrate
+    migrate(store._conn, store.cfg)
+    store._conn.commit()
+    with store._conn.cursor() as cur:
+        cur.execute("SELECT tags FROM memory WHERE id=%s", (m.id,))
+        assert cur.fetchone()[0] == ["zeta", "alpha"]
+
+
+def test_re_running_the_migration_writes_nothing(store):
+    """Migrations re-apply on EVERY start, and the docstring promises a re-run is
+    a no-op. A migration that rewrote rows each boot would also read a client's
+    unchanged tag list as a change: phantom `retag`, seq bump, expiry renewal —
+    and then flip it back on the next boot, forever."""
+    from memgres.schema import migrate
+    m = store.write(body="one", tags=["Zeta", "Alpha", "ZETA"])
+    with store._conn.cursor() as cur:
+        cur.execute("SELECT xmin::text FROM memory WHERE id=%s", (m.id,))
+        before = cur.fetchone()[0]
+
+    migrate(store._conn, store.cfg)
+    migrate(store._conn, store.cfg)
+    store._conn.commit()
+    with store._conn.cursor() as cur:
+        cur.execute("SELECT xmin::text, tags FROM memory WHERE id=%s", (m.id,))
+        after, tags = cur.fetchone()
+    # xmin changes only if the row was actually rewritten.
+    assert after == before, "the migration rewrote a row that was already canonical"
+    assert tags == ["zeta", "alpha"]
+
+
+def test_a_denormalised_row_is_fixed_in_place_keeping_order(store):
+    from memgres.schema import migrate
+    m = store.write(body="one", tags=["zeta"])
+    with store._conn.cursor() as cur:
+        cur.execute("UPDATE memory SET tags = %s WHERE id=%s",
+                    (["Zeta", "  ALPHA ", "zeta"], m.id))
+    store._conn.commit()
+
+    migrate(store._conn, store.cfg)
+    store._conn.commit()
+    with store._conn.cursor() as cur:
+        cur.execute("SELECT tags FROM memory WHERE id=%s", (m.id,))
+        assert cur.fetchone()[0] == ["zeta", "alpha"]      # first-seen order

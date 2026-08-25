@@ -186,3 +186,16 @@ def test_a_chain_mixing_dated_and_undated_rows_verifies(store):
     store.write(id=m.id, body="three", valid_at="2026-08-25")
     store.write(id=m.id, valid_at="2026-08-26")            # revalidate
     assert store.verify_history(None, m.id) is True
+
+
+def test_a_datetime_is_reduced_to_its_day(store):
+    """`datetime` IS a `date` in Python. Folded as `isoformat()` it would hash
+    '2021-03-04T12:30:00' while the `date` column keeps '2021-03-04' — and
+    `verify_history`, recomputing from the value read back, would then call an
+    UNTOUCHED chain tampered, permanently. Transports send strings and are safe;
+    `Store` is a documented embedded API and this is the one spelling it missed."""
+    import datetime
+    m = store.write(body="one", path="a.b",
+                    valid_at=datetime.datetime(2021, 3, 4, 12, 30))
+    assert store.history(None, m.id)[0]["valid_at"] == dt.date(2021, 3, 4)
+    assert store.verify_history(None, m.id) is True

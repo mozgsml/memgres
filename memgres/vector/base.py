@@ -112,10 +112,16 @@ def build_filters(ns, tags: Optional[Sequence[str]], path_prefix: Optional[str],
 
     ``ns`` is one namespace id or several. The tenant predicate is ``= ANY`` in
     both cases: one code path, so a multi-namespace read cannot diverge from a
-    single-namespace one. This is the ONLY place the tenant filter is written for
-    Postgres — ``fetch_hit_rows`` re-applies it to every candidate a vector
-    backend proposes, which is what keeps a backend-side filter bug a recall
-    problem rather than a cross-tenant leak."""
+    single-namespace one. ``fetch_hit_rows`` re-applies it to every candidate a
+    vector backend proposes, which is what keeps a backend-side filter bug a
+    recall problem rather than a cross-tenant leak.
+
+    This is where the predicate belongs for anything that reads memory ROWS. Two
+    reads cannot use it and write their own instead, and each says why on the
+    spot: ``search._ts_headline`` (it re-checks ids that are already scoped) and
+    ``tags.tag_counts`` (it aggregates over ``unnest(tags)``, not over rows).
+    Both are covered by tenancy tests; a third exception should not appear
+    without one."""
     sql = ["namespace = ANY(%s)", "(expires_at IS NULL OR expires_at > now())"]
     params: list = [as_namespaces(ns)]
     from ..tags import check_tag_match, normalize_tags

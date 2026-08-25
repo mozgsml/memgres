@@ -240,3 +240,31 @@ def test_sweeper_starts_and_sweeps_without_any_embedder(monkeypatch):
         cur.execute("SELECT count(*) FROM memory WHERE id=%s", (m.id,))
         assert cur.fetchone()[0] == 0
     s._conn.close()
+
+
+def test_a_process_can_be_told_not_to_sweep(monkeypatch):
+    """Every server process starts a sweeper, and in a stdio-MCP deployment a
+    process is a client session — a dozen sessions would mean a dozen threads
+    issuing the same deployment-wide DELETE. Harmless but redundant, so a
+    deployment with a dedicated sweeper can silence the rest."""
+    _fresh_pg()
+    _env(monkeypatch, MEMGRES_RETENTION_DAYS="2", MEMGRES_RETENTION_SWEEP="false")
+    assert maybe_start_sweeper(load(), lambda: psycopg.connect(DSN)) is None
+    _env(monkeypatch, MEMGRES_RETENTION_DAYS="2")
+    s = maybe_start_sweeper(load(), lambda: psycopg.connect(DSN))
+    assert s is not None
+    s.stop()
+
+
+def test_one_sweep_is_bounded(monkeypatch):
+    """A large expired backlog must not become one long transaction holding row
+    locks; the sweeper simply comes back."""
+    s = _store(monkeypatch, MEMGRES_RETENTION_DAYS="2")
+    for i in range(5):
+        m = s.write(body=f"body {i}", path=f"a.n{i}")
+        _expire(s, m.id)
+    assert s.purge_expired(limit=2) == 2
+    assert s.purge_expired(limit=2) == 2
+    assert s.purge_expired(limit=2) == 1
+    assert s.purge_expired(limit=2) == 0
+    s._conn.close()

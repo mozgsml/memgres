@@ -173,3 +173,11 @@ def test_the_refusal_is_a_value_error(conn, monkeypatch):
     """`server.py` maps ValueError → 422. A caption that was never supplied is
     the caller's to fix, so it must not surface as a 500."""
     assert issubclass(MissingTitle, ValueError)
+
+
+def test_a_create_with_no_body_blames_the_body(conn, monkeypatch):
+    """Saying "no title" to someone who forgot the body sends them to fix the
+    wrong thing."""
+    s = _store(conn, monkeypatch, True)
+    with pytest.raises(ValueError, match="needs a body"):
+        s.write(path="a.b")

@@ -54,13 +54,23 @@ def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
     Titles used to be searchable only through a separate `find` tool, which meant
     the two halves of "where is it" lived in different places and a caller had to
     guess which to reach for — and an untitled corpus made the title half answer
-    "nothing found" to everything. One query over both, with the title weighted."""
+    "nothing found" to everything. One query over both, with the title weighted.
+
+    Both ranks are COALESCEd because a tsvector column can be NULL — rows written
+    before `title_fts` existed carry one, and `ts_rank(NULL, q)` is NULL, which
+    would make the whole sum NULL. Such a row still MATCHES (`fts @@ q OR NULL`
+    is true when the body matches), NULL sorts first under `ORDER BY score DESC`,
+    and the score then reaches `float(None)` — a TypeError no transport catches,
+    so one legacy row would 500 every lexical recall in the deployment. The
+    backfill in `schema.py` removes those NULLs; this makes the arithmetic
+    correct even if one ever appears again."""
     tsq, qtext = _tsquery(cfg, match, query)
     where, params = build_filters(ns, tags, path_prefix, tags_match)
     lang = cfg.fts_language
     sql = (
         f"SELECT {HIT_COLUMNS}, "
-        f"ts_rank(title_fts, {tsq}) * {TITLE_WEIGHT} + ts_rank(fts, {tsq}) AS score "
+        f"COALESCE(ts_rank(title_fts, {tsq}), 0) * {TITLE_WEIGHT} "
+        f"+ COALESCE(ts_rank(fts, {tsq}), 0) AS score "
         f"FROM memory WHERE {where} "
         f"AND (fts @@ {tsq} OR title_fts @@ {tsq}) "
         "ORDER BY score DESC LIMIT %s"

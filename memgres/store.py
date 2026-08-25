@@ -66,7 +66,16 @@ def _as_date(value: object):
     digest folds the ISO text, and `"2021-3-4"` and `"2021-03-04"` must not be two
     different dates to the chain."""
     import datetime as _dt
-    if value is None or isinstance(value, _dt.date):
+    if value is None:
+        return value
+    # datetime IS a date in Python, and this check has to come first. Folded as
+    # `isoformat()` it would hash '2021-03-04T12:30:00' while the `date` column
+    # keeps '2021-03-04' — and `verify_history`, recomputing from the value read
+    # back, would then report an UNTOUCHED chain as tampered, permanently. The
+    # day is what this field means, so the time is dropped rather than refused.
+    if isinstance(value, _dt.datetime):
+        return value.date()
+    if isinstance(value, _dt.date):
         return value
     if isinstance(value, str):
         try:
@@ -246,8 +255,15 @@ def _fold(digest: str, label: str, *fields: str) -> str:
     logically different rows. So each field is first reduced to its own
     fixed-width sha (``_sha(f)``) before the join: the label namespaces the
     dimension, and every joined part (label, the inner digest, each field-hash) is
-    now fixed-width with no client bytes spanning a boundary — injective across
-    both dimensions AND the fields within one."""
+    now fixed-width with no client bytes spanning a boundary.
+
+    The JOIN is injective across dimensions and across the fields within one. The
+    EXTRACTORS above are not: they map a NULL and an empty string to the same
+    folded value, so those two spellings of "nothing" collide. Reaching that needs
+    direct database write access and only swaps values that mean the same thing,
+    which is why it is recorded here rather than fixed — separating them would
+    change digests already written, and that is a `hash_version` bump, not a
+    tidy-up."""
     parts = [label, digest, *(_sha(f) for f in fields)]
     return _sha("\x1f".join(parts))
 
@@ -482,13 +498,20 @@ class Store:
         """The ``expires_at`` every write stamps, from the DEPLOYMENT's retention
         policy alone.
 
-        There is deliberately no per-write override. Retention is the operator's
-        promise about how long a client's data is kept, so a caller must not be
-        able to lengthen it — and the `ttl_days` argument this replaced could, in
-        three separate ways: `0` was read as "keep forever", a large value simply
-        outran the policy, and an edit that merely omitted it silently cleared an
-        expiry already set. Deriving the value from config alone makes all three
-        impossible by construction rather than by validation.
+        There is deliberately no per-write override. The `ttl_days` argument this
+        replaced let a caller set the window itself, in three separate ways: `0`
+        was read as "keep forever", a large value simply outran the policy, and an
+        edit that merely omitted it silently cleared an expiry already set.
+        Deriving the value from config alone makes all three impossible by
+        construction rather than by validation.
+
+        What it does NOT do is pin the clock. The policy is "expire N days after
+        last touch" (`MEMGRES_RENEW_ON_READ`, on by default), so a touch — a read
+        included, with only a `read` ceiling — starts the window again. That is
+        the documented behaviour and not a hole in this function, but it is worth
+        stating next to it: with the sweeper live, "deleted after N days" holds
+        for data nobody touches. A hard ceiling from creation would need a second
+        limit, which is a policy decision and not this parameter's absence.
 
         `retention_days <= 0` means the deployment keeps everything; that is the
         operator's choice too, and it is the default."""
@@ -669,9 +692,12 @@ class Store:
 
     def _create(self, ns, author, body, path, tags, source, reason,
                 title=None, valid_at=None) -> Memory:
-        self._require_title(title, path, body)
+        # Body first: a create with nothing to store is not a caption problem,
+        # and saying "no title" to someone who forgot the body sends them to fix
+        # the wrong thing.
         if body is None:
             raise ValueError("create needs a body (diffs apply to an existing memory)")
+        self._require_title(title, path, body)
         self._check_write_size(body)
         self._check_body_size(body)
         chash = content_hash(body)
@@ -1431,7 +1457,7 @@ class Store:
             self._vectors.delete_chunks(self._conn, id, ns)
         return deleted
 
-    def purge_expired(self) -> int:
+    def purge_expired(self, limit: int = 1000) -> int:
         """Delete the memories whose retention window has closed; returns how many.
 
         ``build_filters`` already hides expired rows from every read, so this is
@@ -1439,15 +1465,28 @@ class Store:
         are not interchangeable. A retention promise is about no longer HOLDING
         the data; a row that is merely filtered out of results is still held.
 
-        Chunk vectors go with them, exactly as in :meth:`forget`. pgvector
-        cascades on the foreign key, but qdrant is an out-of-band collection:
-        skip this and its points outlive the memory, keep taking candidate slots
-        in every search, and are then dropped when ``fetch_hit_rows`` finds no
-        row behind them — recall quietly thinning out rather than an error."""
+        Chunk vectors go with them, as in :meth:`forget`. pgvector cascades on
+        the foreign key; qdrant is an out-of-band collection, so its points are
+        deleted here explicitly — skip that and they outlive the memory, keep
+        taking candidate slots in every search, and are then dropped when
+        ``fetch_hit_rows`` finds no row behind them, recall quietly thinning out
+        rather than an error.
+
+        Honest about the ordering: the row delete COMMITS first, then the point
+        deletes run. A crash or a qdrant outage in between leaves exactly those
+        orphans — the sequence narrows the window, it does not close it, and the
+        next sweep does not retry them. Closing it needs a durable outbox, which
+        is more machinery than this has earned.
+
+        ``limit`` bounds one pass so a large expired backlog is not one long
+        transaction holding row locks; the sweeper simply comes back."""
         with self._conn.transaction():
             cur = self._conn.cursor()
-            cur.execute("DELETE FROM memory WHERE expires_at IS NOT NULL "
-                        "AND expires_at < now() RETURNING id, namespace")
+            cur.execute(
+                "DELETE FROM memory WHERE id IN ("
+                "  SELECT id FROM memory WHERE expires_at IS NOT NULL "
+                "   AND expires_at < now() LIMIT %s) "
+                "RETURNING id, namespace", (limit,))
             gone = [(str(r[0]), r[1]) for r in cur.fetchall()]
         if gone and self._vectors is not None:
             for mid, ns in gone:

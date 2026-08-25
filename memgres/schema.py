@@ -104,6 +104,7 @@ def migrate(conn, cfg: Config) -> None:
                 cur.execute(path.read_text(encoding="utf-8"))
             _apply_tree(cur, cfg)
             _apply_vector(cur, cfg)
+            _backfill_title_fts(cur, cfg)
             _stamp(cur, cfg)
 
 
@@ -152,6 +153,23 @@ def _guard_client_version(cur) -> None:
             f"install) and restart it. Refusing to run below the database's "
             f"compatibility floor."
         )
+
+
+def _backfill_title_fts(cur, cfg: Config) -> None:
+    """Give every row a title tsvector, even an empty one.
+
+    ``0004_title.sql`` left existing rows at ``title=''`` with ``title_fts``
+    NULL, judged harmless because nothing read the column. Recall reads it now,
+    and a NULL tsvector is not an empty one: it makes `ts_rank` NULL, which
+    poisons a summed score and sorts FIRST under `ORDER BY score DESC`. In this
+    repo's own corpus 50 of 95 rows carried that NULL.
+
+    Here rather than in a .sql file because the text-search dictionary is
+    configuration, not schema — the same reason the tree and vector steps live in
+    Python. Touches only NULL rows, so it is a no-op on every later start."""
+    cur.execute(
+        "UPDATE memory SET title_fts = to_tsvector(%s::regconfig, COALESCE(title, '')) "
+        "WHERE title_fts IS NULL", (cfg.fts_language,))
 
 
 def _apply_tree(cur, cfg: Config) -> None:

@@ -107,6 +107,7 @@ class Config:
                                  #     deployment where an external worker embeds.
     embed_worker: bool           # a server process runs an in-process embed worker
     embed_worker_interval: float # seconds the idle worker sleeps between drains
+    retention_sweep: bool        # this process runs the retention sweep
     retention_sweep_interval: float  # seconds between retention sweeps (see retention_days)
     embed_max_attempts: int      # after this many failed embed attempts a row is a
                                  # dead letter — left flagged but out of the claim
@@ -221,6 +222,7 @@ def load() -> Config:
         embed_dispatch=_str("MEMGRES_EMBED_DISPATCH", "inline"),
         embed_worker=_bool("MEMGRES_EMBED_WORKER", True),
         embed_worker_interval=_float("MEMGRES_EMBED_WORKER_INTERVAL", 1.0),
+        retention_sweep=_bool("MEMGRES_RETENTION_SWEEP", True),
         retention_sweep_interval=_float("MEMGRES_RETENTION_SWEEP_INTERVAL", 3600.0),
         embed_max_attempts=_int("MEMGRES_EMBED_MAX_ATTEMPTS", 5),
         embed_retry_backoff_s=_float("MEMGRES_EMBED_RETRY_BACKOFF_S", 60.0),

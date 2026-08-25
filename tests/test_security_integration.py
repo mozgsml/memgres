@@ -680,3 +680,27 @@ def test_capabilities_never_advertise_a_door_that_always_closes(env):
     assert admin.capabilities(setup, strong_p)["can_manage_own_tokens"] is True
     assert ident.list_tokens(setup, strong_p.user_id) != []
     assert admin.capabilities(setup, strong_p)["can_create_namespace"] is True
+
+
+# ─── the tag vocabulary is a read, and reads are scoped ──────────────────────
+def test_the_tag_vocabulary_never_shows_another_tenants_labels(env):
+    """`tag_counts` writes its own namespace predicate — it aggregates over
+    `unnest(tags)` rather than over rows, so it cannot use `build_filters`. That
+    makes it the one read whose tenant filter is a second copy, and a copy with
+    no test is how a leak ships green."""
+    setup, make_store = env
+    s = make_store("managed")
+    v_uid = ident.create_user(setup, name="victim")
+    ident.create_namespace(setup, v_uid, "secrets")
+    victim_tok, _ = ident.issue_token(setup, v_uid)
+    s.write(victim_tok, body="launch codes\n", tags=["classified"], space="secrets")
+
+    a_uid = ident.create_user(setup, name="attacker")
+    ident.create_namespace(setup, a_uid, "mine")
+    attacker_tok, _ = ident.issue_token(setup, a_uid)
+    s.write(attacker_tok, body="my lunch\n", tags=["lunch"], space="mine")
+
+    assert [r["tag"] for r in s.tags(attacker_tok)] == ["lunch"]
+    assert [r["tag"] for r in s.tags(attacker_tok, space="all")] == ["lunch"]
+    # even asking by prefix for the exact label must not confirm it exists
+    assert s.tags(attacker_tok, prefix="classified", space="all") == []
