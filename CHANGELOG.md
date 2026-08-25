@@ -57,6 +57,28 @@ along.
   silently miss a row now stored as `x402`. Upgrade every client of a database
   together.
 
+### Fixed
+- **Lexical recall no longer 500s on a row written before titles existed.**
+  Migration `0004` left such rows with `title_fts` NULL, judged harmless because
+  nothing read the column; the merged search reads it, `ts_rank(NULL, q)` is
+  NULL, and a NULL score sorts first and then hits `float(None)`. One legacy row
+  would have taken recall down for the whole deployment on the first query after
+  upgrading — 50 of the 95 memories in the reference corpus carried that NULL.
+  The ranks are COALESCEd and every row is given a real tsvector on migrate.
+- **A `datetime` passed to `valid_at`** hashed with a time the `date` column
+  cannot keep, so verification called an untouched chain tampered — permanently,
+  for that memory. It is now reduced to its day. Only the embedded `Store` API
+  was affected; both transports send strings.
+- **Migration `0015` is a genuine no-op on re-run.** It sorted tags while
+  `normalize_tags` keeps the writer's order, so every start re-sorted stored
+  tags — diverging from `memory_history.tags_after` with `verify_history` still
+  returning True, and turning a client's unchanged tag list into a phantom
+  `retag` that the next boot flipped back.
+- `MEMGRES_RETENTION_SWEEP=false` turns the sweep off for one process (every
+  server process starts one, and in a stdio deployment a process is a session);
+  one pass is bounded rather than deleting an entire backlog in one transaction.
+- A create with no body says so instead of blaming the missing caption.
+
 ### Added
 - **`valid_at`** on a write: the day the content was last known to be ACCURATE.
   `created_at`/`updated_at` say when a row was written, which cannot answer "is
