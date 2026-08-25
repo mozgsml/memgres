@@ -288,8 +288,9 @@ def test_all_never_includes_an_unreachable_namespace(env):
     assert all("launch codes" not in (h.snippet or "") for h in hits)
     # and the same for the browse + title paths, which share the filter
     assert all(r["space_id"] != vns for r in s.list(attacker_tok, space="all"))
-    assert all(r["space_id"] != vns
-               for r in s.find(attacker_tok, "codes", space="all"))
+    assert all(h.namespace != vns
+               for h in s.recall(attacker_tok, "codes", space="all",
+                                 bodies=False))
 
 
 def test_all_does_not_widen_a_scoped_token(env):

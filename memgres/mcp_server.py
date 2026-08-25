@@ -73,7 +73,6 @@ TOOL_VISIBILITY = {
     "memory_recall": (),
     "memory_get": (),
     "memory_list": (),
-    "memory_find": (),
     "memory_blame": (),
     "memory_history": (),
     "memory_server_info": (),
@@ -327,7 +326,7 @@ def build_server(cfg: Optional[Config] = None):
         path for something genuinely new.
 
         `tags` labels it; `title` is a short curated caption (set whole,
-        searchable via `memory_find`); `source`/`reason` record provenance.
+        searchable via `memory_recall`); `source`/`reason` record provenance.
         `space` picks one of your namespaces by name (`space_id` for a shared
         one); omit both when you reach exactly one namespace — with several, say
         which. The answer's `created` says whether
@@ -377,9 +376,11 @@ def build_server(cfg: Optional[Config] = None):
                       path_prefix: Optional[str] = None,
                       snippet: Optional[bool] = None,
                       full_body: Optional[bool] = None,
+                      bodies: bool = True,
                       space: Spaces = None, space_id: Spaces = None,
                       token: Optional[str] = None, ctx: Context = None) -> List[dict]:
-        """Search memories. `mode`: lexical | semantic | hybrid | auto. `match`
+        """Search memories — bodies AND curated titles, with a title match
+        weighted higher. `mode`: lexical | semantic | hybrid | auto. `match`
         governs lexical word combination — defaults to OR-any (any query word
         matches, forgiving recall); set 'all' to require every word (narrow).
         Optionally scope to a tag set (`tags`) or a subtree (`path_prefix`, e.g.
@@ -389,6 +390,10 @@ def build_server(cfg: Optional[Config] = None):
         `kind="full"` means the snippet IS the whole body (short body, or
         `full_body=true`). Pass `full_body=true` to force whole bodies,
         `snippet=false` to skip slicing.
+
+        `bodies=false` is the cheap "where is it" pass: ranked hits carrying
+        id/path/title/tags and NO text. Use it to scan a wide result set before
+        choosing what to read in full with `memory_get`.
 
         WHERE to search: `space` takes a namespace name, a list of names, or
         `"all"` for every namespace you reach; `space_id` takes ids (the only way
@@ -401,7 +406,7 @@ def build_server(cfg: Optional[Config] = None):
                     for h in _store(conn).recall(
                         _token(ctx, token), query, k=k, tags=tags,
                         path_prefix=path_prefix, mode=mode, match=match,
-                        snippet=snippet, full_body=full_body,
+                        snippet=snippet, full_body=full_body, bodies=bodies,
                         space=space, space_id=space_id)]
 
     @mcp.tool()
@@ -425,22 +430,6 @@ def build_server(cfg: Optional[Config] = None):
                 _token(ctx, token), path_prefix=path_prefix, tags=tags,
                 limit=limit, offset=offset, bodies=bodies,
                 space=space, space_id=space_id)
-
-    @mcp.tool()
-    def memory_find(query: str, k: int = 10, tags: Optional[List[str]] = None,
-                    path_prefix: Optional[str] = None,
-                    match: Optional[Literal["any", "all"]] = None,
-                    space: Spaces = None, space_id: Spaces = None,
-                    token: Optional[str] = None, ctx: Context = None) -> List[dict]:
-        """LOCATE by curated `title` (+ tags) — a light "where is it" search over
-        titles only, NEVER the body. Returns {id, path, title, tags, score} (no
-        body/snippet), so it's cheap to scan before a heavier `memory_recall`.
-        Works even without an embedder. Narrow by `tags`/`path_prefix`; pick
-        namespace(s) with `space`/`space_id` (a name, a list, or `"all"`)."""
-        with pool.connection() as conn:
-            return _store(conn).find(_token(ctx, token), query, k=k, tags=tags,
-                                     path_prefix=path_prefix, match=match,
-                                     space=space, space_id=space_id)
 
     @mcp.tool()
     def memory_server_info(ctx: Context = None) -> dict:

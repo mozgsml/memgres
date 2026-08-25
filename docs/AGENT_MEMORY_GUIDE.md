@@ -43,7 +43,7 @@ WRITE DISCIPLINE:
 - One fact per memory. Give it a title, a path (tree position), and tags. Keep
   bodies small; link related notes with [[path]] instead of restating them.
 - Always set source — never store a fact you can't attribute.
-- Before creating, memory_find / memory_recall first: if it already exists, EDIT it
+- Before creating, memory_recall first: if it already exists, EDIT it
   (replace_old->replace_new, or a diff), don't duplicate. One fact, one home.
 
 DECISIONS: store under decisions.* with What / Context / Why / Alternatives-rejected
@@ -88,12 +88,14 @@ retrieve from the transcript firehose.
 
 ### 2.2 Write discipline (keeps it from becoming a wall of text)
 
-- **One idea per memory.** Small body, a curated `title` (caption, searchable via
-  `memory_find`), a `path`, and `tags`. Atomic notes are what make dedup, linking,
-  and targeted edits possible — you can't cleanly update a fact buried in a 60 KB page.
+- **One idea per memory.** Small body, a curated `title`, a `path`, and `tags`.
+  The title is required for a write that stores content (`MEMGRES_REQUIRE_TITLE`):
+  it names the memory in a result list, and recall weighs a match there higher
+  than one in the body. Atomic notes are what make dedup, linking, and targeted
+  edits possible — you can't cleanly update a fact buried in a 60 KB page.
 - **Attribute everything.** Set `source` on every write. A fact you can't trace you
   can't verify or safely supersede.
-- **Dedup before you write.** `memory_find` (title+tags) or `memory_recall` the topic
+- **Dedup before you write.** `memory_recall` the topic (`bodies=false` for a cheap scan)
   first; if it exists, **edit that memory** (`replace_old`→`replace_new` for a
   surgical change, or a `diff`) instead of creating a second copy. *One fact, one
   home.* (Automatic semantic dedup-at-write is not yet enforced by the tool — this is

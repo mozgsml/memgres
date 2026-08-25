@@ -88,9 +88,9 @@ def test_build_server_sets_instructions(monkeypatch):
     from memgres.config import load
     from memgres.mcp_server import build_server
     _clear_all(monkeypatch)
-    monkeypatch.setenv("MEMGRES_INSTRUCTION", "Prefer memory_find before recall.")
+    monkeypatch.setenv("MEMGRES_INSTRUCTION", "Prefer memory_list before recall.")
     mcp = build_server(load())
-    assert mcp.instructions == "Prefer memory_find before recall."
+    assert mcp.instructions == "Prefer memory_list before recall."
 
 
 @pytest.mark.skipif(not _reachable(), reason="no test Postgres")

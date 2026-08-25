@@ -311,6 +311,8 @@ def create_app(cfg: Optional[Config] = None):
                tags: Optional[str] = Query(None, description="comma-separated"),
                path_prefix: Optional[str] = None,
                snippet: Optional[bool] = None, full_body: Optional[bool] = None,
+               bodies: bool = Query(
+                   True, description="false = light 'where is it' rows, no text"),
                space: Optional[List[str]] = Query(
                    None, description="namespace name(s), or 'all'"),
                space_id: Optional[List[str]] = Query(None),
@@ -319,26 +321,10 @@ def create_app(cfg: Optional[Config] = None):
         with pool.connection() as conn:
             hits = _guard(lambda: _store(conn).recall(
                 tok, q, k=k, tags=taglist or None, path_prefix=path_prefix,
-                mode=mode, snippet=snippet, full_body=full_body,
+                mode=mode, snippet=snippet, full_body=full_body, bodies=bodies,
                 space=space, space_id=space_id))
             return [h.to_recall_dict() for h in hits]
 
-    @app.get("/find")
-    def find(q: str, k: int = 10,
-             tags: Optional[str] = Query(None, description="comma-separated"),
-             path_prefix: Optional[str] = None, match: Optional[str] = None,
-             space: Optional[List[str]] = Query(
-                 None, description="namespace name(s), or 'all'"),
-             space_id: Optional[List[str]] = Query(None),
-             tok: Optional[str] = Depends(token)):
-        """Locate by curated title (+ tags) — light rows, never the body."""
-        taglist = [t for t in (tags.split(",") if tags else []) if t]
-        with pool.connection() as conn:
-            return _guard(lambda: _store(conn).find(
-                tok, q, k=k, tags=taglist or None, path_prefix=path_prefix,
-                match=match, space=space, space_id=space_id))
-
-    # ─── spaces: what this token can reach ──────────────────────────────────
     @app.get("/spaces")
     def spaces(tok: Optional[str] = Depends(token)):
         """List the namespaces this token can reach (identity modes only)."""

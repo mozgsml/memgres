@@ -83,7 +83,7 @@ def test_a_single_namespace_needs_no_address(env):
 
     assert len(s.recall(tok, "lonely")) == 1
     assert len(s.list(tok)) == 1
-    assert len(s.find(tok, "note", space="only")) == 0   # no title set
+    assert len(s.recall(tok, "note", space="only", bodies=False)) == 1
 
 
 # ─── several namespaces: silence is refused, and the refusal is useful ───────
@@ -98,7 +98,8 @@ def test_several_namespaces_require_an_address(env):
     assert "work" in msg and "home" in msg     # names the candidates…
     assert "all" in msg                        # …and the way to take them all
 
-    for call in (lambda: s.list(tok), lambda: s.find(tok, "note")):
+    for call in (lambda: s.list(tok),
+                 lambda: s.recall(tok, "note", bodies=False)):
         with pytest.raises(SpaceAmbiguous):
             call()
 
@@ -213,8 +214,8 @@ def test_every_hit_carries_its_namespace(env):
     assert hit.to_recall_dict()["space"] == "work"
     assert hit.to_recall_dict()["space_id"] == ids[0]
 
-    [row] = s.find(tok, "Apple", space="all")
-    assert row["space"] == "work" and row["space_id"] == ids[0]
+    [light] = s.recall(tok, "Apple", space="all", bodies=False)
+    assert light.space == "work" and light.namespace == ids[0]
 
     [row] = s.list(tok, space="all")
     assert row["space"] == "work" and row["space_id"] == ids[0]

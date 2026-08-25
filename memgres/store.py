@@ -901,36 +901,25 @@ class Store:
                path_prefix: Optional[str] = None, mode: str = "auto",
                match: Optional[str] = None,
                snippet: Optional[bool] = None, full_body: Optional[bool] = None,
-               space=None, space_id=None):
-        """Search. ``space``/``space_id`` may name one namespace, several, or
-        ``'all'`` — see :func:`identity.resolve_spaces`."""
+               bodies: bool = True, space=None, space_id=None):
+        """Search bodies AND curated titles. ``space``/``space_id`` may name one
+        namespace, several, or ``'all'`` — see :func:`identity.resolve_spaces`.
+
+        ``bodies=False`` is the light "where is it" pass: ranked hits with
+        id/path/title/tags and no text. It replaces the separate ``find`` tool,
+        which searched titles and nothing else — two half-searches the caller had
+        to choose between, one of which answered "nothing found" for every
+        memory that had no caption."""
         from .search import recall as _recall
         k = self._clamp_k(k)
         ns, names = self._authorize_read(token, space=space, space_id=space_id)
         hits = _recall(self._conn, self.cfg, self.embedder, ns,
                        query, k=k, tags=tags, path_prefix=path_prefix, mode=mode,
                        match=match, backend=self._vectors,
-                       snippet=snippet, full_body=full_body)
+                       snippet=snippet, full_body=full_body, bodies=bodies)
         for h in hits:
             h.space = names.get(h.namespace)
         return hits
-
-    # ─── find: locate by title (+ tags), no body ────────────────────────────
-    def find(self, token: Optional[str], query: str, *, k: int = 10,
-             tags: Optional[Sequence[str]] = None,
-             path_prefix: Optional[str] = None, match: Optional[str] = None,
-             space=None, space_id=None) -> List[dict]:
-        """Locate memories whose curated `title` matches — a light "where is it"
-        search over titles + tags, never the body. Returns light rows; works
-        without an embedder. Spans namespaces like ``recall``. See ``search.find``."""
-        from .search import find as _find
-        k = self._clamp_k(k)
-        ns, names = self._authorize_read(token, space=space, space_id=space_id)
-        rows = _find(self._conn, self.cfg, ns, query, tags=tags,
-                     path_prefix=path_prefix, k=k, match=match)
-        for r in rows:
-            r["space"] = names.get(r["space_id"])
-        return rows
 
     # ─── list: enumerate a subtree (no query, no ranking) ───────────────────
     def list(self, token: Optional[str], *, path_prefix: Optional[str] = None,

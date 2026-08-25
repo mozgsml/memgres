@@ -366,7 +366,8 @@ def test_recall_over_several_namespaces(monkeypatch):
         # browse and title-find address the same way
         assert len(client.get("/memories", params={"space": "all"},
                               headers=h).json()) == 3
-        assert client.get("/find", params={"q": "apple", "space": "all"},
+        assert client.get("/recall", params={"q": "apple", "space": "all",
+                                            "bodies": False},
                           headers=h).status_code == 200
 
 

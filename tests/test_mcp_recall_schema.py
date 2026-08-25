@@ -92,7 +92,7 @@ def test_space_accepts_one_name_or_several(monkeypatch):
     _clear_env(monkeypatch)
     monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
     mcp = build_server(load())
-    for tool in ("memory_recall", "memory_find", "memory_list"):
+    for tool in ("memory_recall", "memory_list"):
         for field in ("space", "space_id"):
             variants = _space_schema(mcp, tool).get("anyOf", [])
             kinds = {v.get("type") for v in variants}
@@ -101,3 +101,28 @@ def test_space_accepts_one_name_or_several(monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ─── the merged search: one tool, and the half-search is really gone ─────────
+def test_find_is_gone_and_recall_carries_its_job(monkeypatch):
+    """`memory_find` searched titles and nothing else, so a caller had to choose
+    between two half-searches — and on an uncaptioned corpus the title half
+    answered "nothing found" to everything. Removing a tool is only done if the
+    replacement is actually there, so both halves are asserted together."""
+    _clear_env(monkeypatch)
+    mcp = build_server()
+    tools = getattr(getattr(mcp, "_tool_manager", None), "_tools", {})
+    assert "memory_find" not in tools
+    assert "bodies" in tools["memory_recall"].parameters["properties"]
+
+
+def test_every_registered_tool_has_a_visibility_row(monkeypatch):
+    """A registered tool missing from TOOL_VISIBILITY is one the per-caller
+    filter cannot gate. The reverse is fine — the table also covers the identity
+    and admin tools, which this single-mode server does not register."""
+    from memgres.mcp_server import TOOL_VISIBILITY
+    _clear_env(monkeypatch)
+    mcp = build_server()
+    tools = set(getattr(getattr(mcp, "_tool_manager", None), "_tools", {}))
+    assert tools <= set(TOOL_VISIBILITY), tools - set(TOOL_VISIBILITY)
+    assert "memory_find" not in TOOL_VISIBILITY

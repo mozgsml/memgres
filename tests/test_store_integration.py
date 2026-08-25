@@ -331,23 +331,42 @@ def test_title_size_cap(store):
         store.write(body="b\n", title="way too long a title")
 
 
-def test_find_matches_title_not_body(store):
-    # `store` has no embedder — find must work lexically, over the TITLE only.
+def test_lexical_recall_matches_title_and_body(store):
+    # `store` has no embedder — lexical recall must cover BOTH halves. Searching
+    # titles alone was a separate tool, and it answered "nothing found" for every
+    # memory that had no caption.
     a = store.write(body="the body mentions apples\n", title="Fruit Notes")
     b = store.write(body="something about fruit here\n", title="Vegetable Notes")
-    hits = store.find(None, "fruit")
-    ids = [h["id"] for h in hits]
+    ids = [h.id for h in store.recall(None, "fruit")]
     assert a.id in ids                 # 'fruit' is in a's TITLE
-    assert b.id not in ids             # b has 'fruit' only in its BODY → not matched
-    assert set(hits[0]) == {"id", "path", "title", "tags", "score",
-                            "space_id", "space"}                     # light rows
+    assert b.id in ids                 # and in b's BODY — both are findable
 
 
-def test_find_respects_tag_filter(store):
+def test_a_title_match_outranks_a_body_only_match(store):
+    body_only = store.write(body="something about fruit here\n",
+                            title="Vegetable Notes")
+    captioned = store.write(body="nothing relevant\n", title="Fruit Notes")
+    hits = store.recall(None, "fruit")
+    assert [h.id for h in hits][0] == captioned.id
+    assert body_only.id in [h.id for h in hits]     # still found, just lower
+
+
+def test_the_light_pass_returns_no_text(store):
+    """`bodies=False` is the cheap "where is it" scan that replaced `find`."""
+    store.write(body="the body mentions apples\n", title="Fruit Notes",
+                path="notes.fruit")
+    [hit] = store.recall(None, "fruit", bodies=False)
+    assert hit.title == "Fruit Notes" and hit.path == "notes.fruit"
+    assert hit.body is None and hit.snippet is None and hit.kind is None
+    row = hit.to_recall_dict()
+    assert row["snippet"] is None and row["title"] == "Fruit Notes"
+
+
+def test_recall_respects_tag_filter(store):
     store.write(body="x\n", title="alpha report", tags=["keep"])
     store.write(body="y\n", title="alpha summary", tags=["drop"])
-    hits = store.find(None, "alpha", tags=["keep"])
-    assert len(hits) == 1 and hits[0]["title"] == "alpha report"
+    hits = store.recall(None, "alpha", tags=["keep"])
+    assert len(hits) == 1 and hits[0].title == "alpha report"
 
 
 def test_replace_and_retag(store):

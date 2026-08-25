@@ -39,45 +39,37 @@ def _tsquery(cfg, match: Optional[str], query: str):
     return "websearch_to_tsquery(%s::regconfig, %s)", " or ".join(query.split())
 
 
+# How much harder a hit in the curated title counts than one in the body. A
+# caption is written to say what the memory IS, so matching it is the stronger
+# signal — but only a nudge, not a separate stage: a memory that matches in both
+# should still outrank one that matches the title alone, and a two-pass
+# "titles first, then bodies" ordering cannot express that.
+TITLE_WEIGHT = 2.0
+
+
 def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
              match: Optional[str] = None) -> List[Hit]:
+    """Rank by the query against BOTH the body and the curated title.
+
+    Titles used to be searchable only through a separate `find` tool, which meant
+    the two halves of "where is it" lived in different places and a caller had to
+    guess which to reach for — and an untitled corpus made the title half answer
+    "nothing found" to everything. One query over both, with the title weighted."""
     tsq, qtext = _tsquery(cfg, match, query)
     where, params = build_filters(ns, tags, path_prefix)
+    lang = cfg.fts_language
     sql = (
         f"SELECT {HIT_COLUMNS}, "
-        f"ts_rank(fts, {tsq}) AS score "
+        f"ts_rank(title_fts, {tsq}) * {TITLE_WEIGHT} + ts_rank(fts, {tsq}) AS score "
         f"FROM memory WHERE {where} "
-        f"AND fts @@ {tsq} "
+        f"AND (fts @@ {tsq} OR title_fts @@ {tsq}) "
         "ORDER BY score DESC LIMIT %s"
     )
-    args = [cfg.fts_language, qtext] + params + [cfg.fts_language, qtext, k]
+    args = ([lang, qtext, lang, qtext] + params
+            + [lang, qtext, lang, qtext, k])
     with conn.cursor() as cur:
         cur.execute(sql, args)
         return [row_to_hit(r, r[-1]) for r in cur.fetchall()]   # score = trailing col
-
-
-def find(conn, cfg, ns, query: str, *, tags: Optional[Sequence[str]] = None,
-         path_prefix: Optional[str] = None, k: int = 10,
-         match: Optional[str] = None) -> List[dict]:
-    """Locate memories whose TITLE matches — a light "where is it" search over the
-    curated title only (``title_fts``), never the body. Same tag/subtree/namespace
-    filters as recall (so it's multi-tenant safe by construction), but returns
-    light rows ``{id, path, title, tags, score}`` — no body, no snippet, no vectors.
-    Fast to scan before a heavier body recall, and works without an embedder."""
-    tsq, qtext = _tsquery(cfg, match, query)
-    where, params = build_filters(ns, tags, path_prefix)
-    sql = (
-        f"SELECT id, path::text, title, tags, namespace, "
-        f"ts_rank(title_fts, {tsq}) AS score "
-        f"FROM memory WHERE {where} AND title_fts @@ {tsq} "
-        "ORDER BY score DESC LIMIT %s"
-    )
-    args = [cfg.fts_language, qtext] + params + [cfg.fts_language, qtext, k]
-    with conn.cursor() as cur:
-        cur.execute(sql, args)
-        return [{"id": str(r[0]), "path": r[1], "title": r[2],
-                 "tags": list(r[3]), "space_id": str(r[4]), "score": float(r[5])}
-                for r in cur.fetchall()]
 
 
 def _rrf(lists: Sequence[List[Hit]], k: int) -> List[Hit]:
@@ -192,7 +184,7 @@ def recall(conn, cfg, embedder, ns, query: str, *, k: int = 10,
            tags: Optional[Sequence[str]] = None, path_prefix: Optional[str] = None,
            mode: str = "auto", match: Optional[str] = None,
            backend=None, snippet: Optional[bool] = None,
-           full_body: Optional[bool] = None) -> List[Hit]:
+           full_body: Optional[bool] = None, bodies: bool = True) -> List[Hit]:
     if mode == "auto":
         mode = "semantic" if backend else "lexical"
     if mode == "lexical":
@@ -214,5 +206,17 @@ def recall(conn, cfg, embedder, ns, query: str, *, k: int = 10,
     else:
         raise ValueError(
             f"unknown recall mode: {mode!r} (lexical|semantic|hybrid|auto)")
+    if not bodies:
+        # The light pass: rank, then answer with WHERE things are and nothing
+        # more. No ts_headline round-trip, no chunk slicing, no body text on the
+        # wire — cheap enough to scan a large result set before deciding what to
+        # actually read. (The bodies were still SELECTed for ranking; dropping
+        # them is about what leaves this function, not about the query.)
+        for h in hits:
+            h.body = None
+            h.snippet = None
+            h.kind = None
+            h.lines = None
+        return hits
     return attach_snippets(conn, cfg, ns, query, hits,
                            snippet=snippet, full_body=full_body)
