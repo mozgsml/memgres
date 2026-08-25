@@ -118,13 +118,20 @@ def build_filters(ns, tags: Optional[Sequence[str]], path_prefix: Optional[str],
     problem rather than a cross-tenant leak."""
     sql = ["namespace = ANY(%s)", "(expires_at IS NULL OR expires_at > now())"]
     params: list = [as_namespaces(ns)]
-    if tags:
-        from ..tags import check_tag_match, normalize_tags
-        # Normalised on BOTH sides — a filter written `X402` has to find a row
-        # stored as `x402`, and neither side can be trusted to have done it.
-        op = "@>" if check_tag_match(tags_match) == "all" else "&&"
+    from ..tags import check_tag_match, normalize_tags
+    # Normalised on BOTH sides — a filter written `X402` has to find a row stored
+    # as `x402`, and neither side can be trusted to have done it.
+    wanted = normalize_tags(tags)
+    mode = check_tag_match(tags_match)
+    if wanted:
+        op = "@>" if mode == "all" else "&&"
         sql.append(f"tags {op} %s")        # @> every requested tag · && any of them
-        params.append(normalize_tags(tags))
+        params.append(wanted)
+    # A request that normalises to nothing (`[]`, or only blanks) adds NO
+    # predicate. Left to the operators it would mean opposite things: `tags @>
+    # '{}'` is true of every row and `tags && '{}'` is true of none, so the same
+    # input would filter nothing or everything depending on a mode flag the
+    # caller may not have set. Neither is an answer; "no tags requested" is.
     if path_prefix:
         sql.append("path <@ %s::ltree")     # subtree of the prefix
         params.append(path_prefix)

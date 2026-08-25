@@ -76,8 +76,13 @@ def tag_counts(conn, ns: Sequence[str], *, prefix: Optional[str] = None,
            "  AND (expires_at IS NULL OR expires_at > now())"]
     params: list = [as_namespaces(ns)]
     if prefix:
-        sql.append("  AND t LIKE %s")
-        params.append(normalize_tag(prefix) + "%")
+        # ESCAPE, because `_` and `%` are LIKE wildcards and a tag is ordinary
+        # text: without this, prefix="ops_" also matches "opsx" and prefix="%"
+        # matches everything — a wrong answer dressed as a narrowed one.
+        sql.append(r"  AND t LIKE %s ESCAPE '\'")
+        esc = (normalize_tag(prefix).replace("\\", "\\\\")
+               .replace("%", "\\%").replace("_", "\\_"))
+        params.append(esc + "%")
     sql.append("GROUP BY t ORDER BY n DESC, t ASC LIMIT %s")
     params.append(k)
     with conn.cursor() as cur:

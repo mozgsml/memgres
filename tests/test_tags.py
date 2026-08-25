@@ -186,3 +186,29 @@ def test_the_migration_normalises_what_was_already_stored(store):
     assert sorted(tags) == sorted(["x402", "ops",
                                    unicodedata.normalize("NFC", "сло" + Y_DECOMPOSED)])
     assert [h.id for h in store.recall(None, "one", tags=["X402"])] == [m.id]
+
+
+# ─── requests that mean nothing must not mean two different things ───────────
+def test_a_tag_request_that_normalises_to_nothing_filters_nothing(store):
+    """Left to the operators this is the same input meaning opposite things:
+    `tags @> '{}'` is true of every row and `tags && '{}'` is true of none, so a
+    filter of blanks would return everything or nothing depending on a mode flag
+    the caller may not even have set. Neither is an answer."""
+    a = store.write(body="alpha", tags=["keep"])
+    b = store.write(body="beta", tags=["other"])
+    for mode in ("all", "any"):
+        got = {h.id for h in store.recall(None, "alpha beta", tags=["   ", ""],
+                                          match_tags=mode)}
+        assert got == {a.id, b.id}, mode
+    assert {r["id"] for r in store.list(None, tags=[])} == {a.id, b.id}
+
+
+# ─── a narrowed answer must actually be narrowed ─────────────────────────────
+def test_like_wildcards_in_a_prefix_are_literal(store):
+    """`_` and `%` are LIKE metacharacters and a tag is ordinary text. Unescaped,
+    prefix="ops_" also matches "opsx" — a wrong answer dressed as a narrowed one."""
+    store.write(body="x", tags=["opsx"])
+    store.write(body="y", tags=["ops.deploy"])
+    store.write(body="z", tags=["ops_run"])
+    assert [r["tag"] for r in store.tags(None, prefix="ops_")] == ["ops_run"]
+    assert store.tags(None, prefix="%") == []
