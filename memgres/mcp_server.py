@@ -155,7 +155,14 @@ def _instruction_text() -> Optional[str]:
 def _mcp(name: str, instructions: Optional[str] = None):
     # The SDK renamed FastMCP -> MCPServer; support both. ``instructions`` is
     # emitted in the initialize response; None => the SDK omits it.
+    #
+    # `version` matters more than it looks: the initialize response is the only
+    # thing a client sees BEFORE calling a tool, and it is the first question
+    # asked during a coordinated upgrade ("which build is answering?"). It used
+    # to go out empty.
+    from . import __version__
     kw = {"instructions": instructions} if instructions else {}
+    kw["version"] = __version__
     try:
         from mcp.server.mcpserver import MCPServer
         return MCPServer(name, **kw)
@@ -299,6 +306,7 @@ def build_server(cfg: Optional[Config] = None):
                      path: Optional[str] = None, tags: Optional[List[str]] = None,
                      title: Optional[str] = None,
                      source: Optional[str] = None, reason: Optional[str] = None,
+                     valid_at: Optional[str] = None,
                      space: Optional[str] = None, space_id: Optional[str] = None,
                      token: Optional[str] = None, ctx: Context = None) -> dict:
         """Create or edit a memory.
@@ -328,6 +336,14 @@ def build_server(cfg: Optional[Config] = None):
 
         `tags` labels it; `title` is a short curated caption (set whole,
         searchable via `memory_recall`); `source`/`reason` record provenance.
+
+        `valid_at` (YYYY-MM-DD) is the day this content was last known to be
+        ACCURATE — not the day you wrote it. Set it when the fact comes from a
+        dated source ("the letter is from 2021-03") or when you have just
+        re-checked one ("still true today"). Omit it and it means "accurate as of
+        now", which is the ordinary case; it may point into the past, and that is
+        not a mistake. Sending only `valid_at` records a re-confirmation without
+        touching the body.
         `space` picks one of your namespaces by name (`space_id` for a shared
         one); omit both when you reach exactly one namespace — with several, say
         which. The answer's `created` says whether
@@ -344,7 +360,8 @@ def build_server(cfg: Optional[Config] = None):
                 if_moved=if_moved, body=body, diff=diff,
                 base_hash=base_hash, replace=replace, replace_all=replace_all,
                 path=path, tags=tags, title=title, source=source,
-                reason=reason, space=space, space_id=space_id))
+                reason=reason, valid_at=valid_at, space=space,
+                space_id=space_id))
 
     @mcp.tool()
     def memory_get(id: Optional[str] = None, at: Optional[str] = None,

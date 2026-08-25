@@ -18,7 +18,7 @@ from pathlib import Path
 from .config import Config
 
 # The version this build migrates the database TO (the latest migration it carries).
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # The compatibility FLOOR: the schema version of the most recent backward-
 # INCOMPATIBLE migration — one that changed the shape/semantics old code relied on
@@ -54,6 +54,15 @@ SCHEMA_VERSION = 16
 #     pre-0015 client neither normalises nor knows to, so its filter for `X402`
 #     stops matching a row now stored as `x402` and it gets an empty result where
 #     rows exist. Silence shaped like an answer, from a filter that looks fine.
+#   v17 (0016): added memory_history.valid_at → additive, floor stays 16. Unlike
+#     0013 this does NOT change what a stored row_hash says: the dimension folds
+#     in only when the column is set, so every row written without it hashes
+#     exactly as before and an older client verifies it correctly. A row that DOES
+#     carry a date is the only one an older client would misjudge — and no
+#     RELEASED build sits between 0015 and 0016 (both ship in 0.7.0), so every
+#     client that can reach such a row already knows the dimension. Shipping an
+#     optional dimension separately from a floor bump would NOT be safe: that is
+#     the case where an older reader calls an untouched chain tampered.
 SCHEMA_BREAKING_VERSION = 16
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are

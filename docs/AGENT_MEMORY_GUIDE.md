@@ -134,9 +134,19 @@ the full trail; don't overwrite.
   returns them — so the agent can (and must) **check a fact's age before treating it
   as current**. A fact that was true once ("we're on Postgres") can be stale ("…six
   weeks after migrating to MySQL").
-- A dedicated "last-verified" date and a review-by field are not first-class yet
-  (see Gaps); until then, note re-confirmation in `reason`/body when you re-check a
-  fact.
+- **`valid_at` is the one that actually answers "is this still true?"** The stamped
+  dates say when a row was WRITTEN, which is a different question: fixing a typo
+  moves `updated_at` without anyone having re-checked the content, and a fact
+  distilled today from a letter dated 2021 is not fresh because the row is new.
+  `valid_at` (YYYY-MM-DD, on the history row) is the day the content was last known
+  to be ACCURATE.
+  - Set it when the fact comes from a dated source, or when you have just
+    re-checked one. Omit it and it means "accurate as of now" — the ordinary case.
+  - It may point into the past. That is not a mistake and nothing enforces order.
+  - Sending ONLY `valid_at` records a re-confirmation (`op: revalidate`) without
+    touching the body — so "I checked, still true" is a first-class entry in the
+    history rather than a fake edit.
+- A review-by field and a staleness sweep are still not first-class (see Gaps).
 
 ### 2.5 Conflict resolution (memory says X, someone says Y)
 
@@ -182,10 +192,12 @@ that make the discipline *stick* are **tool** features still on the roadmap:
 
 - **Semantic dedup-at-write** — flag/merge a near-duplicate on write instead of
   relying on the agent to `find` first.
-- **Freshness fields** — a first-class `last_confirmed_at` / review-by driving a
-  staleness sweep.
+- **Staleness sweep** — `valid_at` records how far forward the evidence reaches
+  (§2.4), but nothing yet SURFACES what has gone quiet: no review-by, no "show me
+  facts whose evidence is older than N months". Recording is in, retrieval is not.
 - **First-class links** — a real link/backlink graph between memories (validated,
   indexed) instead of informal `[[path]]` in the body.
 
 Until those land, the instruction in §1 carries the load; the tool supports the rest
-(tree, tags, title, find, replace, hash-chained history, forget).
+(tree, tags with a shared vocabulary, required titles, recall over titles and
+bodies, replace, hash-chained history with `valid_at`, retention, forget).

@@ -57,6 +57,26 @@ class TooLarge(ValueError):
     """A write or resulting body exceeds the configured ceiling."""
 
 
+def _as_date(value: object):
+    """Accept a `date` or an ISO `YYYY-MM-DD` string; refuse anything else.
+
+    Transports hand this over as JSON, so a string is the common case. Parsing it
+    here rather than letting Postgres cast keeps one spelling for the hash — the
+    digest folds the ISO text, and `"2021-3-4"` and `"2021-03-04"` must not be two
+    different dates to the chain."""
+    import datetime as _dt
+    if value is None or isinstance(value, _dt.date):
+        return value
+    if isinstance(value, str):
+        try:
+            return _dt.date.fromisoformat(value.strip())
+        except ValueError:
+            pass
+    raise ValueError(
+        f"valid_at must be a date as YYYY-MM-DD (got {value!r}) — it is the day "
+        f"the content was last known to be accurate")
+
+
 class MissingTitle(ValueError):
     """A write stored content without a caption, and the deployment requires one
     (``MEMGRES_REQUIRE_TITLE``, default on).
@@ -237,6 +257,46 @@ def _fold(digest: str, label: str, *fields: str) -> str:
 HASH_VERSION = 2
 
 
+def _dim_title(d):
+    if d.get("title_before") is not None or d.get("title_after") is not None:
+        return (d.get("title_before") or "", d.get("title_after") or "")
+    return None
+
+
+def _dim_author(d):
+    if d.get("author_user_id"):
+        return (d["author_user_id"], d.get("author_token_id") or "")
+    return None
+
+
+def _dim_valid_at(d):
+    v = d.get("valid_at")
+    return None if v is None else (v.isoformat() if hasattr(v, "isoformat")
+                                   else str(v),)
+
+
+# The optional dimensions of a history row, in the order they fold.
+#
+# ORDER IS PART OF THE RECIPE and entries are APPEND-ONLY: compute and verify walk
+# this same tuple, so reordering or inserting in the middle changes the digest of
+# rows already written and turns an untouched chain into a "tampered" one. A
+# registry rather than a chain of `if`s because that requirement is a property of
+# the list, and a list can be asserted in a test — an implicit ordering buried in
+# statement order cannot.
+#
+# Each extractor returns the fields to fold, or None to fold NOTHING. That is what
+# makes a dimension additive: a row that never used it hashes exactly as it did
+# before the dimension existed, which is why adding one needs no version bump.
+# The corollary matters as much: a build that does not know a dimension will
+# mis-verify a row that USES it, so a new dimension must ship where no released
+# client can meet such a row (see the v17 note in schema.py).
+OPTIONAL_DIMENSIONS = (
+    ("memgres.title.v1", _dim_title),
+    ("memgres.author.v1", _dim_author),
+    ("memgres.valid_at.v1", _dim_valid_at),
+)
+
+
 def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
               diff: Optional[str], hash_after: Optional[str],
               path_after: Optional[str], tags_after: Optional[Sequence[str]],
@@ -245,6 +305,7 @@ def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
               author_token_id: Optional[str] = None,
               title_before: Optional[str] = None,
               title_after: Optional[str] = None,
+              valid_at: object = None,
               version: int = HASH_VERSION) -> str:
     """The chain digest for one history row, computed by recipe ``version``.
 
@@ -279,13 +340,15 @@ def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
             f"history row uses hash recipe v{version}; this build implements "
             f"v1 and v2 — a newer memgres wrote this row")
     # Each optional dimension folds in ONLY when it was touched on this row. A row
-    # that touched neither title nor author — which includes EVERY row written
-    # before those features — returns the base digest unchanged and still
-    # verifies. Order (title then author) is fixed so compute and verify agree.
-    if title_before is not None or title_after is not None:
-        h = _fold(h, "memgres.title.v1", title_before or "", title_after or "")
-    if author_user_id:
-        h = _fold(h, "memgres.author.v1", author_user_id, author_token_id or "")
+    # that touched none of them — which includes EVERY row written before those
+    # features — returns the base digest unchanged and still verifies.
+    dims = {"title_before": title_before, "title_after": title_after,
+            "author_user_id": author_user_id, "author_token_id": author_token_id,
+            "valid_at": valid_at}
+    for label, extract in OPTIONAL_DIMENSIONS:
+        fields = extract(dims)
+        if fields is not None:
+            h = _fold(h, label, *fields)
     return h
 
 
@@ -464,7 +527,7 @@ class Store:
               base_hash: Optional[str] = None, path: Optional[str] = None,
               tags: Optional[Sequence[str]] = None, source: Optional[str] = None,
               reason: Optional[str] = None,
-              title: Optional[str] = None,
+              title: Optional[str] = None, valid_at: object = None,
               replace: Optional[Sequence[str]] = None, replace_all: bool = False,
               space: Optional[str] = None, space_id: Optional[str] = None) -> Memory:
         """Create a memory, or edit one addressed by `id` or by `at` (its path).
@@ -497,15 +560,17 @@ class Store:
             # `_update` separately — two normalisation sites is how a tag ends up
             # stored one way and filtered another.
             tags = normalize_tags(tags)
+            valid_at = _as_date(valid_at)
             if id is None and at is None:
                 self._check_path_free(ns, path, if_moved)
                 m = self._create(ns, author, body, path, tags, source, reason,
-                                 title)
+                                 title, valid_at)
             else:
                 id, moved_from = self._address(ns, id, at,
                                                follow=if_moved == "follow")
                 m = self._update(ns, author, id, body, diff, base_hash, path,
                                  tags, source, reason, title=title,
+                                 valid_at=valid_at,
                                  replace=replace, replace_all=replace_all)
                 m.moved_from = moved_from
             # Checked on the STORED body, not the request: a substring edit or a
@@ -602,7 +667,7 @@ class Store:
                 f"{self.cfg.max_title_bytes}")
 
     def _create(self, ns, author, body, path, tags, source, reason,
-                title=None) -> Memory:
+                title=None, valid_at=None) -> Memory:
         self._require_title(title, path, body)
         if body is None:
             raise ValueError("create needs a body (diffs apply to an existing memory)")
@@ -633,7 +698,7 @@ class Store:
         # non-empty title at creation is audited (title_before None → title_after).
         self._append_history(str(mid), 1, "create", make_diff("", body), None, chash,
                              None, path, None, tags, source, reason, author,
-                             title_after=(title or None))
+                             title_after=(title or None), valid_at=valid_at)
         return Memory(str(mid), body, chash, tags, path, 1, created_at,
                       updated_at, expires_at, title, created=True)
 
@@ -717,7 +782,7 @@ class Store:
         return cur_body, None             # metadata-only
 
     def _update(self, ns, author, id, body, diff, base_hash, path, tags,
-                source, reason, *, title=None,
+                source, reason, *, title=None, valid_at=None,
                 replace=None, replace_all=False) -> Memory:
         cur = self._conn.cursor()
         cur_body, cur_hash, cur_tags, cur_path, seq, cur_title = self._load(cur, ns, id)
@@ -742,6 +807,11 @@ class Store:
                 op = "retag"
             elif title_changed:
                 op = "retitle"
+            elif valid_at is not None:
+                # Re-confirming a fact changes no content, but it IS an assertion
+                # and belongs in the chain — otherwise the only way to record
+                # "still true on this date" would be a fake edit to the body.
+                op = "revalidate"
             else:
                 # pure touch: renew TTL, no history row
                 cur.execute(
@@ -802,7 +872,8 @@ class Store:
                              new_tags if tags_changed else None,
                              source, reason, author,
                              title_before=cur_title if title_changed else None,
-                             title_after=new_title if title_changed else None)
+                             title_after=new_title if title_changed else None,
+                             valid_at=valid_at)
         return Memory(str(id), new_body, new_hash, new_tags, new_path, new_seq,
                       created_at, updated_at, expires_at, new_title, created=False)
 
@@ -877,7 +948,7 @@ class Store:
     def _append_history(self, memory_id, seq, op, diff, hash_before, hash_after,
                         path_before, path_after, tags_before, tags_after,
                         source, reason, author=None, *,
-                        title_before=None, title_after=None):
+                        title_before=None, title_after=None, valid_at=None):
         author_user_id, author_token_id = author or (None, None)
         cur = self._conn.cursor()
         cur.execute("SELECT row_hash FROM memory_history WHERE memory_id=%s "
@@ -887,18 +958,18 @@ class Store:
         rhash = _row_hash(prev_hash, memory_id, seq, op, diff, hash_after,
                           path_after, tags_after, source, reason,
                           author_user_id, author_token_id,
-                          title_before, title_after)
+                          title_before, title_after, valid_at)
         cur.execute(
             """INSERT INTO memory_history (memory_id, seq, op, diff, hash_before,
                    hash_after, path_before, path_after, tags_before, tags_after,
                    source, reason, author_user_id, author_token_id,
                    title_before, title_after, prev_row_hash, row_hash,
-                   hash_version)
-               VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                   hash_version, valid_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (memory_id, seq, op, diff, hash_before, hash_after, path_before,
              path_after, tags_before, tags_after, source, reason,
              author_user_id, author_token_id, title_before, title_after,
-             prev_hash, rhash, HASH_VERSION))
+             prev_hash, rhash, HASH_VERSION, valid_at))
 
     # ─── recall: lexical / semantic / hybrid ────────────────────────────────
     def recall(self, token: Optional[str], query: str, *, k: int = 10,
@@ -1156,14 +1227,14 @@ class Store:
             "h.source, h.reason, h.author_user_id::text, h.author_token_id::text, "
             "COALESCE(NULLIF(u.full_name, ''), NULLIF(u.name, '')) AS author_name, "
             "NULLIF(u.email, '') AS author_email, "
-            "h.title_before, h.title_after, h.hash_version, "
+            "h.title_before, h.title_after, h.hash_version, h.valid_at, "
             "h.prev_row_hash, h.row_hash, h.created_at FROM memory_history h "
             "LEFT JOIN app_user u ON u.id = h.author_user_id "
             "WHERE h.memory_id=%s ORDER BY h.seq", (id,))
         cols = ["seq", "op", "diff", "hash_before", "hash_after", "path_before",
                 "path_after", "tags_before", "tags_after", "source", "reason",
                 "author_user_id", "author_token_id", "author_name", "author_email",
-                "title_before", "title_after", "hash_version",
+                "title_before", "title_after", "hash_version", "valid_at",
                 "prev_row_hash", "row_hash", "created_at"]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
@@ -1224,6 +1295,7 @@ class Store:
                                r["source"], r["reason"],
                                r["author_user_id"], r["author_token_id"],
                                r["title_before"], r["title_after"],
+                               r["valid_at"],
                                version=int(r["hash_version"] or 1))
             if expect != r["row_hash"] or (r["prev_row_hash"] or None) != prev:
                 return False

@@ -115,3 +115,18 @@ def test_no_secrets_leak(monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ─── the handshake names the build ───────────────────────────────────────────
+def test_the_mcp_handshake_carries_the_version():
+    """The initialize response is the only thing a client sees BEFORE calling a
+    tool — and "which build is answering?" is the first question of every
+    coordinated upgrade. It used to go out empty, so `/mcp` panels showed a blank
+    where the version belongs."""
+    pytest.importorskip("mcp")
+    from memgres import __version__
+    from memgres.mcp_server import _mcp
+    server = _mcp("memgres")
+    reported = (getattr(server, "version", None)
+                or getattr(getattr(server, "_mcp_server", None), "version", None))
+    assert reported == __version__

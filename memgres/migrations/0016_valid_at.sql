@@ -1,0 +1,16 @@
+-- When the recorded fact was last known to be accurate.
+--
+-- `created_at`/`updated_at` say when we WROTE something, which is not the same
+-- question and cannot answer it: fixing a typo moves `updated_at` without anyone
+-- having checked that the content is still true, and a fact distilled today from
+-- a letter dated 2021 is not "fresh" merely because the row is new.
+--
+-- It sits on the history row, not on the memory, because it is a property of one
+-- ASSERTION rather than of the record: different edits speak to different dates,
+-- and the memory has only one column to hold them in. `source`/`reason`/author
+-- live here for the same reason.
+--
+-- Nullable, and null means "accurate as of when it was written" — not "unknown".
+-- Making it required would put a date on every routine edit by hand; making null
+-- mean unknown would make the common case look like a gap.
+ALTER TABLE memory_history ADD COLUMN IF NOT EXISTS valid_at date;

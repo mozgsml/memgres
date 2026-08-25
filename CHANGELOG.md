@@ -5,6 +5,63 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.7.0] — 2026-08-25
+
+Search, tags and retention — three places where memgres answered with silence
+where it should have answered with data, plus the beginning of an answer to "is
+this still true?".
+
+### Breaking
+- **`memory_find` is gone.** It searched titles and nothing else, while
+  `memory_recall` searched bodies and nothing else, so a caller had to guess which
+  half held what it wanted. Lexical recall now matches title OR body and weights a
+  title match higher; `bodies=false` gives the light "where is it" rows `find`
+  returned. Same for `GET /find` and `Store.find`.
+- **`ttl_days` is gone from `memory_write`** (MCP, REST and `Store.write`).
+  Retention is the operator's promise about how long client data is kept, and a
+  per-write override made it advisory: `0` was read as "keep forever", a larger
+  value outran the policy, and an edit that omitted it silently cleared an expiry
+  already set. `MEMGRES_RETENTION_DAYS` is now the only thing that decides.
+- **A write that stores content must supply `title`** (`MEMGRES_REQUIRE_TITLE`,
+  default on). `move`/`retag` are exempt — they store no content.
+- **Compatibility floor 14 → 16.** Migration 0015 normalises stored tags; a client
+  older than 0.7.0 neither normalises nor knows to, so its filter for `X402` would
+  silently miss a row now stored as `x402`. Upgrade every client of a database
+  together.
+
+### Added
+- **`valid_at`** on a write: the day the content was last known to be ACCURATE.
+  `created_at`/`updated_at` say when a row was written, which cannot answer "is
+  this still true" — a typo fix moves `updated_at`, and a fact distilled today
+  from a 2021 letter is not fresh because the row is new. It lives on the history
+  row (a property of one assertion, like `source`), folds into the hash chain, may
+  point into the past, and sending it alone records a re-confirmation as
+  `op: revalidate` rather than forcing a fake edit.
+- **`memory_tags`** — the tag vocabulary in use, most-used first, narrowable by
+  prefix. A writer cannot reuse a label it has never seen.
+- **`match_tags: all | any`** on recall and browse (`@>` vs `&&`, same index).
+- **Retention is actually enforced.** `purge_expired` had no caller anywhere in the
+  tree: expired rows were hidden from reads and never deleted, so "we expire your
+  data after N days" was half a promise. It now runs on a timer
+  (`MEMGRES_RETENTION_SWEEP_INTERVAL`) and takes chunk vectors with it — pgvector
+  cascades on the FK, but qdrant is out-of-band and orphaned points would keep
+  taking candidate slots until `fetch_hit_rows` found no row behind them.
+- The MCP handshake reports the package version; it used to go out empty.
+
+### Changed
+- **Tags are normalised** (NFC + lowercase) on write and on filter, and 0015
+  brings stored rows along. `X402`, `x402` and the two Unicode spellings of "й"
+  were three unrelated labels — 265 distinct tags across 97 memories in the
+  reference corpus, with the filter working perfectly on a vocabulary nothing
+  agreed on.
+- The retention sweep runs independently of the embed worker: that worker only
+  exists when embeddings are configured, so riding on it would have made a
+  lexical-only deployment keep expired data forever. Their shared thread and
+  connection lifecycle moved to `PeriodicWorker`.
+- The hash chain's optional dimensions are an append-only registry
+  (`OPTIONAL_DIMENSIONS`) rather than a chain of `if`s. Order is part of the
+  recipe, and a list can be asserted in a test where statement order cannot.
+
 ## [0.6.0] — 2026-08-24
 
 ### Security

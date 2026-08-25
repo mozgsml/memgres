@@ -74,6 +74,7 @@ def create_app(cfg: Optional[Config] = None):
         title: Optional[str] = None
         source: Optional[str] = None
         reason: Optional[str] = None
+        valid_at: Optional[str] = None       # day the content was last accurate
         space: Optional[str] = None          # namespace name (your own)
         space_id: Optional[str] = None       # namespace id (canonical; shared spaces)
         if_moved: str = "error"              # a vacated `path`: refuse, or "create"
@@ -95,6 +96,7 @@ def create_app(cfg: Optional[Config] = None):
         title: Optional[str] = None
         source: Optional[str] = None
         reason: Optional[str] = None
+        valid_at: Optional[str] = None       # day the content was last accurate
         space: Optional[str] = None
         space_id: Optional[str] = None
         if_moved: str = "error"              # a stale address: refuse, or "follow"
@@ -192,7 +194,7 @@ def create_app(cfg: Optional[Config] = None):
         with pool.connection() as conn:
             m = _guard(lambda: _store(conn).write(
                 tok, body=req.body, path=req.path, tags=req.tags, title=req.title,
-                source=req.source, reason=req.reason,
+                source=req.source, reason=req.reason, valid_at=req.valid_at,
                 if_moved=req.if_moved, space=req.space, space_id=req.space_id))
             return _mem(m)
 
@@ -221,7 +223,7 @@ def create_app(cfg: Optional[Config] = None):
                 replace=_folded_replace(req),
                 replace_all=req.replace_all,
                 path=req.path, tags=req.tags, title=req.title,
-                source=req.source, reason=req.reason,
+                source=req.source, reason=req.reason, valid_at=req.valid_at,
                 space=req.space, space_id=req.space_id))
             return _mem(m)
 
