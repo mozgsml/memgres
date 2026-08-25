@@ -80,7 +80,7 @@ docker compose up
 
 Defaults suit a single-user setup with no auth. To change limits, the embedding provider, tokens, … drop a `.env` beside it — every `MEMGRES_*` is optional (see [Configuration](#configuration) or [.env.example](.env.example)).
 
-**Give it to an LLM / agent — no code (MCP).** Point any URL-capable MCP client (Cursor, Cline, Claude Desktop, …) at the running server; the model gets `memory_write`, `memory_recall`, `memory_get`, `memory_list`, `memory_blame`, `memory_history`, `memory_move`, `memory_forget`, `memory_server_info` as tools:
+**Give it to an LLM / agent — no code (MCP).** Point any URL-capable MCP client (Cursor, Cline, Claude Desktop, …) at the running server; the model gets `memory_write`, `memory_recall`, `memory_get`, `memory_list`, `memory_tags`, `memory_links`, `memory_blame`, `memory_history`, `memory_move`, `memory_forget`, `memory_server_info` as tools:
 
 ```json
 {
@@ -155,7 +155,7 @@ Not sure which fits? Start with the decision guide: [docs/CHOOSING.md](docs/CHOO
 1. **`docker compose up`** — `pgvector` + service, nothing to configure. For a dedicated vector service instead, `docker compose --profile qdrant up` and set `MEMGRES_VECTOR_BACKEND=qdrant` (Qdrant ranks vectors; Postgres still holds bodies and does tag/subtree/TTL filtering).
 2. **Your own Postgres** — install the `[server]` extra (above), point `MEMGRES_DATABASE_URL` at it, run `memgres-server` (migrates on startup).
 3. **Embedded library** — install the core package, use `Store` directly, no HTTP at all.
-4. **Split service (many clients)** — a stateless API tier that only flags writes plus a scalable `memgres-worker` tier that embeds; see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) and `deploy/docker-compose.yml`. Switch the embedding model later with `memgres-reembed`.
+4. **Split service (many clients)** — a stateless API tier that only flags writes plus a scalable `memgres-worker` tier that embeds; see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) and `deploy/docker-compose.yml`. Switch the embedding model later with `memgres-reembed`; rebuild the link graph with `memgres-relink`.
 
 Semantic recall is optional: the default `MEMGRES_EMBED_PROVIDER=none` gives you lexical FTS with zero models. Turn on `local` (sentence-transformers), a cloud API (`openai`/`jina`), or any OpenAI-compatible server (LM Studio, Ollama, …) when you want meaning-based search — see [docs/EMBEDDINGS.md](docs/EMBEDDINGS.md) for choosing local vs cloud and [docs/BACKENDS.md](docs/BACKENDS.md) for copy-paste setups. The model id + dimension get stamped into the schema and a later mismatch hard-fails instead of silently returning garbage.
 
@@ -293,8 +293,8 @@ pip install "memgres[mcp]"
 ```
 
 Either way the model gets tools `memory_write`, `memory_recall`, `memory_get`,
-`memory_list`, `memory_blame`, `memory_history`, `memory_move`, `memory_forget`,
-`memory_server_info`. Tell it *"remember X"* / *"what do you know about Y?"* and it
+`memory_list`, `memory_tags`, `memory_links`, `memory_blame`, `memory_history`,
+`memory_move`, `memory_forget`, `memory_server_info`. Tell it *"remember X"* / *"what do you know about Y?"* and it
 calls them. (For semantic recall add the embedding env vars — see
 [docs/BACKENDS.md](docs/BACKENDS.md).)
 

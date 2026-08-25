@@ -331,3 +331,57 @@ def test_an_expired_source_stops_appearing_in_backlinks(store):
                     "WHERE id=%s", (src.id,))
     store._conn.commit()
     assert store.links(None, target.id)["in"] == []
+
+
+# ═══ the backfill ════════════════════════════════════════════════════════════
+def test_a_corpus_written_before_the_graph_gets_one(store):
+    """Edges are derived on write, so an existing corpus would upgrade into a
+    perfectly empty graph — and `memory_links` would answer "nothing points here"
+    for every memory, which reads like a fact rather than like "not indexed yet".
+    """
+    from memgres.relink import rebuild
+    target = store.write(body="the runbook", path="ops.deploy")
+    src = store.write(body="see [[ops.deploy]]", path="notes.a")
+    # Simulate the pre-graph state: bodies stored, no edges.
+    with store._conn.cursor() as cur:
+        cur.execute("DELETE FROM memory_link")
+        cur.execute("UPDATE memgres_meta SET links_built = false")
+    store._conn.commit()
+    assert store.links(None, target.id)["in"] == []
+
+    assert rebuild(store._conn, store.cfg) == 2
+    store._conn.commit()
+    assert [r["id"] for r in store.links(None, target.id)["in"]] == [src.id]
+    assert store.links(None, src.id)["out"][0]["id"] == target.id
+
+
+def test_the_backfill_runs_once(store):
+    from memgres.relink import rebuild
+    store.write(body="see [[ops.deploy]]", path="notes.a")
+    with store._conn.cursor() as cur:
+        cur.execute("UPDATE memgres_meta SET links_built = false")
+    store._conn.commit()
+
+    assert rebuild(store._conn, store.cfg) == 1
+    store._conn.commit()
+    assert rebuild(store._conn, store.cfg) == 0        # flag set: no rescan
+    assert rebuild(store._conn, store.cfg, force=True) == 1   # unless forced
+
+
+def test_the_backfill_does_not_cross_namespaces(tenants):
+    from memgres.relink import rebuild
+    s, user = tenants
+    a_tok, _ = user("alice", "alpha")
+    b_tok, _ = user("bob", "beta")
+    b_target = s.write(b_tok, body="bob's runbook", path="ops.deploy", space="beta")
+    a_src = s.write(a_tok, body="see [[ops.deploy]]", path="notes.a", space="alpha")
+
+    with s._conn.cursor() as cur:
+        cur.execute("DELETE FROM memory_link")
+        cur.execute("UPDATE memgres_meta SET links_built = false")
+    s._conn.commit()
+    rebuild(s._conn, s.cfg, force=True)
+    s._conn.commit()
+
+    [edge] = s.links(a_tok, a_src.id)["out"]
+    assert edge["resolved"] is False and edge["id"] != b_target.id

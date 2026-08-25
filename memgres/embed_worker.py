@@ -92,6 +92,10 @@ def wire_server(cfg, embedder):
     # Retention answers to its own policy, not to whether embeddings are on: a
     # lexical-only deployment must still stop holding expired data.
     maybe_start_sweeper(cfg, connect, embedder, backend)
+    # One-time, synchronous: a server that starts serving `memory_links` before
+    # the graph exists would answer "nothing points here" for every memory.
+    from .relink import maybe_backfill
+    maybe_backfill(cfg, connect)
     dispatch = "async" if worker is not None else cfg.embed_dispatch
     if dispatch == "async" and worker is None and backend is not None:
         # async + no local worker: writes will flag embed_pending and this process

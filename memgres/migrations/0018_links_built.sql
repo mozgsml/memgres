@@ -1,0 +1,12 @@
+-- Has the link index been built for the memories that predate it?
+--
+-- Edges are derived from body text, and they are only derived ON WRITE. Without
+-- a one-time backfill an existing corpus would upgrade into a link graph that is
+-- perfectly empty — and `memory_links` would answer "nothing points here" for
+-- every memory, which reads like a fact rather than like "not indexed yet". The
+-- same silence-shaped-as-an-answer this project keeps paying for elsewhere.
+--
+-- A flag rather than "is the table empty?": a corpus with genuinely no links is
+-- indistinguishable from an unbuilt one by emptiness alone, so that test would
+-- rescan every corpus without links on every start, forever.
+ALTER TABLE memgres_meta ADD COLUMN IF NOT EXISTS links_built boolean NOT NULL DEFAULT false;

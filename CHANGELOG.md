@@ -8,8 +8,36 @@ patch = fixes).
 ## [0.7.0] — 2026-08-25
 
 Search, tags and retention — three places where memgres answered with silence
-where it should have answered with data, plus the beginning of an answer to "is
-this still true?".
+where it should have answered with data — plus the beginning of an answer to "is
+this still true?", and the link graph the corpus had been writing by hand all
+along.
+
+### Links
+- **`[[wiki links]]` in a body are now edges you can walk, in both directions.**
+  The convention was already load-bearing with no tool behind it: 238 links
+  across the 97 memories of the reference corpus, 91% resolving. What text could
+  not do was answer "what points HERE" — the question that matters when a fact
+  changes — and 42 of those memories had no inbound link at all.
+  - `[[path]]`, `[[path#anchor]]`, `[[path|label]]`, `[[path#anchor|label]]`;
+    `#` before `|` as in every wiki dialect. `[[idea:slug]]` / `[[file:slug]]`
+    point at other stores and are recorded but never resolved here.
+  - Edges pin the target's `id` at write time, so a link survives its target
+    moving and cannot be hijacked by something later claiming the vacated path.
+  - Unresolved is a real state, not an error: a link to something not yet
+    written stands as `resolved: false` and binds itself when the target appears
+    (or when a memory moves onto that path). A target later erased nulls the
+    edge rather than letting it drift onto whatever takes the path next.
+  - Code spans and fenced blocks are not scanned — the corpus's own notes
+    explain the syntax in backticks, and a validator that flags its own
+    documentation teaches everyone to ignore it. URLs and prose stay prose.
+  - Links never cross a tenant boundary; the backlink query re-applies the
+    namespace predicate rather than trusting that rule.
+  - `memory_links` (MCP) / `GET /memories/{id}/links` (REST).
+- **The graph is backfilled once, automatically**, and `memgres-relink` forces a
+  rebuild. Deriving edges only on write would have upgraded every existing
+  corpus into an empty graph that answered "nothing points here" for every
+  memory — a fact-shaped silence, which is the failure this release is mostly
+  about.
 
 ### Breaking
 - **`memory_find` is gone.** It searched titles and nothing else, while

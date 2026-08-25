@@ -95,6 +95,12 @@ retrieve from the transcript firehose.
   edits possible — you can't cleanly update a fact buried in a 60 KB page.
 - **Attribute everything.** Set `source` on every write. A fact you can't trace you
   can't verify or safely supersede.
+- **Link, don't restate.** Write `[[path]]` in the body (or
+  `[[path#anchor|label]]`) instead of repeating what another memory says. The links
+  become a real graph: `memory_links` walks it in both directions, and the INBOUND
+  half is the one that matters — before changing a fact, it tells you who is relying
+  on it. A link to something not written yet is fine and deliberate: it stands as
+  `resolved: false` and binds itself when the target appears.
 - **Reuse the tag vocabulary.** `memory_tags` lists what is already in use;
   a label you invent that exists in another wording becomes a second, unrelated
   tag. Case and Unicode form are normalised for you — wording is not.
@@ -195,9 +201,12 @@ that make the discipline *stick* are **tool** features still on the roadmap:
 - **Staleness sweep** — `valid_at` records how far forward the evidence reaches
   (§2.4), but nothing yet SURFACES what has gone quiet: no review-by, no "show me
   facts whose evidence is older than N months". Recording is in, retrieval is not.
-- **First-class links** — a real link/backlink graph between memories (validated,
-  indexed) instead of informal `[[path]]` in the body.
+- **Anchors are a hint, not a contract.** `[[path#anchor]]` is recorded, but
+  nothing yet resolves it to a place inside the body — a link lands on the whole
+  memory. When you need to point at part of one, that is usually a sign the target
+  should be split.
 
 Until those land, the instruction in §1 carries the load; the tool supports the rest
 (tree, tags with a shared vocabulary, required titles, recall over titles and
-bodies, replace, hash-chained history with `valid_at`, retention, forget).
+bodies, the link graph with backlinks, replace, hash-chained history with
+`valid_at`, retention, forget).
