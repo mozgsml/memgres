@@ -127,6 +127,15 @@ def test_the_mcp_handshake_carries_the_version():
     from memgres import __version__
     from memgres.mcp_server import _mcp
     server = _mcp("memgres")
-    reported = (getattr(server, "version", None)
-                or getattr(getattr(server, "_mcp_server", None), "version", None))
-    assert reported == __version__
+    # Whichever SDK generation is installed, the version must reach the wire.
+    # Reading it off the object is not enough — on one generation it lives on the
+    # lowlevel server underneath, and only `create_initialization_options` proves
+    # which value the client will actually be told.
+    low = getattr(server, "_mcp_server", None) or getattr(
+        server, "_lowlevel_server", None)
+    if low is not None and hasattr(low, "create_initialization_options"):
+        assert low.create_initialization_options().server_version == __version__
+    else:
+        reported = (getattr(server, "version", None)
+                    or getattr(low, "version", None))
+        assert reported == __version__

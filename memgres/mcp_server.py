@@ -161,15 +161,26 @@ def _mcp(name: str, instructions: Optional[str] = None):
     # thing a client sees BEFORE calling a tool, and it is the first question
     # asked during a coordinated upgrade ("which build is answering?"). It used
     # to go out empty.
+    import inspect
+
     from . import __version__
     kw = {"instructions": instructions} if instructions else {}
-    kw["version"] = __version__
     try:
-        from mcp.server.mcpserver import MCPServer
-        return MCPServer(name, **kw)
+        from mcp.server.mcpserver import MCPServer as _Server
     except ImportError:
-        from mcp.server.fastmcp import FastMCP
-        return FastMCP(name, **kw)
+        from mcp.server.fastmcp import FastMCP as _Server
+    # `version` is a constructor argument on one SDK generation and not the
+    # other, where it lives on the lowlevel server underneath. Asked rather than
+    # tried, so a TypeError from something else is not swallowed as "no version
+    # here" — and set either way, because the point is that the handshake carries
+    # it, not which class holds the field.
+    if "version" in inspect.signature(_Server.__init__).parameters:
+        kw["version"] = __version__
+    server = _Server(name, **kw)
+    low = getattr(server, "_mcp_server", None)
+    if low is not None and not getattr(low, "version", None):
+        low.version = __version__
+    return server
 
 
 def _mem(m) -> dict:
