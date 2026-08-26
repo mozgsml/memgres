@@ -18,7 +18,7 @@ from pathlib import Path
 from .config import Config
 
 # The version this build migrates the database TO (the latest migration it carries).
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 # The compatibility FLOOR: the schema version of the most recent backward-
 # INCOMPATIBLE migration — one that changed the shape/semantics old code relied on
@@ -68,6 +68,9 @@ SCHEMA_VERSION = 19
 #     missing until something re-writes those bodies, which costs completeness of
 #     a new feature, not correctness of an old one.
 #   v19 (0018): added memgres_meta.links_built → additive, floor stays 16.
+#   v20 (0019): added the memory_usage table → additive, floor stays 16. An older
+#     client simply does not count; the statistics have a gap, and nothing an old
+#     reader relies on changed shape.
 SCHEMA_BREAKING_VERSION = 16
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are

@@ -107,6 +107,10 @@ class Config:
                                  #     deployment where an external worker embeds.
     embed_worker: bool           # a server process runs an in-process embed worker
     embed_worker_interval: float # seconds the idle worker sleeps between drains
+    usage_counters: bool         # count how often each memory surfaces in search and
+                                 # is read in full. Off makes reads pure again — for
+                                 # a read-only replica, or a deployment unwilling to
+                                 # pay one small write per read.
     retention_sweep: bool        # this process runs the retention sweep
     retention_sweep_interval: float  # seconds between retention sweeps (see retention_days)
     embed_max_attempts: int      # after this many failed embed attempts a row is a
@@ -222,6 +226,7 @@ def load() -> Config:
         embed_dispatch=_str("MEMGRES_EMBED_DISPATCH", "inline"),
         embed_worker=_bool("MEMGRES_EMBED_WORKER", True),
         embed_worker_interval=_float("MEMGRES_EMBED_WORKER_INTERVAL", 1.0),
+        usage_counters=_bool("MEMGRES_USAGE_COUNTERS", True),
         retention_sweep=_bool("MEMGRES_RETENTION_SWEEP", True),
         retention_sweep_interval=_float("MEMGRES_RETENTION_SWEEP_INTERVAL", 3600.0),
         embed_max_attempts=_int("MEMGRES_EMBED_MAX_ATTEMPTS", 5),

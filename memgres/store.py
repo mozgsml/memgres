@@ -48,6 +48,11 @@ _log = logging.getLogger("memgres.store")
 # cannot pick whichever path forgot to clamp.
 MAX_RESULTS = 500
 
+# The two ways a memory gets used, and the columns that record each. Fixed
+# constants, not caller input — they are interpolated into SQL.
+_USAGE_COLUMNS = {"get": ("get_count", "last_get_at"),
+                  "recall": ("recall_count", "last_recall_at")}
+
 
 class Conflict(RuntimeError):
     """base_hash didn't match the current body — re-read and retry (HTTP 409)."""
@@ -230,6 +235,9 @@ class Memory:
     partial: bool = False
     lines: Optional[List[List[int]]] = None    # contiguous runs actually returned
     total_lines: Optional[int] = None
+    # how much this memory is used — set only by `get`, and only when the
+    # deployment counts (see `_count_usage`). A write does not have it.
+    usage: Optional[dict] = None
 
     def to_dict(self, *, stringify_dates: bool = False) -> dict:
         """Serialize for an API layer. ``stringify_dates`` str()-coerces the
@@ -243,7 +251,11 @@ class Memory:
                 "updated_at": d(self.updated_at), "expires_at": d(self.expires_at),
                 "created": self.created, "moved_from": self.moved_from,
                 "warnings": self.warnings, "partial": self.partial,
-                "lines": self.lines, "total_lines": self.total_lines}
+                "lines": self.lines, "total_lines": self.total_lines,
+                "usage": ({**self.usage,
+                           "last_recall_at": d(self.usage["last_recall_at"]),
+                           "last_get_at": d(self.usage["last_get_at"])}
+                          if self.usage else None)}
 
 
 def _sha(text: str) -> str:
@@ -849,7 +861,7 @@ class Store:
                 cur.execute(
                     f"UPDATE memory SET updated_at=now(), expires_at={self._expiry_sql()} "
                     "WHERE id=%s", (id,))
-                touched = self.get(None, id, _ns=ns, renew=False)
+                touched = self.get(None, id, _ns=ns, renew=False, _count=False)
                 touched.created = False
                 return touched
 
@@ -1134,6 +1146,10 @@ class Store:
                        tags_match=check_tag_match(match_tags))
         for h in hits:
             h.space = names.get(h.namespace)
+        # A hit is a surfacing: this memory was findable for what someone asked.
+        # Counted for what came BACK, not for what was considered — a candidate
+        # the ranking discarded showed nobody anything.
+        self._count_usage("recall", [h.id for h in hits])
         return hits
 
     # ─── links: the graph between memories ──────────────────────────────────
@@ -1283,12 +1299,16 @@ class Store:
         head = [] if bodies else [self.cfg.list_preview_chars]
         cur.execute(
             f"SELECT id, path::text, tags, title, {shown} AS shown, "
-            "created_at, updated_at, namespace "
-            f"FROM memory WHERE {where} ORDER BY namespace, path, id "
+            "created_at, updated_at, namespace, "
+            # Browsing is where usage becomes actionable: it is how you find the
+            # subtree nobody reads. No row yet means never used, which is zero.
+            "COALESCE(u.recall_count, 0), COALESCE(u.get_count, 0) "
+            "FROM memory LEFT JOIN memory_usage u ON u.memory_id = memory.id "
+            f"WHERE {where} ORDER BY namespace, path, id "
             "LIMIT %s OFFSET %s",
             head + params + [limit, offset])
         cols = ["id", "path", "tags", "title", "shown", "created_at",
-                "updated_at", "space_id"]
+                "updated_at", "space_id", "recalled", "gets"]
         budget = self.cfg.list_bodies_max_bytes
         rows, wanted = [], []
         for r in cur.fetchall():
@@ -1402,10 +1422,49 @@ class Store:
                           source=source, reason=reason,
                           space=space, space_id=space_id)
 
+    # ─── usage counters ─────────────────────────────────────────────────────
+    def _count_usage(self, kind: str, ids: Sequence[str], *,
+                     want: bool = False) -> Optional[dict]:
+        """Record that these memories were used — `kind` is ``"get"`` (read in
+        full) or ``"recall"`` (came back as a search hit) — and, with `want`,
+        return the totals including this one.
+
+        Best-effort by design, in its own transaction: statistics must never be
+        the reason a read fails, so a counter that cannot be written is logged and
+        the caller still gets their answer. For the same reason none of this
+        touches `memory` or the hash chain — a read must not rewrite a row that
+        holds a body, and `verify_history` must not become a function of how often
+        a memory was read (see migration 0019).
+
+        Rows appear on first use, so "never used" needs no storage.
+        """
+        if not self.cfg.usage_counters or not ids:
+            return None
+        col, ts = _USAGE_COLUMNS[kind]
+        try:
+            with self._conn.transaction(), self._conn.cursor() as cur:
+                cur.execute(
+                    f"INSERT INTO memory_usage (memory_id, {col}, {ts}) "
+                    f"SELECT u, 1, clock_timestamp() FROM unnest(%s::uuid[]) AS u "
+                    f"ON CONFLICT (memory_id) DO UPDATE "
+                    f"    SET {col} = memory_usage.{col} + 1, {ts} = clock_timestamp() "
+                    + ("RETURNING recall_count, get_count, last_recall_at, "
+                       "last_get_at" if want else ""),
+                    (list(ids),))
+                row = cur.fetchone() if want else None
+        except Exception:
+            _log.warning("usage counters: could not record %s", kind,
+                         exc_info=True)
+            return None
+        if row is None:
+            return None
+        return {"recalled": int(row[0]), "gets": int(row[1]),
+                "last_recall_at": row[2], "last_get_at": row[3]}
+
     # ─── read ───────────────────────────────────────────────────────────────
     def get(self, token: Optional[str], id: Optional[str] = None, *,
             at: Optional[str] = None, if_moved: str = "follow",
-            lines: Optional[str] = None,
+            lines: Optional[str] = None, _count: bool = True,
             renew: bool = True, _ns: Optional[str] = None,
             space: Optional[str] = None, space_id: Optional[str] = None) -> Memory:
         """Fetch one memory by `id`, or by `at` — the path it lives at.
@@ -1441,6 +1500,11 @@ class Store:
                     (id,))
         m = Memory(str(row[0]), row[1], row[2], list(row[3]), row[4], row[5],
                    row[6], row[7], row[8], row[9], moved_from=moved_from)
+        # Counted only for a read someone ASKED for. `_count=False` is how the
+        # write path reads a row back mid-edit, and counting that would measure
+        # the store working rather than the memory being used.
+        if _count:
+            m.usage = self._count_usage("get", [m.id], want=True)
         return _slice_lines(m, lines) if lines else m
 
     def history(self, token: Optional[str], id: Optional[str] = None, *,

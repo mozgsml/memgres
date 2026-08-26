@@ -395,6 +395,9 @@ def build_server(cfg: Optional[Config] = None):
         address changed — use the new `path` from then on. `if_moved="error"` asks
         to be told rather than redirected.
 
+        The answer carries `usage`: how often this memory has surfaced in search
+        (`recalled`) and been fetched (`gets`), and when each last happened.
+
         `lines` ("40-80", "5", "1,10-12") returns only part of a long body. The
         answer is then marked `partial`, carries `total_lines`, and has NO
         `content_hash` — do not send a slice back as a whole `body`, or
@@ -466,7 +469,11 @@ def build_server(cfg: Optional[Config] = None):
         a fetch per row; it is capped in total, and rows past the cap come back
         with `body_omitted=true` rather than being silently dropped.
         `space`/`space_id` pick the namespace(s) — a name, a list, or `"all"`;
-        required when you reach several. Rows carry `space`/`space_id`."""
+        required when you reach several. Rows carry `space`/`space_id`, plus
+        `recalled`/`gets` — how often each memory has surfaced in a search and
+        been read in full. That pair is how you find dead weight: surfaced often
+        but never opened is noise in results; neither is a memory nobody can
+        reach."""
         with pool.connection() as conn:
             return _store(conn).list(
                 _token(ctx, token), path_prefix=path_prefix, tags=tags,
