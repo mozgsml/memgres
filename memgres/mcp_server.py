@@ -27,6 +27,9 @@ from __future__ import annotations
 
 from typing import List, Literal, Optional, Union
 
+from pydantic import Field
+from typing_extensions import Annotated
+
 try:  # mcp SDK >= 2.0 renamed the module fastmcp -> mcpserver
     from mcp.server.mcpserver import Context
 except ImportError:  # mcp SDK 1.x
@@ -43,6 +46,40 @@ from .store import Store, build_replace, fold_replace_aliases
 # One namespace, several, or the keyword "all" — the address shape every search
 # tool accepts. Named once so the three tools cannot drift apart.
 Spaces = Optional[Union[str, List[str]]]
+
+# Per-parameter descriptions, because a tool's PROSE is the part that gets cut.
+# A long docstring is truncated tail-first by clients that cap it, and the tail is
+# where the newest rules land — `valid_at` shipped documented only there, which
+# from the schema's side means undocumented. A `Field` description travels with
+# the parameter and survives that.
+SourceArg = Annotated[Optional[str], Field(
+    default=None,
+    description="Where this knowledge came from, as an ADDRESS someone else can "
+                "follow back to the original: host + absolute path + date; mailbox, "
+                "sender -> recipient, date, subject; messenger, who with whom, date; "
+                "machine + project + session/transcript for an agent run; full URL + "
+                "date read. 'email', 'the meeting', 'the user said' is not one — "
+                "nothing can be reached through it, so the fact can only be believed.")]
+ReasonArg = Annotated[Optional[str], Field(
+    default=None,
+    description="Why this write happened — what changed and why, in one line. Kept "
+                "in history next to the diff.")]
+ValidAtArg = Annotated[Optional[str], Field(
+    default=None,
+    description="A DATE, YYYY-MM-DD: the day this content was last known to be "
+                "ACCURATE — not when you wrote it. Use it when the knowledge is "
+                "older or newer than the write: a fact distilled today from a 2021 "
+                "letter is valid_at 2021-…, and re-checking an old memory today "
+                "records today WITHOUT touching the body. Leave it unset for an "
+                "ordinary edit, which is accurate as of now.")]
+IfMovedArg = Annotated[Literal["error", "follow", "create"], Field(
+    default="error",
+    description="What to do when the address you used is one a memory MOVED AWAY "
+                "from. Reading follows by default (you get the memory, plus "
+                "`moved_from`); writing refuses by default, because an edit landing "
+                "on a memory you did not name is not recoverable — 'follow' edits it "
+                "where it is now, 'create' claims the vacated path for something new. "
+                "Erasing never follows and has no such option.")]
 
 
 # The MCP `initialize` response carries a server-side `instructions` string; a
@@ -217,20 +254,7 @@ def build_server(cfg: Optional[Config] = None):
     _worker, cfg, backend = wire_server(cfg, embedder)
     mcp = _mcp("memgres", instructions=_instruction_text())
 
-    # Should the LLM-facing tools carry a `token` argument at all?
-    #   MEMGRES_MCP_TOKEN_ARG = on | off | auto (default).
-    # auto: expose it only on a genuinely multi-tenant endpoint with no pinned
-    # default token — i.e. when the LLM really must supply the identity. When the
-    # identity is pinned (MEMGRES_TOKEN, or a per-client Authorization header) or
-    # in single mode, the argument is pruned so the agent never sees or fills it.
     import os as _os
-    _arg = _os.environ.get("MEMGRES_MCP_TOKEN_ARG", "auto").strip().lower()
-    if _arg in ("1", "true", "on", "yes"):
-        expose_token = True
-    elif _arg in ("0", "false", "off", "no"):
-        expose_token = False
-    else:
-        expose_token = cfg.key_mode != "single" and not cfg.default_token
 
     # The control-plane tools. `auto` registers them wherever there are
     # identities to administer — that is every mode except `single`, which has
@@ -258,18 +282,22 @@ def build_server(cfg: Optional[Config] = None):
 
     _TOKEN_TIMES = ("expires_at", "revoked_at", "last_used_at", "created_at")
 
-    def _token(ctx, arg: Optional[str] = None) -> Optional[str]:
+    def _token(ctx) -> Optional[str]:
         """The caller's token, resolved **authoritatively** so a pin can't be
         overridden by the model:
 
           1. a per-client ``Authorization: Bearer`` / ``X-Memgres-Token`` header
              (http transport) — how a client pins its own identity;
-          2. else ``MEMGRES_TOKEN`` — a pinned default the arg cannot override;
-          3. else the explicit ``arg`` — only meaningful on an unpinned,
-             multi-tenant endpoint (where the arg is exposed).
+          2. else ``MEMGRES_TOKEN`` — the credential a stdio endpoint is
+             configured with, in the `env` of the client's MCP entry.
 
-        Security does not depend on the schema-pruning below: even if the `token`
-        argument stays visible, a header/env pin still wins here."""
+        There is no third place, and deliberately no `token` TOOL ARGUMENT: both
+        transports can already be configured with a credential — http carries a
+        header, and a stdio server is spawned by its client with an env — so an
+        argument could only ever name an identity the DEPLOYMENT did not choose.
+        In `open` mode that was a live hazard rather than clutter: tokens
+        self-register on first write, so a model that invented an `mgk_…` string
+        created a namespace nobody else could see and wrote into it."""
         # The two SDK generations hand the request out differently: 1.x wraps it
         # in a `Context` (`.request_context.request`), 2.x passes the
         # `ServerRequestContext` itself, which carries `.request`. Accept both —
@@ -292,7 +320,7 @@ def build_server(cfg: Optional[Config] = None):
                     return tok
             except Exception:
                 pass
-        return cfg.default_token or arg or None
+        return cfg.default_token or None
 
     def _uid(conn, token: Optional[str]) -> str:
         """Resolve a token to its user id (for read-level identity tools)."""
@@ -326,7 +354,7 @@ def build_server(cfg: Optional[Config] = None):
     @mcp.tool()
     def memory_write(body: Optional[str] = None, id: Optional[str] = None,
                      at: Optional[str] = None,
-                     if_moved: Literal["error", "follow", "create"] = "error",
+                     if_moved: IfMovedArg = "error",
                      diff: Optional[str] = None, base_hash: Optional[str] = None,
                      replace_old: Optional[str] = None,
                      replace_new: Optional[str] = None, replace_all: bool = False,
@@ -336,56 +364,34 @@ def build_server(cfg: Optional[Config] = None):
                      new_str: Optional[str] = None,
                      path: Optional[str] = None, tags: Optional[List[str]] = None,
                      title: Optional[str] = None,
-                     source: Optional[str] = None, reason: Optional[str] = None,
-                     valid_at: Optional[str] = None,
+                     source: SourceArg = None, reason: ReasonArg = None,
+                     valid_at: ValidAtArg = None,
                      space: Optional[str] = None, space_id: Optional[str] = None,
-                     token: Optional[str] = None, ctx: Context = None) -> dict:
-        """Create or edit a memory.
+                     ctx: Context = None) -> dict:
+        """Create or edit a memory. (Per-argument rules are on the arguments.)
 
-        EDIT an existing one by addressing it — `id`, or `at` (the tree path it
-        lives at, e.g. at="decisions.pricing") — plus ONE of: a whole new `body`;
-        a substring edit `replace_old`→`replace_new` — also accepted as
-        `old_string`/`new_string` or `old_str`/`new_str`, the spellings file
-        editors use (the server finds `replace_old`
-        and rewrites just it — no diff to hand-build, and a body larger than the
-        write cap stays editable since only old+new are sent; `replace_old` must
-        be unique unless `replace_all=true`); or a unified `diff` with the
-        `base_hash` it was cut from.
+        EDIT an existing one by addressing it — `id`, or `at` (the path it lives
+        at, e.g. at="decisions.pricing") — plus ONE of: a whole new `body`; a
+        substring edit `replace_old`→`replace_new` (no diff to hand-build, and a
+        body past the write cap stays editable because only old+new are sent;
+        `replace_old` must be unique unless `replace_all=true`); or a unified
+        `diff` with the `base_hash` it was cut from.
 
-        CREATE by giving neither `id` nor `at` (needs `body`). `path` files the
-        new memory at an address. Note the difference: **`at` finds an existing
-        memory, `path` says where a memory lives.** Creating at a path something
-        else already occupies is refused, naming the occupant — edit that one with
-        `at` instead of making a near-duplicate beside it.
-
-        If the address you used is one a memory MOVED AWAY from, the write is
-        refused and the error says where it went — otherwise your edit would land
-        on a memory you didn't name, or quietly become a SECOND memory on the same
-        subject while the first lives on elsewhere. Then decide: `if_moved="follow"`
-        to edit it at its new address, or `if_moved="create"` to claim the vacated
-        path for something genuinely new.
+        CREATE by giving neither `id` nor `at` (needs `body`). **`at` finds an
+        existing memory, `path` says where a memory lives.** Creating at an
+        occupied path is refused, naming the occupant — edit THAT one instead of
+        leaving a near-duplicate beside it.
 
         **`title` is REQUIRED** for any write that stores content — a create, or
-        an edit that changes the body. (Re-addressing with `path` and relabelling
-        with `tags` are exempt.) It is a short curated caption, set whole; it
-        names the memory in results, and recall weights a match there above one in
-        the body. Omit it and the write is refused, naming the memory so you can
-        caption it from the error. `source`/`reason` record provenance.
-        Link other memories from the body as `[[path]]` (or
-        `[[path#anchor|label]]`) — they become a real graph you can walk with
-        `memory_links`, including backwards.
+        an edit that changes the body; re-addressing with `path` and relabelling
+        with `tags` are exempt. A short curated caption, set whole: it names the
+        memory in results and recall weights a match there above one in the body.
 
-        `valid_at` (YYYY-MM-DD) is the day this content was last known to be
-        ACCURATE — not the day you wrote it. Set it when the fact comes from a
-        dated source ("the letter is from 2021-03") or when you have just
-        re-checked one ("still true today"). Omit it and it means "accurate as of
-        now", which is the ordinary case; it may point into the past, and that is
-        not a mistake. Sending only `valid_at` records a re-confirmation without
-        touching the body.
-        `space` picks one of your namespaces by name (`space_id` for a shared
-        one); omit both when you reach exactly one namespace — with several, say
-        which. The answer's `created` says whether
-        this made a new memory or edited one."""
+        Link other memories from the body as `[[path]]` (or `[[path#anchor|label]]`)
+        — they become a graph `memory_links` walks in both directions. `space`
+        picks one of your namespaces by name (`space_id` for a shared one); omit
+        both when you reach exactly one. The answer's `created` says whether this
+        made a new memory or edited one."""
         folded = fold_replace_aliases(
             {"replace_old": replace_old, "replace_new": replace_new,
              "old_string": old_string, "new_string": new_string,
@@ -394,7 +400,7 @@ def build_server(cfg: Optional[Config] = None):
                                 folded.get("replace_new"))
         with pool.connection() as conn:
             return _mem(_store(conn).write(
-                _token(ctx, token), id=id or None, at=at or None,
+                _token(ctx), id=id or None, at=at or None,
                 if_moved=if_moved, body=body, diff=diff,
                 base_hash=base_hash, replace=replace, replace_all=replace_all,
                 path=path, tags=tags, title=title, source=source,
@@ -407,7 +413,7 @@ def build_server(cfg: Optional[Config] = None):
                    lines: Optional[str] = None,
                    space: Optional[str] = None,
                    space_id: Optional[str] = None,
-                   token: Optional[str] = None, ctx: Context = None) -> dict:
+                   ctx: Context = None) -> dict:
         """Fetch one memory, by `id` or by `at` — the tree path it lives at
         (`at="decisions.pricing"`). Renews its TTL. If that path has since moved,
         you get the memory anyway and `moved_from` in the answer tells you the
@@ -423,7 +429,7 @@ def build_server(cfg: Optional[Config] = None):
         everything outside it is erased. To change part of a long memory use
         `replace_old`/`replace_new` instead."""
         with pool.connection() as conn:
-            return _mem(_store(conn).get(_token(ctx, token), id, at=at,
+            return _mem(_store(conn).get(_token(ctx), id, at=at,
                                          if_moved=if_moved, lines=lines,
                                          space=space, space_id=space_id))
 
@@ -438,7 +444,7 @@ def build_server(cfg: Optional[Config] = None):
                       bodies: bool = True,
                       match_tags: Optional[Literal["all", "any"]] = None,
                       space: Spaces = None, space_id: Spaces = None,
-                      token: Optional[str] = None, ctx: Context = None) -> List[dict]:
+                      ctx: Context = None) -> List[dict]:
         """Search memories — bodies AND curated titles, with a title match
         weighted higher. `mode`: lexical | semantic | hybrid | auto. `match`
         governs lexical word combination — defaults to OR-any (any query word
@@ -466,7 +472,7 @@ def build_server(cfg: Optional[Config] = None):
         with pool.connection() as conn:
             return [h.to_recall_dict()
                     for h in _store(conn).recall(
-                        _token(ctx, token), query, k=k, tags=tags,
+                        _token(ctx), query, k=k, tags=tags,
                         path_prefix=path_prefix, mode=mode, match=match,
                         snippet=snippet, full_body=full_body, bodies=bodies,
                         match_tags=match_tags, space=space, space_id=space_id)]
@@ -477,7 +483,7 @@ def build_server(cfg: Optional[Config] = None):
                     offset: int = 0, bodies: bool = False,
                     match_tags: Optional[Literal["all", "any"]] = None,
                     space: Spaces = None, space_id: Spaces = None,
-                    token: Optional[str] = None, ctx: Context = None) -> List[dict]:
+                    ctx: Context = None) -> List[dict]:
         """BROWSE (enumerate) a subtree — NOT a search. Lists memories under
         `path_prefix` (e.g. survey all of 'decisions.*') ordered by path, with a
         short first-line `preview` of each. No query, no ranking; use
@@ -495,14 +501,14 @@ def build_server(cfg: Optional[Config] = None):
         reach."""
         with pool.connection() as conn:
             return _store(conn).list(
-                _token(ctx, token), path_prefix=path_prefix, tags=tags,
+                _token(ctx), path_prefix=path_prefix, tags=tags,
                 limit=limit, offset=offset, bodies=bodies,
                 match_tags=match_tags, space=space, space_id=space_id)
 
     @mcp.tool()
     def memory_tags(prefix: Optional[str] = None, k: int = 50,
                     space: Spaces = None, space_id: Spaces = None,
-                    token: Optional[str] = None, ctx: Context = None) -> List[dict]:
+                    ctx: Context = None) -> List[dict]:
         """The tag vocabulary in use, most-used first: `{tag, count}`.
 
         READ THIS BEFORE TAGGING A NEW MEMORY. Tags match exactly, so a label you
@@ -511,14 +517,14 @@ def build_server(cfg: Optional[Config] = None):
         caps the list. Tags are stored lowercased and Unicode-normalised, so case
         and accent form are not what makes two tags different — wording is."""
         with pool.connection() as conn:
-            return _store(conn).tags(_token(ctx, token), prefix=prefix, k=k,
+            return _store(conn).tags(_token(ctx), prefix=prefix, k=k,
                                      space=space, space_id=space_id)
 
     @mcp.tool()
     def memory_links(id: Optional[str] = None, at: Optional[str] = None,
                      direction: Literal["in", "out", "both"] = "both",
                      space: Optional[str] = None, space_id: Optional[str] = None,
-                     token: Optional[str] = None, ctx: Context = None) -> dict:
+                     ctx: Context = None) -> dict:
         """What this memory links to, and WHAT LINKS TO IT. Address it by `id` or
         `at` (its path).
 
@@ -531,7 +537,7 @@ def build_server(cfg: Optional[Config] = None):
         stores use a scheme (`[[idea:some-slug]]`); anything else in double
         brackets is left as plain text."""
         with pool.connection() as conn:
-            return _store(conn).links(_token(ctx, token), id=id or None,
+            return _store(conn).links(_token(ctx), id=id or None,
                                       at=at or None, direction=direction,
                                       space=space, space_id=space_id)
 
@@ -549,7 +555,7 @@ def build_server(cfg: Optional[Config] = None):
     def memory_blame(id: Optional[str] = None, at: Optional[str] = None,
                      grouped: bool = True, lines: Optional[str] = None,
                      space: Optional[str] = None, space_id: Optional[str] = None,
-                     token: Optional[str] = None, ctx: Context = None) -> List[dict]:
+                     ctx: Context = None) -> List[dict]:
         """Who last changed each line. `lines` ("2", "1,3-5") narrows it to
         specific lines (per-line attribution). Grouped into author-blocks by default;
         set grouped=false for per-line attribution. Each entry carries the
@@ -557,7 +563,7 @@ def build_server(cfg: Optional[Config] = None):
         seq/op/source/reason — in a shared namespace this says who, authoritatively."""
         with pool.connection() as conn:
             s = _store(conn)
-            tok = _token(ctx, token)
+            tok = _token(ctx)
             want = parse_line_spec(lines)
             if grouped and want is None:
                 return s.annotate_grouped(tok, id, at=at, space=space,
@@ -569,13 +575,13 @@ def build_server(cfg: Optional[Config] = None):
     def memory_history(id: Optional[str] = None, at: Optional[str] = None,
                        space: Optional[str] = None,
                        space_id: Optional[str] = None,
-                       token: Optional[str] = None, ctx: Context = None) -> List[dict]:
+                       ctx: Context = None) -> List[dict]:
         """The full change chain for a memory: per version the diff, provenance
         (source/reason), the server-stamped author (author_user_id / author_token_id
         / resolved author_name), and the hash-chain fields. Author is authoritative
         (from the authenticated principal), unlike free-text source/reason."""
         with pool.connection() as conn:
-            return _store(conn).history(_token(ctx, token), id, at=at,
+            return _store(conn).history(_token(ctx), id, at=at,
                                         space=space, space_id=space_id)
 
     @mcp.tool()
@@ -584,12 +590,12 @@ def build_server(cfg: Optional[Config] = None):
                     if_moved: Literal["error", "follow"] = "error",
                     reason: Optional[str] = None,
                     space: Optional[str] = None, space_id: Optional[str] = None,
-                    token: Optional[str] = None, ctx: Context = None) -> dict:
+                    ctx: Context = None) -> dict:
         """Move a memory to a new tree path (cascades its subtree). Address it by
         `id` or by `at` (its current path). Every node that moves records the
         move, so its old path still resolves afterwards."""
         with pool.connection() as conn:
-            return _mem(_store(conn).move(_token(ctx, token), id, new_path,
+            return _mem(_store(conn).move(_token(ctx), id, new_path,
                                           at=at, if_moved=if_moved,
                                           reason=reason, space=space,
                                           space_id=space_id))
@@ -598,30 +604,28 @@ def build_server(cfg: Optional[Config] = None):
     def memory_forget(id: Optional[str] = None, at: Optional[str] = None,
                       space: Optional[str] = None,
                       space_id: Optional[str] = None,
-                      token: Optional[str] = None, ctx: Context = None) -> dict:
+                      ctx: Context = None) -> dict:
         """Permanently delete a memory and its history (GDPR erasure). Address it
         by `id` or by `at` (its path). A path that has since moved is REFUSED
         rather than followed — deleting on the strength of a stale address is the
         one mistake here you cannot undo."""
         with pool.connection() as conn:
             return {"forgotten": _store(conn).forget(
-                _token(ctx, token), id, at=at, space=space, space_id=space_id)}
+                _token(ctx), id, at=at, space=space, space_id=space_id)}
 
     # ─── identity: spaces & tokens (open/managed modes) ─────────────────────
     @mcp.tool()
-    def memory_list_spaces(token: Optional[str] = None,
-                           ctx: Context = None) -> List[dict]:
+    def memory_list_spaces(ctx: Context = None) -> List[dict]:
         """List the namespaces you can reach — your own plus any shared with you —
         with each one's id, name, description, permission, and your `alias` for it
         if you set one. To address one, pass its `alias` (or `name`, when that
         name is unambiguous for you) as `space`, or its `id` as `space_id`."""
         with pool.connection() as conn, conn.transaction():
-            return identity.list_spaces(conn, _uid(conn, _token(ctx, token)))
+            return identity.list_spaces(conn, _uid(conn, _token(ctx)))
 
     @mcp.tool()
     def memory_create_space(name: str, description: str = "",
                             instruction: str = "",
-                            token: Optional[str] = None,
                             ctx: Context = None) -> dict:
         """Create a namespace of your own. Nothing creates one implicitly, so a
         mistyped `space` is an error rather than a new empty space your write
@@ -629,13 +633,12 @@ def build_server(cfg: Optional[Config] = None):
         tells an agent how to use it. Needs the right to create namespaces."""
         with pool.connection() as conn, conn.transaction():
             nsid = identity.create_own_namespace(
-                conn, _principal(conn, _token(ctx, token)), name,
+                conn, _principal(conn, _token(ctx)), name,
                 description=description, instruction=instruction)
         return {"id": nsid, "name": name}
 
     @mcp.tool()
     def memory_set_alias(alias: str, space_id: str,
-                         token: Optional[str] = None,
                          ctx: Context = None) -> dict:
         """Give a namespace a name of your own, for when a bare name is ambiguous
         — two people can each own a 'notes', and once one is shared with you the
@@ -643,24 +646,24 @@ def build_server(cfg: Optional[Config] = None):
         space must already be reachable. It is refused if the name already
         resolves for you."""
         with pool.connection() as conn, conn.transaction():
-            uid = _uid(conn, _token(ctx, token))
+            uid = _uid(conn, _token(ctx))
             identity.create_alias(conn, uid, alias, space_id)
         return {"alias": alias, "space_id": space_id}
 
     @mcp.tool()
-    def memory_drop_alias(alias: str, token: Optional[str] = None,
+    def memory_drop_alias(alias: str,
                           ctx: Context = None) -> dict:
         """Remove one of your namespace aliases. The namespace itself is
         untouched — an alias is only a name."""
         with pool.connection() as conn, conn.transaction():
-            uid = _uid(conn, _token(ctx, token))
+            uid = _uid(conn, _token(ctx))
             return {"dropped": identity.drop_alias(conn, uid, alias)}
 
     @mcp.tool()
     def memory_issue_token(permission: str = "write", space: Optional[str] = None,
                            space_id: Optional[str] = None, label: str = "",
                            expires_days: Optional[int] = None,
-                           token: Optional[str] = None, ctx: Context = None) -> dict:
+                           ctx: Context = None) -> dict:
         """Mint a new token for your account (rotate / delegate / time-box).
         `permission` is its ceiling (read|write|admin); `space`/`space_id` scope
         it to one namespace (omit for all yours). The secret is returned ONCE."""
@@ -669,7 +672,7 @@ def build_server(cfg: Optional[Config] = None):
         if expires_days:
             exp = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=expires_days)
         with pool.connection() as conn, conn.transaction():
-            tok = _token(ctx, token)
+            tok = _token(ctx)
             uid = _admin_uid(conn, tok)
             nsid = space_id
             if nsid is not None:
@@ -703,45 +706,44 @@ def build_server(cfg: Optional[Config] = None):
                 "namespace_id": nsid, "note": "store this now — it is not recoverable"}
 
     @mcp.tool()
-    def memory_list_tokens(token: Optional[str] = None,
-                           ctx: Context = None) -> List[dict]:
+    def memory_list_tokens(ctx: Context = None) -> List[dict]:
         """List your tokens (metadata only — never the secret)."""
         with pool.connection() as conn, conn.transaction():
-            out = identity.list_tokens(conn, _admin_uid(conn, _token(ctx, token)))
+            out = identity.list_tokens(conn, _admin_uid(conn, _token(ctx)))
         return _iso(out, *_TOKEN_TIMES)
 
     @mcp.tool()
-    def memory_revoke_token(token_id: str, token: Optional[str] = None,
+    def memory_revoke_token(token_id: str,
                             ctx: Context = None) -> dict:
         """Revoke one of your tokens by id (kills it immediately)."""
         with pool.connection() as conn, conn.transaction():
-            uid = _admin_uid(conn, _token(ctx, token))
+            uid = _admin_uid(conn, _token(ctx))
             owned = {t["id"] for t in identity.list_tokens(conn, uid)}
             if token_id not in owned:
                 raise identity.AuthError("not your token")
             return {"revoked": identity.revoke_token(conn, token_id)}
 
     @mcp.tool()
-    def memory_whoami(token: Optional[str] = None, ctx: Context = None) -> dict:
+    def memory_whoami(ctx: Context = None) -> dict:
         """Who you are and what you may do: user id, service role, this
         credential's permission ceiling and namespace scope, plus the
         capabilities that follow from them. Check here before assuming an admin
         tool will refuse you — or explaining to someone why it did."""
         with pool.connection() as conn:
-            return admin.whoami(conn, _principal(conn, _token(ctx, token)))
+            return admin.whoami(conn, _principal(conn, _token(ctx)))
 
     # ─── control plane: provisioning (authorized in `admin`, not here) ───────
     if admin_surface:
 
         @mcp.tool()
         def memory_admin_list_users(role: Optional[str] = None, limit: int = 50,
-                                    offset: int = 0, token: Optional[str] = None,
+                                    offset: int = 0,
                                     ctx: Context = None) -> List[dict]:
             """The user directory: id, name, service role, profile
             (full_name/email/department/position) and the namespace-creation right.
             `role` filters to one tier (user | user_manager | superadmin)."""
             with pool.connection() as conn:
-                out = admin.list_users(conn, _principal(conn, _token(ctx, token)),
+                out = admin.list_users(conn, _principal(conn, _token(ctx)),
                                        role=role, limit=limit, offset=offset)
             return _iso(out, "created_at")
 
@@ -753,7 +755,6 @@ def build_server(cfg: Optional[Config] = None):
                                      full_name: Optional[str] = None,
                                      department: Optional[str] = None,
                                      position: Optional[str] = None,
-                                     token: Optional[str] = None,
                                      ctx: Context = None) -> dict:
             """Create a user and return its id. A new user owns nothing yet —
             give it a namespace with `memory_admin_create_namespace`, share one
@@ -764,7 +765,7 @@ def build_server(cfg: Optional[Config] = None):
             `full_name` is what `memory_blame` shows as the author, so without it
             an audit trail reads as bare uuids."""
             with pool.connection() as conn, conn.transaction():
-                uid = admin.create_user(conn, _principal(conn, _token(ctx, token)),
+                uid = admin.create_user(conn, _principal(conn, _token(ctx)),
                                         name=name, description=description,
                                         role=role,
                                         can_create_namespace=can_create_namespace,
@@ -780,7 +781,6 @@ def build_server(cfg: Optional[Config] = None):
                                    full_name: Optional[str] = None,
                                    department: Optional[str] = None,
                                    position: Optional[str] = None,
-                                   token: Optional[str] = None,
                                    ctx: Context = None) -> dict:
             """Change who a user is. Only the fields you pass are touched, so a
             partial update cannot blank the rest."""
@@ -789,43 +789,40 @@ def build_server(cfg: Optional[Config] = None):
                       "position": position}
             with pool.connection() as conn, conn.transaction():
                 return admin.edit_user(
-                    conn, _principal(conn, _token(ctx, token)), user_id=user_id,
+                    conn, _principal(conn, _token(ctx)), user_id=user_id,
                     **{k: v for k, v in fields.items() if v is not None})
 
         @mcp.tool()
         def memory_admin_set_can_create_namespace(user_id: str, allowed: bool,
-                                                  token: Optional[str] = None,
                                                   ctx: Context = None) -> dict:
             """Grant or withdraw a user's right to create namespaces. Without it
             they must be given a namespace or shared into one; writing to a name
             that does not exist is refused instead of silently making it."""
             with pool.connection() as conn, conn.transaction():
                 return admin.set_can_create_namespace(
-                    conn, _principal(conn, _token(ctx, token)),
+                    conn, _principal(conn, _token(ctx)),
                     user_id=user_id, allowed=allowed)
 
         @mcp.tool()
         def memory_admin_set_role(user_id: str, role: str,
-                                  token: Optional[str] = None,
                                   ctx: Context = None) -> dict:
             """Set a user's service role (user | user_manager | superadmin).
             Superadmin only. Demoting the last superadmin is refused — that
             would leave the deployment with no control plane."""
             with pool.connection() as conn, conn.transaction():
-                return admin.set_role(conn, _principal(conn, _token(ctx, token)),
+                return admin.set_role(conn, _principal(conn, _token(ctx)),
                                       user_id=user_id, role=role)
 
         @mcp.tool()
         def memory_admin_list_namespaces(owner_user_id: Optional[str] = None,
                                          limit: int = 50, offset: int = 0,
-                                         token: Optional[str] = None,
                                          ctx: Context = None) -> List[dict]:
             """Every namespace on the deployment, with its owner and routing
             instruction. `memory_list_spaces` answers what *you* can reach; this
             answers what exists."""
             with pool.connection() as conn:
                 out = admin.list_namespaces(
-                    conn, _principal(conn, _token(ctx, token)),
+                    conn, _principal(conn, _token(ctx)),
                     owner_user_id=owner_user_id, limit=limit, offset=offset)
             return _iso(out, "created_at")
 
@@ -833,14 +830,13 @@ def build_server(cfg: Optional[Config] = None):
         def memory_admin_create_namespace(name: str, owner_user_id: str,
                                           description: str = "",
                                           instruction: str = "",
-                                          token: Optional[str] = None,
                                           ctx: Context = None) -> dict:
             """Create a namespace owned by `owner_user_id`. `instruction` is the
             routing hint agents read to decide what belongs here — write it as
             guidance, not decoration. Idempotent: an existing name returns it."""
             with pool.connection() as conn, conn.transaction():
                 nsid = admin.create_namespace(
-                    conn, _principal(conn, _token(ctx, token)),
+                    conn, _principal(conn, _token(ctx)),
                     owner_user_id=owner_user_id, name=name,
                     description=description, instruction=instruction)
             return {"id": nsid}
@@ -849,31 +845,28 @@ def build_server(cfg: Optional[Config] = None):
         def memory_admin_edit_namespace(space_id: str,
                                         description: Optional[str] = None,
                                         instruction: Optional[str] = None,
-                                        token: Optional[str] = None,
                                         ctx: Context = None) -> dict:
             """Amend a namespace's description or routing instruction. Creating
             it again will not: that call ignores conflicts, so this is the only
             way to correct the text agents route by."""
             with pool.connection() as conn, conn.transaction():
                 return admin.edit_namespace(
-                    conn, _principal(conn, _token(ctx, token)),
+                    conn, _principal(conn, _token(ctx)),
                     namespace_id=space_id, description=description,
                     instruction=instruction)
 
         @mcp.tool()
-        def memory_admin_count_orphans(token: Optional[str] = None,
-                                       ctx: Context = None) -> dict:
+        def memory_admin_count_orphans(ctx: Context = None) -> dict:
             """How many memories are stranded in the pre-identity namespace.
             `single` mode stores everything under one nameless namespace; after a
             switch to open/managed nobody resolves to it, so the old corpus is
             present but invisible and every read of it just comes back empty.
             This is the only thing that says so."""
             with pool.connection() as conn:
-                return admin.count_orphans(conn, _principal(conn, _token(ctx, token)))
+                return admin.count_orphans(conn, _principal(conn, _token(ctx)))
 
         @mcp.tool()
         def memory_admin_adopt_orphans(space_id: str,
-                                       token: Optional[str] = None,
                                        ctx: Context = None) -> dict:
             """Move every stranded `single`-mode memory into a real namespace.
             Idempotent — with nothing stranded it changes nothing. Moves the chunk
@@ -881,29 +874,27 @@ def build_server(cfg: Optional[Config] = None):
             would make it answer empty without erroring."""
             with pool.connection() as conn, conn.transaction():
                 return admin.adopt_orphans(
-                    conn, _principal(conn, _token(ctx, token)),
+                    conn, _principal(conn, _token(ctx)),
                     namespace_id=space_id, vectors=backend)
 
         @mcp.tool()
         def memory_admin_add_member(space_id: str, user_id: str,
                                     permission: str = "read",
-                                    token: Optional[str] = None,
                                     ctx: Context = None) -> dict:
             """Share a namespace with another user at read | write | admin.
             Superadmin only — it grants access across tenants."""
             with pool.connection() as conn, conn.transaction():
-                return admin.add_member(conn, _principal(conn, _token(ctx, token)),
+                return admin.add_member(conn, _principal(conn, _token(ctx)),
                                         namespace_id=space_id, user_id=user_id,
                                         permission=permission)
 
         @mcp.tool()
         def memory_admin_list_members(space_id: str,
-                                      token: Optional[str] = None,
                                       ctx: Context = None) -> List[dict]:
             """Who can reach a namespace — the owner first, then everyone shared
             in. The audit answer to "who can see this?"."""
             with pool.connection() as conn:
-                out = admin.list_members(conn, _principal(conn, _token(ctx, token)),
+                out = admin.list_members(conn, _principal(conn, _token(ctx)),
                                          namespace_id=space_id)
             return _iso(out, "created_at")
 
@@ -912,7 +903,6 @@ def build_server(cfg: Optional[Config] = None):
                                      space_id: Optional[str] = None,
                                      label: str = "",
                                      expires_days: Optional[int] = None,
-                                     token: Optional[str] = None,
                                      ctx: Context = None) -> dict:
             """Mint a token for another user. `permission` is its ceiling,
             `space_id` scopes it to one namespace (omit for all theirs). The
@@ -920,28 +910,27 @@ def build_server(cfg: Optional[Config] = None):
             superadmin."""
             with pool.connection() as conn, conn.transaction():
                 return admin.issue_token(
-                    conn, _principal(conn, _token(ctx, token)), user_id=user_id,
+                    conn, _principal(conn, _token(ctx)), user_id=user_id,
                     namespace_id=space_id, permission=permission, label=label,
                     expires_days=expires_days)
 
         @mcp.tool()
-        def memory_admin_list_tokens(user_id: str, token: Optional[str] = None,
+        def memory_admin_list_tokens(user_id: str,
                                      ctx: Context = None) -> List[dict]:
             """A user's tokens — metadata only, never the secret."""
             with pool.connection() as conn:
-                out = admin.list_tokens(conn, _principal(conn, _token(ctx, token)),
+                out = admin.list_tokens(conn, _principal(conn, _token(ctx)),
                                         user_id=user_id)
             return _iso(out, *_TOKEN_TIMES)
 
         @mcp.tool()
         def memory_admin_revoke_token(token_id: str,
-                                      token: Optional[str] = None,
                                       ctx: Context = None) -> dict:
             """Kill any user's token immediately. False means it was already
             revoked or never existed."""
             with pool.connection() as conn, conn.transaction():
                 return {"revoked": admin.revoke_token(
-                    conn, _principal(conn, _token(ctx, token)), token_id=token_id)}
+                    conn, _principal(conn, _token(ctx)), token_id=token_id)}
 
     # ─── per-caller tool list ───────────────────────────────────────────────
     # MEMGRES_MCP_TOOL_VISIBILITY = auto (default) | off.
@@ -980,7 +969,7 @@ def build_server(cfg: Optional[Config] = None):
                     # credential, not acting on it. Stamping `last_used_at` here
                     # would make every `tools/list` a write transaction and turn
                     # the column into "last connected".
-                    p = identity.resolve(conn, cfg, _token(ctx, None),
+                    p = identity.resolve(conn, cfg, _token(ctx),
                                          touch=False)
                 except identity.AuthError:
                     return None
@@ -1052,15 +1041,22 @@ def build_server(cfg: Optional[Config] = None):
     # cosmetic — _token above already resolves identity from the header/env and a
     # pin wins regardless; if a future FastMCP changes these internals this simply
     # no-ops and the optional field stays in place (still safe).
-    if not expose_token:
-        for _t in getattr(getattr(mcp, "_tool_manager", None), "_tools", {}).values():
-            _params = getattr(_t, "parameters", None)
-            if not isinstance(_params, dict):
-                continue
-            _params.get("properties", {}).pop("token", None)
-            _req = _params.get("required")
-            if isinstance(_req, list) and "token" in _req:
-                _req.remove("token")
+    # The same substring edit is spelled three ways across the ecosystem and all
+    # three are accepted (`fold_replace_aliases`), so an agent with file-editor
+    # muscle memory does not get a baffling refusal. ADVERTISING all six, though,
+    # puts four redundant parameters on the most important tool and invites the
+    # question they were meant to prevent — "what happens if I mix them?". They
+    # are pruned from the schema and still work: an argument absent from the
+    # advertised schema reaches the handler regardless (verified on both SDK
+    # generations, same mechanism the `token` pruning below relies on).
+    for _t in getattr(getattr(mcp, "_tool_manager", None), "_tools", {}).values():
+        if getattr(_t, "name", None) != "memory_write":
+            continue
+        _params = getattr(_t, "parameters", None)
+        if not isinstance(_params, dict):
+            continue
+        for _alias in ("old_string", "new_string", "old_str", "new_str"):
+            _params.get("properties", {}).pop(_alias, None)
 
     # Best-effort: with no embedder configured there is no vector backend, so
     # semantic/hybrid recall can't run — drop them from memory_recall's `mode`

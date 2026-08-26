@@ -261,9 +261,13 @@ Tools:
 - `memory_admin_*` — the control plane (see below), where the caller has the
   authority for it.
 
-Only a genuinely multi-tenant endpoint (`open`/`managed`, **no** pinned token)
-exposes a `token` argument for the model to supply; force it either way with
-`MEMGRES_MCP_TOKEN_ARG=on|off`. In `single` mode no token is needed at all.
+**No MCP tool takes a `token` argument.** Both transports can be configured with
+a credential — http carries an `Authorization` (or `X-Memgres-Token`) header,
+and a stdio server is spawned by its client with an env — so an argument could
+only name an identity the deployment did not choose. In `open` mode it was worse
+than clutter: tokens self-register on first write, so a model that invented an
+`mgk_…` string created a namespace nobody else could see and wrote into it. In
+`single` mode no token is needed at all.
 
 ### What a client is shown
 

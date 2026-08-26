@@ -315,11 +315,12 @@ secret and can't switch user):
       "headers": { "Authorization": "Bearer mgk_…" } } } }
   ```
 
-A *namespace-scoped* token also locks the agent to one space. Only a genuinely
-multi-tenant endpoint (open/managed, **no** pinned token) exposes a `token` tool
-argument for the model to supply — force it either way with
-`MEMGRES_MCP_TOKEN_ARG=on|off`. Single mode needs no token. Full model in
-[docs/TENANCY.md](docs/TENANCY.md).
+A *namespace-scoped* token also locks the agent to one space. **No tool takes a
+`token` argument**: a deployment names its caller in configuration — an
+`Authorization` header on http, `MEMGRES_TOKEN` in the env of a stdio server's
+client entry — and both transports can carry one, so an argument could only ever
+name an identity the deployment did not choose. Single mode needs no token at
+all. Full model in [docs/TENANCY.md](docs/TENANCY.md).
 
 **B. From your own agent code** — your loop calls the HTTP API or the `Store`
 library after the model produces text (see the examples above). Use this when you

@@ -35,13 +35,29 @@ pytest.importorskip("mcp")
 
 from memgres import identity  # noqa: E402
 
-DSN = os.environ.get("MEMGRES_TEST_DSN",
-                     "postgresql://memgres:memgres@localhost:55432/memgres")
+# A database of this file's OWN, not the shared test one. These tests keep a
+# server ALIVE across several test functions (they differ only in the header they
+# send, so they share one), and every other fixture in the suite opens with
+# `DROP SCHEMA public CASCADE`. Sharing would mean another module pulling the
+# schema out from under a running server — green alone, a wall of unrelated
+# failures in the full run.
+_BASE_DSN = os.environ.get("MEMGRES_TEST_DSN",
+                           "postgresql://memgres:memgres@localhost:55432/memgres")
+DSN = _BASE_DSN.rsplit("/", 1)[0] + "/memgres_visibility_http"
+
+
+def _ensure_db() -> None:
+    admin_dsn = _BASE_DSN.rsplit("/", 1)[0] + "/postgres"
+    with psycopg.connect(admin_dsn, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_database WHERE datname = %s",
+                    ("memgres_visibility_http",))
+        if cur.fetchone() is None:
+            cur.execute("CREATE DATABASE memgres_visibility_http")
 
 
 def _reachable() -> bool:
     try:
-        psycopg.connect(DSN, connect_timeout=2).close()
+        psycopg.connect(_BASE_DSN, connect_timeout=2).close()
         return True
     except Exception:
         return False
@@ -142,6 +158,7 @@ class Server:
 
 
 def _fresh_db():
+    _ensure_db()
     with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
         cur.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
                     "WHERE datname = current_database() AND pid <> pg_backend_pid()")

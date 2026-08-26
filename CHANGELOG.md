@@ -5,6 +5,48 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.8.0] — 2026-08-26
+
+### Breaking
+- **No MCP tool takes a `token` argument any more.** Both transports can already
+  be configured with a credential — http carries an `Authorization` (or
+  `X-Memgres-Token`) header, a stdio server is spawned by its client with an env
+  — so the argument could only ever name an identity the DEPLOYMENT did not
+  choose, and it was the model choosing it. In `open` mode that was a live hazard
+  rather than clutter: tokens self-register on first write, so a model that
+  invented an `mgk_…` string created a namespace nobody else could see and wrote
+  into it. The module docstring had claimed "the tools take no `token` argument"
+  for some time; now they don't. `MEMGRES_MCP_TOKEN_ARG` is gone with it.
+  Callers that passed one: configure the credential instead.
+
+### Fixed
+- **Every restart re-granted `can_create_namespace` to every account.** Migration
+  0009 ended with a backfill for accounts that predated the column — but
+  migrations re-apply on every start, and the statement cannot tell "predates the
+  column" from "was created yesterday without the right". So a user provisioned
+  with the right withheld got it back at the next restart, an admin's revocation
+  was silently undone, and `create_user`'s `can_create_namespace=False` default
+  meant nothing. The backfill is removed rather than guarded: a database older
+  than the migration was backfilled the first time it ran, and one created after
+  it has an empty `app_user` when it runs. **If you ran any version between v10
+  and this one, assume the right is set on every account and re-check the ones
+  that should not have it.**
+  - It hid behind the same blind spot as the last two: the tests provisioned and
+    asserted against one long-lived server, and only restarting makes it visible.
+
+### Changed
+- **Per-argument rules now live on the arguments.** A tool's prose is what gets
+  truncated by clients that cap it, and the tail is where the newest rules land —
+  `valid_at` shipped documented only there, which from the schema's side is
+  undocumented. `source`, `reason`, `valid_at` and `if_moved` carry their own
+  descriptions now, and `memory_write`'s docstring is half the size it was.
+- **The file-editor spellings of the substring edit are no longer advertised.**
+  `old_string`/`new_string` and `old_str`/`new_str` are still accepted — an agent
+  with muscle memory should not get a baffling refusal — but showing all six put
+  four redundant parameters on the most important tool and invited the question
+  they exist to prevent. Conflicting spellings of the same side are still refused
+  rather than resolved.
+
 ## [0.7.2] — 2026-08-26
 
 ### Fixed

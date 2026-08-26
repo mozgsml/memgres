@@ -12,12 +12,26 @@
 -- other people. Admin roles (user_manager, superadmin) may always create and do
 -- not consult this column.
 --
--- Backfill deliberately grants it to every EXISTING account. They have had the
--- right since the deployment was created; taking it away during an upgrade
--- would break running writes with a permission error. New accounts start
--- without it, which is the behaviour we actually want going forward.
+-- 🔴 THIS MIGRATION USED TO END WITH A BACKFILL, AND THE BACKFILL WAS A BUG:
+--
+--     UPDATE app_user SET can_create_namespace = true
+--      WHERE can_create_namespace = false;
+--
+-- The intent was one-time and reasonable — accounts that predate the column had
+-- the right since the deployment was created, and taking it away mid-upgrade
+-- would break their running writes with a permission error. But migrations are
+-- re-applied on EVERY start, and that statement cannot tell "predates the
+-- column" from "was created yesterday without the right". So every restart
+-- re-granted namespace creation to every account: a user provisioned with the
+-- right withheld got it back, an admin's revocation was silently undone, and
+-- `create_user`'s `can_create_namespace=False` default meant nothing.
+--
+-- Removed rather than guarded, because it has no remaining work to do. A
+-- database older than this migration was backfilled the first time it ran; one
+-- created after it has an empty `app_user` when it runs, so the statement was
+-- always a no-op there. Deleting it is correct for both.
+--
+-- If your deployment ran a version between v10 and this fix, assume the right
+-- is set on every account and re-check the ones that should not have it.
 ALTER TABLE app_user
     ADD COLUMN IF NOT EXISTS can_create_namespace boolean NOT NULL DEFAULT false;
-
-UPDATE app_user SET can_create_namespace = true
- WHERE can_create_namespace = false;

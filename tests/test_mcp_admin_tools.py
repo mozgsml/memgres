@@ -96,8 +96,27 @@ def box(monkeypatch):
     monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
     monkeypatch.setenv("MEMGRES_ADMIN_ROLE", "superadmin")
     monkeypatch.setenv("MEMGRES_ADMIN_TOKEN", root_tok)
-    mcp = build_server(load())                      # migrates + seeds the admin
-    return mcp, root_tok
+    built = {}
+
+    def as_(tok):
+        """A server that identifies its caller as `tok`.
+
+        There is no per-call `token` argument any more: a deployment names its
+        caller in CONFIGURATION — a header on http, `MEMGRES_TOKEN` in the env of
+        a stdio server's client entry — so a test acting as two identities builds
+        two servers, which is exactly what two configured clients are. Cached
+        because building one migrates.
+        """
+        if tok not in built:
+            if tok is None:                         # an endpoint with no credential
+                monkeypatch.delenv("MEMGRES_TOKEN", raising=False)
+            else:
+                monkeypatch.setenv("MEMGRES_TOKEN", tok)
+            built[tok] = build_server(load())
+        return built[tok]
+
+    as_(root_tok)                                   # migrates + seeds the admin
+    return as_, root_tok
 
 
 def _admin_tools(mcp):
@@ -113,25 +132,24 @@ def test_provisioning_end_to_end(box):
     against is a user provisioned into a namespace whose token then writes
     somewhere else entirely.
     """
-    mcp, root = box
+    as_, root = box
 
-    uid = _call(mcp, "memory_admin_create_user", name="ada", token=root)["id"]
-    nsid = _call(mcp, "memory_admin_create_namespace", name="sales",
-                 owner_user_id=uid, instruction="deals only", token=root)["id"]
-    _call(mcp, "memory_admin_edit_namespace", space_id=nsid,
-          description="provisioned in this test",
-          token=root)
-    minted = _call(mcp, "memory_admin_issue_token", user_id=uid,
-                   permission="write", label="agent", token=root)
+    uid = _call(as_(root), "memory_admin_create_user", name="ada")["id"]
+    nsid = _call(as_(root), "memory_admin_create_namespace", name="sales",
+                 owner_user_id=uid, instruction="deals only")["id"]
+    _call(as_(root), "memory_admin_edit_namespace", space_id=nsid,
+          description="provisioned in this test")
+    minted = _call(as_(root), "memory_admin_issue_token", user_id=uid,
+                   permission="write", label="agent")
 
     # the directory reflects all of it
-    users = _call(mcp, "memory_admin_list_users", token=root)
+    users = _call(as_(root), "memory_admin_list_users")
     assert [u for u in users if u["id"] == uid][0]["name"] == "ada"
     assert [n["name"] for n in
-            _call(mcp, "memory_admin_list_namespaces", token=root)] == ["sales"]
+            _call(as_(root), "memory_admin_list_namespaces")] == ["sales"]
 
     # and the new credential is real: it writes, reads back, and knows itself
-    who = _call(mcp, "memory_whoami", token=minted["token"])
+    who = _call(as_(minted["token"]), "memory_whoami")
     assert who["user_id"] == uid and who["permission"] == "write"
     # capabilities are EFFECTIVE for this credential, not the role's potential:
     # a write-ceiling token administers nothing, not even its own tokens
@@ -141,19 +159,17 @@ def test_provisioning_end_to_end(box):
         "can_write": True, "can_manage_own_tokens": False,
         "has_admin_ceiling": False}
 
-    _call(mcp, "memory_write", body="a deal closed", path="deals.acme",
-          token=minted["token"])
-    got = _call(mcp, "memory_list", path_prefix="deals", token=minted["token"])
+    _call(as_(minted["token"]), "memory_write", body="a deal closed", path="deals.acme")
+    got = _call(as_(minted["token"]), "memory_list", path_prefix="deals")
     assert [m["path"] for m in got] == ["deals.acme"]
     # it landed in the ONE namespace it was provisioned into — the write named
     # no space, and with exactly one reachable there is nothing to choose
-    assert [s["name"] for s in _call(mcp, "memory_list_spaces",
-                                     token=minted["token"])] == ["sales"]
+    assert [s["name"] for s in _call(as_(minted["token"]), "memory_list_spaces")] == ["sales"]
 
     # revoking it takes effect immediately
-    _call(mcp, "memory_admin_revoke_token", token_id=minted["id"], token=root)
+    _call(as_(root), "memory_admin_revoke_token", token_id=minted["id"])
     with pytest.raises(ToolError):
-        _call(mcp, "memory_whoami", token=minted["token"])
+        _call(as_(minted["token"]), "memory_whoami")
 
 
 # ─── fail-closed: nobody without the role gets in, by any door ───────────────
@@ -182,31 +198,30 @@ def _matrix(uid: str, nsid: str, token_id: str) -> dict:
 
 def test_denial_matrix_covers_every_admin_tool(box):
     """A new admin tool must be added to the matrix or this suite fails."""
-    mcp, root = box
-    uid = _call(mcp, "memory_admin_create_user", name="u", token=root)["id"]
-    assert _admin_tools(mcp) == set(_matrix(uid, uid, uid))
+    as_, root = box
+    uid = _call(as_(root), "memory_admin_create_user", name="u")["id"]
+    assert _admin_tools(as_(root)) == set(_matrix(uid, uid, uid))
 
 
 def test_admin_tools_are_fail_closed(box):
-    mcp, root = box
+    as_, root = box
 
-    victim = _call(mcp, "memory_admin_create_user", name="victim", token=root)["id"]
-    nsid = _call(mcp, "memory_admin_create_namespace", name="private",
-                 owner_user_id=victim, token=root)["id"]
-    a_token = _call(mcp, "memory_admin_issue_token", user_id=victim,
-                    token=root)["id"]
+    victim = _call(as_(root), "memory_admin_create_user", name="victim")["id"]
+    nsid = _call(as_(root), "memory_admin_create_namespace", name="private",
+                 owner_user_id=victim)["id"]
+    a_token = _call(as_(root), "memory_admin_issue_token", user_id=victim)["id"]
 
-    plain = _call(mcp, "memory_admin_create_user", name="plain", token=root)["id"]
+    plain = _call(as_(root), "memory_admin_create_user", name="plain")["id"]
     # a plain user, at each of the ways a credential can fall short
-    unprivileged = _call(mcp, "memory_admin_issue_token", user_id=plain,
-                         permission="admin", token=root)["token"]
-    read_only = _call(mcp, "memory_admin_issue_token", user_id=plain,
-                      permission="read", token=root)["token"]
-    scoped = _call(mcp, "memory_admin_issue_token", user_id=plain,
-                   permission="admin", space_id=nsid, token=root)["token"]
-    revoked_pair = _call(mcp, "memory_admin_issue_token", user_id=plain,
-                         permission="admin", token=root)
-    _call(mcp, "memory_admin_revoke_token", token_id=revoked_pair["id"], token=root)
+    unprivileged = _call(as_(root), "memory_admin_issue_token", user_id=plain,
+                         permission="admin")["token"]
+    read_only = _call(as_(root), "memory_admin_issue_token", user_id=plain,
+                      permission="read")["token"]
+    scoped = _call(as_(root), "memory_admin_issue_token", user_id=plain,
+                   permission="admin", space_id=nsid)["token"]
+    revoked_pair = _call(as_(root), "memory_admin_issue_token", user_id=plain,
+                         permission="admin")
+    _call(as_(root), "memory_admin_revoke_token", token_id=revoked_pair["id"])
 
     callers = {
         "plain user": unprivileged,
@@ -218,31 +233,27 @@ def test_admin_tools_are_fail_closed(box):
     }
     for tool, args in _matrix(victim, nsid, a_token).items():
         for who, tok in callers.items():
-            kw = dict(args)
-            if tok is not None:
-                kw["token"] = tok
             with pytest.raises(ToolError, match=r".*"):
-                _call(mcp, tool, **kw)
+                _call(as_(tok), tool, **args)
             # and nothing happened: the victim keeps exactly one token
-            assert len(_call(mcp, "memory_admin_list_tokens", user_id=victim,
-                             token=root)) == 1, f"{tool} / {who} had an effect"
+            assert len(_call(as_(root), "memory_admin_list_tokens", user_id=victim)) == 1, f"{tool} / {who} had an effect"
 
 
 # ─── the middle tier: provisions without gaining ─────────────────────────────
 
 def test_user_manager_provisions_but_does_not_escalate(box):
-    mcp, root = box
-    mgr = _call(mcp, "memory_admin_create_user", name="mgr",
-                role="user_manager", token=root)["id"]
-    mtok = _call(mcp, "memory_admin_issue_token", user_id=mgr,
-                 permission="admin", token=root)["token"]
+    as_, root = box
+    mgr = _call(as_(root), "memory_admin_create_user", name="mgr",
+                role="user_manager")["id"]
+    mtok = _call(as_(root), "memory_admin_issue_token", user_id=mgr,
+                 permission="admin")["token"]
 
     # it does its job
-    u = _call(mcp, "memory_admin_create_user", name="u", token=mtok)["id"]
-    ns = _call(mcp, "memory_admin_create_namespace", name="kb",
-               owner_user_id=u, token=mtok)["id"]
-    _call(mcp, "memory_admin_issue_token", user_id=u, token=mtok)
-    assert _call(mcp, "memory_admin_list_users", token=mtok)
+    u = _call(as_(mtok), "memory_admin_create_user", name="u")["id"]
+    ns = _call(as_(mtok), "memory_admin_create_namespace", name="kb",
+               owner_user_id=u)["id"]
+    _call(as_(mtok), "memory_admin_issue_token", user_id=u)
+    assert _call(as_(mtok), "memory_admin_list_users")
 
     # but cannot mint authority, hand out cross-tenant access, or set roles
     for tool, args in (
@@ -251,16 +262,16 @@ def test_user_manager_provisions_but_does_not_escalate(box):
         ("memory_admin_set_role", {"user_id": mgr, "role": "superadmin"}),
     ):
         with pytest.raises(ToolError):
-            _call(mcp, tool, token=mtok, **args)
+            _call(as_(mtok), tool, **args)
 
     # nor touch the account that could undo any of this
-    root_uid = _call(mcp, "memory_whoami", token=root)["user_id"]
+    root_uid = _call(as_(root), "memory_whoami")["user_id"]
     for tool, args in (
         ("memory_admin_issue_token", {"user_id": root_uid}),
         ("memory_admin_list_tokens", {"user_id": root_uid}),
     ):
         with pytest.raises(ToolError):
-            _call(mcp, tool, token=mtok, **args)
+            _call(as_(mtok), tool, **args)
 
 
 # ─── role transitions ────────────────────────────────────────────────────────
@@ -268,44 +279,38 @@ def test_user_manager_provisions_but_does_not_escalate(box):
 def test_set_role_reaches_the_middle_tier_and_refuses_lockout(box):
     """`set_role` exists because grant/revoke only speak superadmin — there was
     no way to make a user_manager through any door."""
-    mcp, root = box
-    u = _call(mcp, "memory_admin_create_user", name="u", token=root)["id"]
+    as_, root = box
+    u = _call(as_(root), "memory_admin_create_user", name="u")["id"]
 
-    assert _call(mcp, "memory_admin_set_role", user_id=u, role="user_manager",
-                 token=root)["role"] == "user_manager"
-    assert [x["role"] for x in _call(mcp, "memory_admin_list_users",
-                                     role="user_manager", token=root)] == \
+    assert _call(as_(root), "memory_admin_set_role", user_id=u, role="user_manager")["role"] == "user_manager"
+    assert [x["role"] for x in _call(as_(root), "memory_admin_list_users",
+                                     role="user_manager")] == \
         ["user_manager"]
 
     # demoting the only superadmin would leave nobody in charge
-    root_uid = _call(mcp, "memory_whoami", token=root)["user_id"]
+    root_uid = _call(as_(root), "memory_whoami")["user_id"]
     with pytest.raises(ToolError):
-        _call(mcp, "memory_admin_set_role", user_id=root_uid, role="user",
-              token=root)
+        _call(as_(root), "memory_admin_set_role", user_id=root_uid, role="user")
 
     # with a second superadmin it is allowed
-    _call(mcp, "memory_admin_set_role", user_id=u, role="superadmin", token=root)
-    assert _call(mcp, "memory_admin_set_role", user_id=root_uid, role="user",
-                 token=root)["role"] == "user"
+    _call(as_(root), "memory_admin_set_role", user_id=u, role="superadmin")
+    assert _call(as_(root), "memory_admin_set_role", user_id=root_uid, role="user")["role"] == "user"
 
 
 def test_edit_namespace_is_the_only_way_to_fix_a_routing_hint(box):
     """create_namespace is an upsert that ignores conflicts, so re-creating with
     corrected text silently does nothing."""
-    mcp, root = box
-    uid = _call(mcp, "memory_admin_create_user", name="u", token=root)["id"]
-    ns = _call(mcp, "memory_admin_create_namespace", name="kb",
-               owner_user_id=uid, instruction="typo", token=root)["id"]
+    as_, root = box
+    uid = _call(as_(root), "memory_admin_create_user", name="u")["id"]
+    ns = _call(as_(root), "memory_admin_create_namespace", name="kb",
+               owner_user_id=uid, instruction="typo")["id"]
 
-    _call(mcp, "memory_admin_create_namespace", name="kb", owner_user_id=uid,
-          instruction="fixed", token=root)
-    assert _call(mcp, "memory_admin_list_namespaces",
-                 token=root)[0]["instruction"] == "typo"
+    _call(as_(root), "memory_admin_create_namespace", name="kb", owner_user_id=uid,
+          instruction="fixed")
+    assert _call(as_(root), "memory_admin_list_namespaces")[0]["instruction"] == "typo"
 
-    _call(mcp, "memory_admin_edit_namespace", space_id=ns, instruction="fixed",
-          token=root)
-    assert _call(mcp, "memory_admin_list_namespaces",
-                 token=root)[0]["instruction"] == "fixed"
+    _call(as_(root), "memory_admin_edit_namespace", space_id=ns, instruction="fixed")
+    assert _call(as_(root), "memory_admin_list_namespaces")[0]["instruction"] == "fixed"
 
 
 def test_admin_surface_is_absent_where_there_is_nothing_to_administer(monkeypatch):
@@ -327,3 +332,24 @@ def test_admin_surface_is_absent_where_there_is_nothing_to_administer(monkeypatc
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_a_withheld_right_survives_a_restart(box):
+    """Migrations re-apply on every start, so a data-touching one has to be
+    idempotent against data written AFTER it. `0009` backfilled
+    `can_create_namespace = true` for accounts that predated the column — and,
+    re-running forever, kept re-granting it to accounts provisioned without it.
+    An admin's revocation lasted until the next restart.
+
+    Restarting is what makes this visible, which is why no test saw it: they all
+    provisioned and asserted against one long-lived server."""
+    as_, root = box
+    uid = _call(as_(root), "memory_admin_create_user", name="narrow")["id"]
+    tok = _call(as_(root), "memory_admin_issue_token", user_id=uid,
+                permission="write")["token"]
+    assert _call(as_(tok), "memory_whoami")["capabilities"]["can_create_namespace"] is False
+
+    build_server(load())          # a restart: every migration runs again
+
+    assert _call(as_(tok), "memory_whoami")["capabilities"]["can_create_namespace"] is False, \
+        "a restart re-granted a right the deployment withheld"
