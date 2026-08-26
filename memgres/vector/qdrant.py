@@ -186,7 +186,8 @@ class QdrantBackend:
 
     # ─── grouped semantic ranking ─────────────────────────────────────────────
     def search(self, conn, cfg, query_vec: Sequence[float], k: int, ns,
-               tags: Optional[Sequence[str]], path_prefix: Optional[str]) -> List[Hit]:
+               tags: Optional[Sequence[str]], path_prefix: Optional[str],
+               tags_match: str = "all") -> List[Hit]:
         from qdrant_client.models import FieldCondition, Filter, MatchAny
 
         # MatchAny over the same normalized set Postgres filters on. A recall may
@@ -215,4 +216,5 @@ class QdrantBackend:
                             float(p.score)))
             return out
 
-        return grouped_chunk_search(conn, ns, k, tags, path_prefix, fetch_chunks)
+        return grouped_chunk_search(conn, ns, k, tags, path_prefix, fetch_chunks,
+                                    tags_match)

@@ -5,6 +5,166 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.7.0] — 2026-08-25
+
+Search, tags and retention — three places where memgres answered with silence
+where it should have answered with data — plus the beginning of an answer to "is
+this still true?", and the link graph the corpus had been writing by hand all
+along.
+
+### Links
+- **`[[wiki links]]` in a body are now edges you can walk, in both directions.**
+  The convention was already load-bearing with no tool behind it: 238 links
+  across the 97 memories of the reference corpus, 91% resolving. What text could
+  not do was answer "what points HERE" — the question that matters when a fact
+  changes — and 42 of those memories had no inbound link at all.
+  - `[[path]]`, `[[path#anchor]]`, `[[path|label]]`, `[[path#anchor|label]]`;
+    `#` before `|` as in every wiki dialect. `[[idea:slug]]` / `[[file:slug]]`
+    point at other stores and are recorded but never resolved here.
+  - Edges pin the target's `id` at write time, so a link survives its target
+    moving and cannot be hijacked by something later claiming the vacated path.
+  - **And a move repairs the bodies that still name the old address.** The pin
+    alone was not enough, which is easy to miss: edges are re-derived from body
+    text on every write, so a pinned edge lasts only until the REFERRING memory
+    is next edited — and then the stale text wins, silently. Either the vacated
+    path is empty and a resolved edge degrades to dangling (the edit that does it
+    can be a typo fix), or something else has claimed that path and the edge
+    binds to a DIFFERENT memory. A reader copying the address out of the body
+    spreads it into new memories before either happens. So the text is repaired
+    too: the body is the source of truth for its own links, and fixing only the
+    edge buys one write's worth of correctness.
+    - Rewrites go by parsed span and link order, never by substituting text —
+      a body that links to the same path twice has two edges and may need only
+      one changed, and a body that writes `[[path]]` in backticks to document
+      the syntax must come out untouched. Label and anchor ride along unchanged.
+    - Recorded as a `relink` operation with a diff, authored by **whoever moved
+      the memory**, not by a service identity: someone did cause the change, and
+      crediting a ghost hides who. Retention is deliberately not renewed — the
+      window measures the client's use of their data, and a repair made on their
+      behalf is not use.
+    - A subtree move repairs links to the descendants too, and the mover may be
+      its own referrer (a memory linking into its own subtree), so `move` returns
+      the repaired body rather than one the store no longer has.
+    - Still open, and different in kind: `forget` leaves the text with nowhere to
+      point, so it cannot be repaired this way.
+  - Unresolved is a real state, not an error: a link to something not yet
+    written stands as `resolved: false` and binds itself when the target appears
+    (or when a memory moves onto that path). A target later erased nulls the
+    edge rather than letting it drift onto whatever takes the path next.
+  - Code spans and fenced blocks are not scanned — the corpus's own notes
+    explain the syntax in backticks, and a validator that flags its own
+    documentation teaches everyone to ignore it. URLs and prose stay prose.
+  - Links never cross a tenant boundary; the backlink query re-applies the
+    namespace predicate rather than trusting that rule.
+  - `memory_links` (MCP) / `GET /memories/{id}/links` (REST).
+- **The graph is backfilled once, automatically**, and `memgres-relink` forces a
+  rebuild. Deriving edges only on write would have upgraded every existing
+  corpus into an empty graph that answered "nothing points here" for every
+  memory — a fact-shaped silence, which is the failure this release is mostly
+  about.
+
+### Usage
+- **Every memory now records how often it surfaces in search and how often it is
+  read in full** (`recalled` / `gets`, with the time of each). Two counts rather
+  than one, because they answer different questions: surfacing says the memory is
+  findable — its words match what people ask; being fetched says it was worth
+  opening once found. Surfaced often but never opened is noise in every result
+  list it appears in; neither is a memory reachable only by already knowing it
+  exists, which is how 42 of this corpus's 97 memories sat.
+  - Kept in a separate `memory_usage` table, never on the `memory` row. Postgres
+    writes a new version of the whole row on every UPDATE and a memory row
+    carries its body, so counting a read there would rewrite kilobytes per read,
+    bloat the largest table in the schema and contend with real writes for the
+    same lock — and it would muddy `updated_at`, which means "the content
+    changed". For the same reason none of it enters the hash chain:
+    `verify_history` must not become a function of how often a memory was read.
+  - Counted for what came BACK from a search, not for what the ranking
+    considered; reads the store makes for itself are not counted. Best-effort, so
+    a statistic that cannot be written is never the reason a read fails.
+  - **No foreign key to `memory`**, which is counter-intuitive and load-bearing:
+    one would make every counted read take `FOR KEY SHARE` on the memory row —
+    held until the reader's transaction ended — and that conflicts with the
+    `SELECT … FOR UPDATE` every write begins with. A plain `get()` would block
+    writes, `forget` and the retention sweep for that memory. Statistics must not
+    be able to block the data they describe, so `forget` and `purge_expired`
+    delete the counts themselves.
+  - Visible where each is useful: `usage` on `memory_get`, `recalled`/`gets` per
+    row on `memory_list` — which is how a subtree nobody reads becomes visible.
+  - `MEMGRES_USAGE_COUNTERS=false` turns counting off (read-only replicas).
+
+### Breaking
+- **`memory_find` is gone.** It searched titles and nothing else, while
+  `memory_recall` searched bodies and nothing else, so a caller had to guess which
+  half held what it wanted. Lexical recall now matches title OR body and weights a
+  title match higher; `bodies=false` gives the light "where is it" rows `find`
+  returned. Same for `GET /find` and `Store.find`.
+- **`ttl_days` is gone from `memory_write`** (MCP, REST and `Store.write`).
+  Retention is the operator's promise about how long client data is kept, and a
+  per-write override made it advisory: `0` was read as "keep forever", a larger
+  value outran the policy, and an edit that omitted it silently cleared an expiry
+  already set. `MEMGRES_RETENTION_DAYS` is now the only thing that decides.
+- **A write that stores content must supply `title`** (`MEMGRES_REQUIRE_TITLE`,
+  default on). `move`/`retag` are exempt — they store no content.
+- **Compatibility floor 14 → 16.** Migration 0015 normalises stored tags; a client
+  older than 0.7.0 neither normalises nor knows to, so its filter for `X402` would
+  silently miss a row now stored as `x402`. Upgrade every client of a database
+  together.
+
+### Fixed
+- **Lexical recall no longer 500s on a row written before titles existed.**
+  Migration `0004` left such rows with `title_fts` NULL, judged harmless because
+  nothing read the column; the merged search reads it, `ts_rank(NULL, q)` is
+  NULL, and a NULL score sorts first and then hits `float(None)`. One legacy row
+  would have taken recall down for the whole deployment on the first query after
+  upgrading — 50 of the 95 memories in the reference corpus carried that NULL.
+  The ranks are COALESCEd and every row is given a real tsvector on migrate.
+- **A `datetime` passed to `valid_at`** hashed with a time the `date` column
+  cannot keep, so verification called an untouched chain tampered — permanently,
+  for that memory. It is now reduced to its day. Only the embedded `Store` API
+  was affected; both transports send strings.
+- **Migration `0015` is a genuine no-op on re-run.** It sorted tags while
+  `normalize_tags` keeps the writer's order, so every start re-sorted stored
+  tags — diverging from `memory_history.tags_after` with `verify_history` still
+  returning True, and turning a client's unchanged tag list into a phantom
+  `retag` that the next boot flipped back.
+- `MEMGRES_RETENTION_SWEEP=false` turns the sweep off for one process (every
+  server process starts one, and in a stdio deployment a process is a session);
+  one pass is bounded rather than deleting an entire backlog in one transaction.
+- A create with no body says so instead of blaming the missing caption.
+
+### Added
+- **`valid_at`** on a write: the day the content was last known to be ACCURATE.
+  `created_at`/`updated_at` say when a row was written, which cannot answer "is
+  this still true" — a typo fix moves `updated_at`, and a fact distilled today
+  from a 2021 letter is not fresh because the row is new. It lives on the history
+  row (a property of one assertion, like `source`), folds into the hash chain, may
+  point into the past, and sending it alone records a re-confirmation as
+  `op: revalidate` rather than forcing a fake edit.
+- **`memory_tags`** — the tag vocabulary in use, most-used first, narrowable by
+  prefix. A writer cannot reuse a label it has never seen.
+- **`match_tags: all | any`** on recall and browse (`@>` vs `&&`, same index).
+- **Retention is actually enforced.** `purge_expired` had no caller anywhere in the
+  tree: expired rows were hidden from reads and never deleted, so "we expire your
+  data after N days" was half a promise. It now runs on a timer
+  (`MEMGRES_RETENTION_SWEEP_INTERVAL`) and takes chunk vectors with it — pgvector
+  cascades on the FK, but qdrant is out-of-band and orphaned points would keep
+  taking candidate slots until `fetch_hit_rows` found no row behind them.
+- The MCP handshake reports the package version; it used to go out empty.
+
+### Changed
+- **Tags are normalised** (NFC + lowercase) on write and on filter, and 0015
+  brings stored rows along. `X402`, `x402` and the two Unicode spellings of "й"
+  were three unrelated labels — 265 distinct tags across 97 memories in the
+  reference corpus, with the filter working perfectly on a vocabulary nothing
+  agreed on.
+- The retention sweep runs independently of the embed worker: that worker only
+  exists when embeddings are configured, so riding on it would have made a
+  lexical-only deployment keep expired data forever. Their shared thread and
+  connection lifecycle moved to `PeriodicWorker`.
+- The hash chain's optional dimensions are an append-only registry
+  (`OPTIONAL_DIMENSIONS`) rather than a chain of `if`s. Order is part of the
+  recipe, and a list can be asserted in a test where statement order cannot.
+
 ## [0.6.0] — 2026-08-24
 
 ### Security

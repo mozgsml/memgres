@@ -63,7 +63,7 @@ optional layers on top of the same core:
   └─ MCP server           write/recall/get/blame/move/forget as MCP tools
 ```
 
-**Record model:** one memory = one mutable body (up to a configurable ceiling, default 256 KB) plus metadata — `tags` (cross-cutting labels, `text[]` + GIN), a `path` (its place in an `ltree` tree), timestamps, and per-diff provenance (`source`/`reason`, kept in history). A single write/diff is capped smaller (default 16 KB), so large bodies accrue over many authored diffs. **Organization is two orthogonal axes:** the tree is *where a memory lives* (one place, subtree-selectable); tags are *what it's about* (many, overlapping). Both filter either search — narrow a semantic query to a subtree, or list a tag across the tree.
+**Record model:** one memory = one mutable body (up to a configurable ceiling, default 256 KB) plus metadata — `tags` (cross-cutting labels, `text[]` + GIN), a `path` (its place in an `ltree` tree), timestamps, and per-diff provenance (`source`/`reason`, kept in history). A single write/diff is capped smaller (default 16 KB), so large bodies accrue over many authored diffs. **Organization is two orthogonal axes:** the tree is *where a memory lives* (one place, subtree-selectable); tags are *what it's about* (many, overlapping). Both filter either search — narrow a semantic query to a subtree, or list a tag across the tree. **Links are the third axis:** `[[path]]` in a body becomes a real edge — walkable in BOTH directions, so "what relies on this?" has an answer before you change a fact — and a move rewrites the bodies that named the old address, so a link keeps working and an address copied out of a body is still one. Each memory also records how often it surfaces in search and how often it is opened, which is how the part of a corpus nobody reads becomes visible.
 
 **Isolation:** optional multi-tenant identity keeps tenants from seeing each other's memories — users own *namespaces*, and rotatable, permission-scoped *tokens* authenticate as a user (turned on with `MEMGRES_KEY_MODE=open|managed`; see [docs/TENANCY.md](docs/TENANCY.md)). Encryption at rest is left to the deployment — Postgres/managed-PG/disk TDE stays transparent to queries, so search keeps working; memgres deliberately does **not** encrypt bodies application-side (that would make them unsearchable, which is why no comparable tool does it either). GDPR erasure is real: `forget()` hard-deletes the row, its vectors, and crypto-shreds the history chain. All limits are env-configurable, so the same code serves a single-user embed and a capped multi-tenant service.
 
@@ -80,7 +80,7 @@ docker compose up
 
 Defaults suit a single-user setup with no auth. To change limits, the embedding provider, tokens, … drop a `.env` beside it — every `MEMGRES_*` is optional (see [Configuration](#configuration) or [.env.example](.env.example)).
 
-**Give it to an LLM / agent — no code (MCP).** Point any URL-capable MCP client (Cursor, Cline, Claude Desktop, …) at the running server; the model gets `memory_write`, `memory_recall`, `memory_get`, `memory_list`, `memory_blame`, `memory_history`, `memory_move`, `memory_forget`, `memory_server_info` as tools:
+**Give it to an LLM / agent — no code (MCP).** Point any URL-capable MCP client (Cursor, Cline, Claude Desktop, …) at the running server; the model gets `memory_write`, `memory_recall`, `memory_get`, `memory_list`, `memory_tags`, `memory_links`, `memory_blame`, `memory_history`, `memory_move`, `memory_forget`, `memory_server_info` as tools:
 
 ```json
 {
@@ -155,7 +155,7 @@ Not sure which fits? Start with the decision guide: [docs/CHOOSING.md](docs/CHOO
 1. **`docker compose up`** — `pgvector` + service, nothing to configure. For a dedicated vector service instead, `docker compose --profile qdrant up` and set `MEMGRES_VECTOR_BACKEND=qdrant` (Qdrant ranks vectors; Postgres still holds bodies and does tag/subtree/TTL filtering).
 2. **Your own Postgres** — install the `[server]` extra (above), point `MEMGRES_DATABASE_URL` at it, run `memgres-server` (migrates on startup).
 3. **Embedded library** — install the core package, use `Store` directly, no HTTP at all.
-4. **Split service (many clients)** — a stateless API tier that only flags writes plus a scalable `memgres-worker` tier that embeds; see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) and `deploy/docker-compose.yml`. Switch the embedding model later with `memgres-reembed`.
+4. **Split service (many clients)** — a stateless API tier that only flags writes plus a scalable `memgres-worker` tier that embeds; see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) and `deploy/docker-compose.yml`. Switch the embedding model later with `memgres-reembed`; rebuild the link graph with `memgres-relink`.
 
 Semantic recall is optional: the default `MEMGRES_EMBED_PROVIDER=none` gives you lexical FTS with zero models. Turn on `local` (sentence-transformers), a cloud API (`openai`/`jina`), or any OpenAI-compatible server (LM Studio, Ollama, …) when you want meaning-based search — see [docs/EMBEDDINGS.md](docs/EMBEDDINGS.md) for choosing local vs cloud and [docs/BACKENDS.md](docs/BACKENDS.md) for copy-paste setups. The model id + dimension get stamped into the schema and a later mismatch hard-fails instead of silently returning garbage.
 
@@ -170,12 +170,16 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_MAX_BODY_BYTES` | `262144` | ceiling for a whole record body (256 KB) |
 | `MEMGRES_MAX_WRITE_BYTES` | `16384` | ceiling for one write/diff payload (≤ body) |
 | `MEMGRES_MAX_SOURCE_BYTES` / `_MAX_REASON_BYTES` | `2048` / `1024` | ceilings for a write's `source` / `reason` provenance |
-| `MEMGRES_RETENTION_DAYS` | `0` | `0` = keep forever (TTL off); `>0` = expire N days after last touch |
+| `MEMGRES_RETENTION_DAYS` | `0` | how long data is kept: `0` = forever (off); `>0` = expire N days after **last touch**. Operator-only — there is no per-write TTL. Note the clock restarts on a touch, and a read counts as one unless `MEMGRES_RENEW_ON_READ=false`: the window covers data nobody uses |
 | `MEMGRES_RENEW_ON_READ` | `true` | a read pushes the expiry clock forward |
+| `MEMGRES_RETENTION_SWEEP` | `true` | this process runs the retention sweep. Every server process starts one; set `false` where a dedicated sweeper already runs |
+| `MEMGRES_RETENTION_SWEEP_INTERVAL` | `3600` | seconds between sweeps that DELETE expired rows (and their vectors). Only runs when `RETENTION_DAYS > 0` |
+| `MEMGRES_USAGE_COUNTERS` | `true` | count how often each memory surfaces in search and is read in full (`memory_usage`, a separate table — never the `memory` row, never the hash chain). Off makes reads pure again, for a read-only replica |
 | `MEMGRES_KEY_MODE` | `single` | `single` (no auth, one space) · `open` (bring-your-own token, self-registers) · `managed` (admin-provisioned). See [docs/TENANCY.md](docs/TENANCY.md) |
 | `MEMGRES_ADMIN_TOKEN` | — | global admin bearer for provisioning (managed mode) |
 | `MEMGRES_TOKEN` | — | default token used when a call passes none (single-tenant endpoints) |
 | `MEMGRES_TREE` | `true` | `ltree` path column + GiST index (fast subtree select) |
+| `MEMGRES_REQUIRE_TITLE` | `true` | `true` = a write that stores content must supply `title`. Captions are what name a memory in results and what title-weighted ranking weighs; `move`/`retag` are exempt (they store no content) |
 | `MEMGRES_REQUIRE_PARENT` | `false` | `true` = a node's parent path must already exist |
 | `MEMGRES_HISTORY` | `true` | keep the hash-chained diff history (deleted with the record) |
 | `MEMGRES_FTS_LANGUAGE` | `simple` | Postgres FTS dictionary (`simple`/`english`/…) |
@@ -291,8 +295,8 @@ pip install "memgres[mcp]"
 ```
 
 Either way the model gets tools `memory_write`, `memory_recall`, `memory_get`,
-`memory_list`, `memory_blame`, `memory_history`, `memory_move`, `memory_forget`,
-`memory_server_info`. Tell it *"remember X"* / *"what do you know about Y?"* and it
+`memory_list`, `memory_tags`, `memory_links`, `memory_blame`, `memory_history`,
+`memory_move`, `memory_forget`, `memory_server_info`. Tell it *"remember X"* / *"what do you know about Y?"* and it
 calls them. (For semantic recall add the embedding env vars — see
 [docs/BACKENDS.md](docs/BACKENDS.md).)
 

@@ -1,0 +1,17 @@
+-- Remove the foreign key that 0019 created, from any database that already ran it.
+--
+-- 0019 has been corrected in place, but `CREATE TABLE IF NOT EXISTS` does nothing
+-- to a table that exists — so a database migrated before the correction would keep
+-- the key forever and keep paying for it. Editing a migration only fixes databases
+-- that have not run it yet; the ones that have need a migration of their own.
+--
+-- Why it goes: the key made every counted read take `FOR KEY SHARE` on the memory
+-- row, held until the READER's transaction ended, which conflicts with the
+-- `SELECT … FOR UPDATE` that begins every write. A plain `get()` then blocked
+-- writes, `forget` and the retention sweep for that memory. Statistics must not be
+-- able to block the data they describe; `forget` and `purge_expired` delete the
+-- counts explicitly instead.
+--
+-- The name is Postgres's default for this column and table, and `IF EXISTS` makes
+-- the whole thing a no-op where the key was never created.
+ALTER TABLE memory_usage DROP CONSTRAINT IF EXISTS memory_usage_memory_id_fkey;

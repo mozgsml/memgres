@@ -72,6 +72,7 @@ class Config:
                                  # user_manager (default) | superadmin
     # organization
     tree_enabled: bool           # ltree path column + GiST index for fast subtree selection
+    require_title: bool          # True = a write that stores CONTENT must caption it
     require_parent: bool         # False = sparse paths (create food.apple with no food row);
                                  # True = a node's parent path must already exist as a memory
     # history
@@ -106,6 +107,12 @@ class Config:
                                  #     deployment where an external worker embeds.
     embed_worker: bool           # a server process runs an in-process embed worker
     embed_worker_interval: float # seconds the idle worker sleeps between drains
+    usage_counters: bool         # count how often each memory surfaces in search and
+                                 # is read in full. Off makes reads pure again — for
+                                 # a read-only replica, or a deployment unwilling to
+                                 # pay one small write per read.
+    retention_sweep: bool        # this process runs the retention sweep
+    retention_sweep_interval: float  # seconds between retention sweeps (see retention_days)
     embed_max_attempts: int      # after this many failed embed attempts a row is a
                                  # dead letter — left flagged but out of the claim
                                  # rotation (logged), so one poison body can't wedge
@@ -151,6 +158,8 @@ class Config:
             raise ValueError("MEMGRES_FULL_BODY_MAX_CHARS must be >= 0")
         if self.embed_worker_interval <= 0:
             raise ValueError("MEMGRES_EMBED_WORKER_INTERVAL must be > 0")
+        if self.retention_sweep_interval <= 0:
+            raise ValueError("MEMGRES_RETENTION_SWEEP_INTERVAL must be > 0")
         if self.embed_max_attempts < 1:
             raise ValueError("MEMGRES_EMBED_MAX_ATTEMPTS must be >= 1")
         if self.embed_retry_backoff_s < 0:
@@ -200,6 +209,7 @@ def load() -> Config:
         admin_token_file=_str("MEMGRES_ADMIN_TOKEN_FILE", ""),
         admin_role=_str("MEMGRES_ADMIN_ROLE", "user_manager"),
         tree_enabled=_bool("MEMGRES_TREE", True),
+        require_title=_bool("MEMGRES_REQUIRE_TITLE", True),
         require_parent=_bool("MEMGRES_REQUIRE_PARENT", False),
         history_enabled=_bool("MEMGRES_HISTORY", True),
         fts_language=_str("MEMGRES_FTS_LANGUAGE", "simple"),
@@ -216,6 +226,9 @@ def load() -> Config:
         embed_dispatch=_str("MEMGRES_EMBED_DISPATCH", "inline"),
         embed_worker=_bool("MEMGRES_EMBED_WORKER", True),
         embed_worker_interval=_float("MEMGRES_EMBED_WORKER_INTERVAL", 1.0),
+        usage_counters=_bool("MEMGRES_USAGE_COUNTERS", True),
+        retention_sweep=_bool("MEMGRES_RETENTION_SWEEP", True),
+        retention_sweep_interval=_float("MEMGRES_RETENTION_SWEEP_INTERVAL", 3600.0),
         embed_max_attempts=_int("MEMGRES_EMBED_MAX_ATTEMPTS", 5),
         embed_retry_backoff_s=_float("MEMGRES_EMBED_RETRY_BACKOFF_S", 60.0),
         list_preview_chars=_int("MEMGRES_LIST_PREVIEW_CHARS", 120),

@@ -47,6 +47,9 @@ def env(monkeypatch):
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
+    # Captions are not what most of this suite is about; the requirement
+    # has its own file (test_require_title.py) covering both settings.
+    monkeypatch.setenv("MEMGRES_REQUIRE_TITLE", "false")
     monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
     monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
     monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
@@ -285,8 +288,9 @@ def test_all_never_includes_an_unreachable_namespace(env):
     assert all("launch codes" not in (h.snippet or "") for h in hits)
     # and the same for the browse + title paths, which share the filter
     assert all(r["space_id"] != vns for r in s.list(attacker_tok, space="all"))
-    assert all(r["space_id"] != vns
-               for r in s.find(attacker_tok, "codes", space="all"))
+    assert all(h.namespace != vns
+               for h in s.recall(attacker_tok, "codes", space="all",
+                                 bodies=False))
 
 
 def test_all_does_not_widen_a_scoped_token(env):
@@ -676,3 +680,27 @@ def test_capabilities_never_advertise_a_door_that_always_closes(env):
     assert admin.capabilities(setup, strong_p)["can_manage_own_tokens"] is True
     assert ident.list_tokens(setup, strong_p.user_id) != []
     assert admin.capabilities(setup, strong_p)["can_create_namespace"] is True
+
+
+# ─── the tag vocabulary is a read, and reads are scoped ──────────────────────
+def test_the_tag_vocabulary_never_shows_another_tenants_labels(env):
+    """`tag_counts` writes its own namespace predicate — it aggregates over
+    `unnest(tags)` rather than over rows, so it cannot use `build_filters`. That
+    makes it the one read whose tenant filter is a second copy, and a copy with
+    no test is how a leak ships green."""
+    setup, make_store = env
+    s = make_store("managed")
+    v_uid = ident.create_user(setup, name="victim")
+    ident.create_namespace(setup, v_uid, "secrets")
+    victim_tok, _ = ident.issue_token(setup, v_uid)
+    s.write(victim_tok, body="launch codes\n", tags=["classified"], space="secrets")
+
+    a_uid = ident.create_user(setup, name="attacker")
+    ident.create_namespace(setup, a_uid, "mine")
+    attacker_tok, _ = ident.issue_token(setup, a_uid)
+    s.write(attacker_tok, body="my lunch\n", tags=["lunch"], space="mine")
+
+    assert [r["tag"] for r in s.tags(attacker_tok)] == ["lunch"]
+    assert [r["tag"] for r in s.tags(attacker_tok, space="all")] == ["lunch"]
+    # even asking by prefix for the exact label must not confirm it exists
+    assert s.tags(attacker_tok, prefix="classified", space="all") == []

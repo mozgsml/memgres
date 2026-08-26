@@ -74,6 +74,9 @@ def _base_env(monkeypatch):
     for k in list(os.environ):
         if k.startswith("MEMGRES_") or k == "QDRANT_URL":
             monkeypatch.delenv(k, raising=False)
+    # Captions are not what most of this suite is about; the requirement
+    # has its own file (test_require_title.py) covering both settings.
+    monkeypatch.setenv("MEMGRES_REQUIRE_TITLE", "false")
     monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
     monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
     monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "openai")   # shape only; stub injected
@@ -349,3 +352,29 @@ def test_qdrant_adopt_orphans_keeps_both_recalls(qdrant_store):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ─── match_tags must reach the vector paths, not just the lexical one ────────
+def _tags_match_reaches_the_backend(store):
+    """`mode="auto"` resolves to semantic whenever an embedder is configured, so
+    the vector path is the DEFAULT one for any semantic deployment. If
+    `tags_match` is not threaded into `grouped_chunk_search`, `any` silently
+    returns the `all` answer — fewer rows, no error."""
+    both = store.write(body="apple apple", tags=["a", "b"])
+    just_a = store.write(body="apple apple apple", tags=["a"])
+
+    for mode in ("semantic", "hybrid"):
+        strict = {h.id for h in store.recall(None, "apple", mode=mode,
+                                             tags=["a", "b"])}
+        assert strict == {both.id}, mode
+        loose = {h.id for h in store.recall(None, "apple", mode=mode,
+                                            tags=["a", "b"], match_tags="any")}
+        assert loose == {both.id, just_a.id}, mode
+
+
+def test_pg_tags_match_reaches_the_backend(pg_store):
+    _tags_match_reaches_the_backend(pg_store)
+
+
+def test_qdrant_tags_match_reaches_the_backend(qdrant_store):
+    _tags_match_reaches_the_backend(qdrant_store)

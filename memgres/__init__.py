@@ -22,7 +22,8 @@ from .embeddings import Embedder, get_embedder
 from .schema import migrate, SchemaMismatch, SCHEMA_VERSION
 from .search import Hit, recall
 from .blame import annotate, annotate_grouped, reconstruct, replay
-from .store import Store, Memory, Conflict, NotFound, TooLarge, NoParent
+from .store import (Store, Memory, Conflict, NotFound, TooLarge, NoParent,
+                    MissingTitle)
 from .identity import (
     Principal, AuthError, SpaceNotFound,
     resolve, resolve_space, new_token, valid_format,
@@ -36,6 +37,7 @@ __all__ = [
     "__version__",
     "Config", "load_config",
     "Store", "Memory", "Conflict", "NotFound", "TooLarge", "NoParent",
+    "MissingTitle",
     "make_diff", "apply_diff", "content_hash", "DiffConflict",
     "Embedder", "get_embedder",
     "migrate", "SchemaMismatch", "SCHEMA_VERSION",

@@ -9,84 +9,46 @@ One daemon thread, one dedicated connection. It backfills on start (so a restart
 catches up any rows left pending, including the one-time re-chunk after the
 schema upgrade), then polls. ``drain_once`` is the same code the loop runs and is
 directly callable from a test or a CLI. The real work lives in
-:func:`memgres.indexing.drain`; this is just its lifecycle.
+:func:`memgres.indexing.drain`; the lifecycle lives in
+:class:`memgres.periodic.PeriodicWorker`, shared with the retention sweep.
 """
 
 from __future__ import annotations
 
 import logging
-import threading
 from typing import Callable, Optional
 
 from .indexing import drain
+from .periodic import PeriodicWorker, maybe_start_sweeper
 
 _log = logging.getLogger("memgres.embed_worker")
 
 
-class EmbedWorker:
+class EmbedWorker(PeriodicWorker):
+    """Drains ``embed_pending`` — one tick is one drain pass.
+
+    The first tick IS the backfill (rows left pending across a restart or the
+    schema upgrade). It happens in the thread rather than in ``start()``, so
+    building a server never blocks on embedding a backlog."""
+
+    name = "memgres-embed"
+
     def __init__(self, cfg, embedder, backend,
                  connect: Callable[[], "object"]):
-        self.cfg = cfg
+        super().__init__(cfg, connect, cfg.embed_worker_interval)
         self.embedder = embedder
         self.backend = backend
-        self._connect = connect          # () -> a fresh psycopg connection
-        self._conn = None
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def _conn_ok(self):
-        if self._conn is None or getattr(self._conn, "closed", False):
-            self._conn = self._connect()
-        return self._conn
 
     def drain_once(self) -> int:
         """One synchronous drain pass over all currently-pending rows. Returns the
         count embedded. Used by the loop and directly by tests."""
         return drain(self._conn_ok(), self.cfg, self.embedder, self.backend)
 
-    def _run(self) -> None:
-        # The first iteration IS the backfill (catch up rows left pending across a
-        # restart / the schema upgrade). Done in the thread, not in start(), so
-        # building a server never blocks on embedding a backlog.
-        while not self._stop.is_set():
-            try:
-                self.drain_once()
-            except Exception:
-                _log.exception("embed worker drain failed; dropping connection, retrying")
-                self._reset_conn()
-            self._stop.wait(self.cfg.embed_worker_interval)
-
-    def _reset_conn(self) -> None:
-        try:
-            if self._conn is not None:
-                self._conn.close()
-        except Exception:
-            pass
-        self._conn = None
-
-    def start(self) -> "EmbedWorker":
-        if self._thread is not None:
-            return self
-        self._thread = threading.Thread(target=self._run, name="memgres-embed",
-                                        daemon=True)
-        self._thread.start()
-        return self
-
-    def serve(self) -> None:
-        """Run the drain loop in the CURRENT thread, blocking until ``stop()``.
-        Used by the standalone ``memgres-worker`` process (a signal handler calls
-        ``stop()``); the in-process server path uses ``start()`` instead."""
-        self._run()
-        self._reset_conn()
+    def _tick(self) -> None:
+        self.drain_once()
 
     def stop(self) -> None:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-            self._thread = None
-        self._reset_conn()
-
-
 def maybe_start_worker(cfg, embedder, backend,
                        connect: Callable[[], "object"]) -> Optional[EmbedWorker]:
     """Start an :class:`EmbedWorker` when there's something to embed and the
@@ -99,11 +61,16 @@ def maybe_start_worker(cfg, embedder, backend,
 
 
 def wire_server(cfg, embedder):
-    """Server-side setup shared by the HTTP and MCP entrypoints: build the vector
-    backend ONCE, start the in-process embed worker if warranted, and return
+    """Server-side background setup shared by the HTTP and MCP entrypoints: build
+    the vector backend ONCE, start the in-process embed worker if warranted, start
+    the retention sweep if the deployment has a retention policy, and return
     ``(worker, cfg, backend)`` with ``cfg.embed_dispatch`` set to what actually
     holds. The caller injects ``backend`` into every per-request ``Store`` so a
     qdrant client isn't rebuilt each call.
+
+    The sweep is started here and not returned: like the embed worker at both
+    call sites, nothing holds it — it is a daemon thread that dies with the
+    process. Drive it directly (``RetentionSweeper.sweep_once``) in a test.
 
     Dispatch resolution:
       * an in-process worker started (``embed_worker`` on, embedder present) →
@@ -120,9 +87,15 @@ def wire_server(cfg, embedder):
     from .vector.base import make_backend
 
     backend = make_backend(cfg, embedder)
-    worker = maybe_start_worker(
-        cfg, embedder, backend,
-        connect=lambda: psycopg.connect(cfg.database_url or ""))
+    connect = lambda: psycopg.connect(cfg.database_url or "")   # noqa: E731
+    worker = maybe_start_worker(cfg, embedder, backend, connect=connect)
+    # Retention answers to its own policy, not to whether embeddings are on: a
+    # lexical-only deployment must still stop holding expired data.
+    maybe_start_sweeper(cfg, connect, embedder, backend)
+    # One-time, synchronous: a server that starts serving `memory_links` before
+    # the graph exists would answer "nothing points here" for every memory.
+    from .relink import maybe_backfill
+    maybe_backfill(cfg, connect)
     dispatch = "async" if worker is not None else cfg.embed_dispatch
     if dispatch == "async" and worker is None and backend is not None:
         # async + no local worker: writes will flag embed_pending and this process

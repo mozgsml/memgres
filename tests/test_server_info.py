@@ -20,6 +20,9 @@ def _clear(monkeypatch):
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
+    # Captions are not what most of this suite is about; the requirement
+    # has its own file (test_require_title.py) covering both settings.
+    monkeypatch.setenv("MEMGRES_REQUIRE_TITLE", "false")
 
 
 def test_top_level_keys_and_limits(monkeypatch):
@@ -112,3 +115,27 @@ def test_no_secrets_leak(monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ─── the handshake names the build ───────────────────────────────────────────
+def test_the_mcp_handshake_carries_the_version():
+    """The initialize response is the only thing a client sees BEFORE calling a
+    tool — and "which build is answering?" is the first question of every
+    coordinated upgrade. It used to go out empty, so `/mcp` panels showed a blank
+    where the version belongs."""
+    pytest.importorskip("mcp")
+    from memgres import __version__
+    from memgres.mcp_server import _mcp
+    server = _mcp("memgres")
+    # Whichever SDK generation is installed, the version must reach the wire.
+    # Reading it off the object is not enough — on one generation it lives on the
+    # lowlevel server underneath, and only `create_initialization_options` proves
+    # which value the client will actually be told.
+    low = getattr(server, "_mcp_server", None) or getattr(
+        server, "_lowlevel_server", None)
+    if low is not None and hasattr(low, "create_initialization_options"):
+        assert low.create_initialization_options().server_version == __version__
+    else:
+        reported = (getattr(server, "version", None)
+                    or getattr(low, "version", None))
+        assert reported == __version__

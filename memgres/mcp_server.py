@@ -73,7 +73,8 @@ TOOL_VISIBILITY = {
     "memory_recall": (),
     "memory_get": (),
     "memory_list": (),
-    "memory_find": (),
+    "memory_tags": (),
+    "memory_links": (),
     "memory_blame": (),
     "memory_history": (),
     "memory_server_info": (),
@@ -155,13 +156,31 @@ def _instruction_text() -> Optional[str]:
 def _mcp(name: str, instructions: Optional[str] = None):
     # The SDK renamed FastMCP -> MCPServer; support both. ``instructions`` is
     # emitted in the initialize response; None => the SDK omits it.
+    #
+    # `version` matters more than it looks: the initialize response is the only
+    # thing a client sees BEFORE calling a tool, and it is the first question
+    # asked during a coordinated upgrade ("which build is answering?"). It used
+    # to go out empty.
+    import inspect
+
+    from . import __version__
     kw = {"instructions": instructions} if instructions else {}
     try:
-        from mcp.server.mcpserver import MCPServer
-        return MCPServer(name, **kw)
+        from mcp.server.mcpserver import MCPServer as _Server
     except ImportError:
-        from mcp.server.fastmcp import FastMCP
-        return FastMCP(name, **kw)
+        from mcp.server.fastmcp import FastMCP as _Server
+    # `version` is a constructor argument on one SDK generation and not the
+    # other, where it lives on the lowlevel server underneath. Asked rather than
+    # tried, so a TypeError from something else is not swallowed as "no version
+    # here" — and set either way, because the point is that the handshake carries
+    # it, not which class holds the field.
+    if "version" in inspect.signature(_Server.__init__).parameters:
+        kw["version"] = __version__
+    server = _Server(name, **kw)
+    low = getattr(server, "_mcp_server", None)
+    if low is not None and not getattr(low, "version", None):
+        low.version = __version__
+    return server
 
 
 def _mem(m) -> dict:
@@ -299,7 +318,7 @@ def build_server(cfg: Optional[Config] = None):
                      path: Optional[str] = None, tags: Optional[List[str]] = None,
                      title: Optional[str] = None,
                      source: Optional[str] = None, reason: Optional[str] = None,
-                     ttl_days: Optional[int] = None,
+                     valid_at: Optional[str] = None,
                      space: Optional[str] = None, space_id: Optional[str] = None,
                      token: Optional[str] = None, ctx: Context = None) -> dict:
         """Create or edit a memory.
@@ -327,8 +346,23 @@ def build_server(cfg: Optional[Config] = None):
         to edit it at its new address, or `if_moved="create"` to claim the vacated
         path for something genuinely new.
 
-        `tags` labels it; `title` is a short curated caption (set whole,
-        searchable via `memory_find`); `source`/`reason` record provenance.
+        **`title` is REQUIRED** for any write that stores content — a create, or
+        an edit that changes the body. (Re-addressing with `path` and relabelling
+        with `tags` are exempt.) It is a short curated caption, set whole; it
+        names the memory in results, and recall weights a match there above one in
+        the body. Omit it and the write is refused, naming the memory so you can
+        caption it from the error. `source`/`reason` record provenance.
+        Link other memories from the body as `[[path]]` (or
+        `[[path#anchor|label]]`) — they become a real graph you can walk with
+        `memory_links`, including backwards.
+
+        `valid_at` (YYYY-MM-DD) is the day this content was last known to be
+        ACCURATE — not the day you wrote it. Set it when the fact comes from a
+        dated source ("the letter is from 2021-03") or when you have just
+        re-checked one ("still true today"). Omit it and it means "accurate as of
+        now", which is the ordinary case; it may point into the past, and that is
+        not a mistake. Sending only `valid_at` records a re-confirmation without
+        touching the body.
         `space` picks one of your namespaces by name (`space_id` for a shared
         one); omit both when you reach exactly one namespace — with several, say
         which. The answer's `created` says whether
@@ -345,7 +379,8 @@ def build_server(cfg: Optional[Config] = None):
                 if_moved=if_moved, body=body, diff=diff,
                 base_hash=base_hash, replace=replace, replace_all=replace_all,
                 path=path, tags=tags, title=title, source=source,
-                reason=reason, ttl_days=ttl_days, space=space, space_id=space_id))
+                reason=reason, valid_at=valid_at, space=space,
+                space_id=space_id))
 
     @mcp.tool()
     def memory_get(id: Optional[str] = None, at: Optional[str] = None,
@@ -359,6 +394,9 @@ def build_server(cfg: Optional[Config] = None):
         you get the memory anyway and `moved_from` in the answer tells you the
         address changed — use the new `path` from then on. `if_moved="error"` asks
         to be told rather than redirected.
+
+        The answer carries `usage`: how often this memory has surfaced in search
+        (`recalled`) and been fetched (`gets`), and when each last happened.
 
         `lines` ("40-80", "5", "1,10-12") returns only part of a long body. The
         answer is then marked `partial`, carries `total_lines`, and has NO
@@ -378,18 +416,27 @@ def build_server(cfg: Optional[Config] = None):
                       path_prefix: Optional[str] = None,
                       snippet: Optional[bool] = None,
                       full_body: Optional[bool] = None,
+                      bodies: bool = True,
+                      match_tags: Optional[Literal["all", "any"]] = None,
                       space: Spaces = None, space_id: Spaces = None,
                       token: Optional[str] = None, ctx: Context = None) -> List[dict]:
-        """Search memories. `mode`: lexical | semantic | hybrid | auto. `match`
+        """Search memories — bodies AND curated titles, with a title match
+        weighted higher. `mode`: lexical | semantic | hybrid | auto. `match`
         governs lexical word combination — defaults to OR-any (any query word
         matches, forgiving recall); set 'all' to require every word (narrow).
-        Optionally scope to a tag set (`tags`) or a subtree (`path_prefix`, e.g.
-        'ops.postgres'). Each hit carries a `snippet` plus `kind` and `lines`:
+        Optionally scope to a tag set (`tags` — `match_tags="all"`, the default,
+        needs every one; `"any"` needs at least one) or a subtree (`path_prefix`,
+        e.g. 'ops.postgres'). `memory_tags` lists the vocabulary in use, so you
+        can reuse an existing tag instead of inventing a near-duplicate. Each hit carries a `snippet` plus `kind` and `lines`:
         `kind="snippet"` is the most relevant slice (semantic/hybrid pick the
         best-matching segment, lexical uses ts_headline) with `lines`=[start,end];
         `kind="full"` means the snippet IS the whole body (short body, or
         `full_body=true`). Pass `full_body=true` to force whole bodies,
         `snippet=false` to skip slicing.
+
+        `bodies=false` is the cheap "where is it" pass: ranked hits carrying
+        id/path/title/tags and NO text. Use it to scan a wide result set before
+        choosing what to read in full with `memory_get`.
 
         WHERE to search: `space` takes a namespace name, a list of names, or
         `"all"` for every namespace you reach; `space_id` takes ids (the only way
@@ -402,46 +449,72 @@ def build_server(cfg: Optional[Config] = None):
                     for h in _store(conn).recall(
                         _token(ctx, token), query, k=k, tags=tags,
                         path_prefix=path_prefix, mode=mode, match=match,
-                        snippet=snippet, full_body=full_body,
-                        space=space, space_id=space_id)]
+                        snippet=snippet, full_body=full_body, bodies=bodies,
+                        match_tags=match_tags, space=space, space_id=space_id)]
 
     @mcp.tool()
     def memory_list(path_prefix: Optional[str] = None,
                     tags: Optional[List[str]] = None, limit: int = 50,
-                    offset: int = 0, bodies: bool = False, space: Spaces = None,
-                    space_id: Spaces = None,
+                    offset: int = 0, bodies: bool = False,
+                    match_tags: Optional[Literal["all", "any"]] = None,
+                    space: Spaces = None, space_id: Spaces = None,
                     token: Optional[str] = None, ctx: Context = None) -> List[dict]:
         """BROWSE (enumerate) a subtree — NOT a search. Lists memories under
         `path_prefix` (e.g. survey all of 'decisions.*') ordered by path, with a
         short first-line `preview` of each. No query, no ranking; use
         `memory_recall` when you want relevance search. Optionally narrow by
-        `tags`; `limit`/`offset` paginate. `bodies=true` returns whole bodies
+        `tags` (`match_tags="all"` needs every one, `"any"` at least one);
+        `limit`/`offset` paginate. `bodies=true` returns whole bodies
         instead of previews — read a subtree in ONE call instead of a browse plus
         a fetch per row; it is capped in total, and rows past the cap come back
         with `body_omitted=true` rather than being silently dropped.
         `space`/`space_id` pick the namespace(s) — a name, a list, or `"all"`;
-        required when you reach several. Rows carry `space`/`space_id`."""
+        required when you reach several. Rows carry `space`/`space_id`, plus
+        `recalled`/`gets` — how often each memory has surfaced in a search and
+        been read in full. That pair is how you find dead weight: surfaced often
+        but never opened is noise in results; neither is a memory nobody can
+        reach."""
         with pool.connection() as conn:
             return _store(conn).list(
                 _token(ctx, token), path_prefix=path_prefix, tags=tags,
                 limit=limit, offset=offset, bodies=bodies,
-                space=space, space_id=space_id)
+                match_tags=match_tags, space=space, space_id=space_id)
 
     @mcp.tool()
-    def memory_find(query: str, k: int = 10, tags: Optional[List[str]] = None,
-                    path_prefix: Optional[str] = None,
-                    match: Optional[Literal["any", "all"]] = None,
+    def memory_tags(prefix: Optional[str] = None, k: int = 50,
                     space: Spaces = None, space_id: Spaces = None,
                     token: Optional[str] = None, ctx: Context = None) -> List[dict]:
-        """LOCATE by curated `title` (+ tags) — a light "where is it" search over
-        titles only, NEVER the body. Returns {id, path, title, tags, score} (no
-        body/snippet), so it's cheap to scan before a heavier `memory_recall`.
-        Works even without an embedder. Narrow by `tags`/`path_prefix`; pick
-        namespace(s) with `space`/`space_id` (a name, a list, or `"all"`)."""
+        """The tag vocabulary in use, most-used first: `{tag, count}`.
+
+        READ THIS BEFORE TAGGING A NEW MEMORY. Tags match exactly, so a label you
+        invent that already exists in another spelling becomes a second, unrelated
+        tag and neither filter finds both. `prefix` narrows (e.g. "ops"), `k`
+        caps the list. Tags are stored lowercased and Unicode-normalised, so case
+        and accent form are not what makes two tags different — wording is."""
         with pool.connection() as conn:
-            return _store(conn).find(_token(ctx, token), query, k=k, tags=tags,
-                                     path_prefix=path_prefix, match=match,
+            return _store(conn).tags(_token(ctx, token), prefix=prefix, k=k,
                                      space=space, space_id=space_id)
+
+    @mcp.tool()
+    def memory_links(id: Optional[str] = None, at: Optional[str] = None,
+                     direction: Literal["in", "out", "both"] = "both",
+                     space: Optional[str] = None, space_id: Optional[str] = None,
+                     token: Optional[str] = None, ctx: Context = None) -> dict:
+        """What this memory links to, and WHAT LINKS TO IT. Address it by `id` or
+        `at` (its path).
+
+        `in` is the half you cannot get by reading the memory: before you change
+        a fact, this is who is relying on it. `out` lists its `[[links]]` and is
+        where a DANGLING one shows up — `resolved: false` means the target has
+        not been written yet, or was erased.
+
+        Write a link as `[[path]]`, or `[[path#anchor|label]]`. Pointers at other
+        stores use a scheme (`[[idea:some-slug]]`); anything else in double
+        brackets is left as plain text."""
+        with pool.connection() as conn:
+            return _store(conn).links(_token(ctx, token), id=id or None,
+                                      at=at or None, direction=direction,
+                                      space=space, space_id=space_id)
 
     @mcp.tool()
     def memory_server_info(ctx: Context = None) -> dict:

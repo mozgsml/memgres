@@ -48,6 +48,9 @@ def conn(monkeypatch):
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
+    # Captions are not what most of this suite is about; the requirement
+    # has its own file (test_require_title.py) covering both settings.
+    monkeypatch.setenv("MEMGRES_REQUIRE_TITLE", "false")
     monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
     monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
     monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")

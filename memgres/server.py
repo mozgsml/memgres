@@ -74,7 +74,7 @@ def create_app(cfg: Optional[Config] = None):
         title: Optional[str] = None
         source: Optional[str] = None
         reason: Optional[str] = None
-        ttl_days: Optional[int] = None
+        valid_at: Optional[str] = None       # day the content was last accurate
         space: Optional[str] = None          # namespace name (your own)
         space_id: Optional[str] = None       # namespace id (canonical; shared spaces)
         if_moved: str = "error"              # a vacated `path`: refuse, or "create"
@@ -96,7 +96,7 @@ def create_app(cfg: Optional[Config] = None):
         title: Optional[str] = None
         source: Optional[str] = None
         reason: Optional[str] = None
-        ttl_days: Optional[int] = None
+        valid_at: Optional[str] = None       # day the content was last accurate
         space: Optional[str] = None
         space_id: Optional[str] = None
         if_moved: str = "error"              # a stale address: refuse, or "follow"
@@ -194,7 +194,7 @@ def create_app(cfg: Optional[Config] = None):
         with pool.connection() as conn:
             m = _guard(lambda: _store(conn).write(
                 tok, body=req.body, path=req.path, tags=req.tags, title=req.title,
-                source=req.source, reason=req.reason, ttl_days=req.ttl_days,
+                source=req.source, reason=req.reason, valid_at=req.valid_at,
                 if_moved=req.if_moved, space=req.space, space_id=req.space_id))
             return _mem(m)
 
@@ -223,8 +223,8 @@ def create_app(cfg: Optional[Config] = None):
                 replace=_folded_replace(req),
                 replace_all=req.replace_all,
                 path=req.path, tags=req.tags, title=req.title,
-                source=req.source, reason=req.reason,
-                ttl_days=req.ttl_days, space=req.space, space_id=req.space_id))
+                source=req.source, reason=req.reason, valid_at=req.valid_at,
+                space=req.space, space_id=req.space_id))
             return _mem(m)
 
     @app.post("/memories/{mid}/move")
@@ -287,6 +287,8 @@ def create_app(cfg: Optional[Config] = None):
     def list_memories(path: Optional[str] = None,
                       tags: Optional[str] = Query(None, description="comma-separated"),
                       limit: int = 50, offset: int = 0, bodies: bool = False,
+                      match_tags: Optional[str] = Query(
+                          None, description="'all' (default) or 'any'"),
                       space: Optional[List[str]] = Query(
                           None, description="namespace name(s), or 'all'"),
                       space_id: Optional[List[str]] = Query(None),
@@ -299,7 +301,31 @@ def create_app(cfg: Optional[Config] = None):
         with pool.connection() as conn:
             return _guard(lambda: _store(conn).list(
                 tok, path_prefix=path, tags=taglist or None, limit=limit,
-                offset=offset, bodies=bodies, space=space, space_id=space_id))
+                offset=offset, bodies=bodies, match_tags=match_tags,
+                space=space, space_id=space_id))
+
+    @app.get("/memories/{mid}/links")
+    def links(mid: str, direction: str = "both",
+              space: Optional[str] = None, space_id: Optional[str] = None,
+              tok: Optional[str] = Depends(token)):
+        """What this memory links to, and what links to it. Inbound is the half
+        the body cannot answer: who is relying on this fact."""
+        with pool.connection() as conn:
+            return _guard(lambda: _store(conn).links(
+                tok, **_ref(mid), direction=direction,
+                space=space, space_id=space_id))
+
+    @app.get("/tags")
+    def tags_in_use(prefix: Optional[str] = None, k: int = 50,
+                    space: Optional[List[str]] = Query(
+                        None, description="namespace name(s), or 'all'"),
+                    space_id: Optional[List[str]] = Query(None),
+                    tok: Optional[str] = Depends(token)):
+        """The tag vocabulary in use, most-used first. Tags match exactly, so a
+        writer that cannot see the existing labels invents near-duplicates."""
+        with pool.connection() as conn:
+            return _guard(lambda: _store(conn).tags(
+                tok, prefix=prefix, k=k, space=space, space_id=space_id))
 
     @app.get("/info")
     def info():
@@ -313,6 +339,10 @@ def create_app(cfg: Optional[Config] = None):
                tags: Optional[str] = Query(None, description="comma-separated"),
                path_prefix: Optional[str] = None,
                snippet: Optional[bool] = None, full_body: Optional[bool] = None,
+               bodies: bool = Query(
+                   True, description="false = light 'where is it' rows, no text"),
+               match_tags: Optional[str] = Query(
+                   None, description="'all' (default) or 'any'"),
                space: Optional[List[str]] = Query(
                    None, description="namespace name(s), or 'all'"),
                space_id: Optional[List[str]] = Query(None),
@@ -321,26 +351,10 @@ def create_app(cfg: Optional[Config] = None):
         with pool.connection() as conn:
             hits = _guard(lambda: _store(conn).recall(
                 tok, q, k=k, tags=taglist or None, path_prefix=path_prefix,
-                mode=mode, snippet=snippet, full_body=full_body,
-                space=space, space_id=space_id))
+                mode=mode, snippet=snippet, full_body=full_body, bodies=bodies,
+                match_tags=match_tags, space=space, space_id=space_id))
             return [h.to_recall_dict() for h in hits]
 
-    @app.get("/find")
-    def find(q: str, k: int = 10,
-             tags: Optional[str] = Query(None, description="comma-separated"),
-             path_prefix: Optional[str] = None, match: Optional[str] = None,
-             space: Optional[List[str]] = Query(
-                 None, description="namespace name(s), or 'all'"),
-             space_id: Optional[List[str]] = Query(None),
-             tok: Optional[str] = Depends(token)):
-        """Locate by curated title (+ tags) — light rows, never the body."""
-        taglist = [t for t in (tags.split(",") if tags else []) if t]
-        with pool.connection() as conn:
-            return _guard(lambda: _store(conn).find(
-                tok, q, k=k, tags=taglist or None, path_prefix=path_prefix,
-                match=match, space=space, space_id=space_id))
-
-    # ─── spaces: what this token can reach ──────────────────────────────────
     @app.get("/spaces")
     def spaces(tok: Optional[str] = Depends(token)):
         """List the namespaces this token can reach (identity modes only)."""

@@ -40,6 +40,9 @@ def client(monkeypatch):
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
+    # Captions are not what most of this suite is about; the requirement
+    # has its own file (test_require_title.py) covering both settings.
+    monkeypatch.setenv("MEMGRES_REQUIRE_TITLE", "false")
     monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
     monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
     monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
@@ -196,6 +199,9 @@ def test_identity_open_mode_over_http(monkeypatch):
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
+    # Captions are not what most of this suite is about; the requirement
+    # has its own file (test_require_title.py) covering both settings.
+    monkeypatch.setenv("MEMGRES_REQUIRE_TITLE", "false")
     monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
     monkeypatch.setenv("MEMGRES_KEY_MODE", "open")
     monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
@@ -242,6 +248,9 @@ def test_admin_provisioning_and_request_access(monkeypatch):
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
+    # Captions are not what most of this suite is about; the requirement
+    # has its own file (test_require_title.py) covering both settings.
+    monkeypatch.setenv("MEMGRES_REQUIRE_TITLE", "false")
     monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
     monkeypatch.setenv("MEMGRES_KEY_MODE", "managed")
     monkeypatch.setenv("MEMGRES_ADMIN_TOKEN", "root-admin")
@@ -316,6 +325,9 @@ def test_recall_over_several_namespaces(monkeypatch):
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
+    # Captions are not what most of this suite is about; the requirement
+    # has its own file (test_require_title.py) covering both settings.
+    monkeypatch.setenv("MEMGRES_REQUIRE_TITLE", "false")
     monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
     monkeypatch.setenv("MEMGRES_KEY_MODE", "open")
     monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
@@ -354,7 +366,8 @@ def test_recall_over_several_namespaces(monkeypatch):
         # browse and title-find address the same way
         assert len(client.get("/memories", params={"space": "all"},
                               headers=h).json()) == 3
-        assert client.get("/find", params={"q": "apple", "space": "all"},
+        assert client.get("/recall", params={"q": "apple", "space": "all",
+                                            "bodies": False},
                           headers=h).status_code == 200
 
 
@@ -432,6 +445,9 @@ def test_creating_spaces_and_aliasing_them_over_http(monkeypatch):
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
+    # Captions are not what most of this suite is about; the requirement
+    # has its own file (test_require_title.py) covering both settings.
+    monkeypatch.setenv("MEMGRES_REQUIRE_TITLE", "false")
     monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
     monkeypatch.setenv("MEMGRES_KEY_MODE", "open")
     monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")

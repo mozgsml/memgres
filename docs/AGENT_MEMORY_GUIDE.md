@@ -43,7 +43,7 @@ WRITE DISCIPLINE:
 - One fact per memory. Give it a title, a path (tree position), and tags. Keep
   bodies small; link related notes with [[path]] instead of restating them.
 - Always set source — never store a fact you can't attribute.
-- Before creating, memory_find / memory_recall first: if it already exists, EDIT it
+- Before creating, memory_recall first: if it already exists, EDIT it
   (replace_old->replace_new, or a diff), don't duplicate. One fact, one home.
 
 DECISIONS: store under decisions.* with What / Context / Why / Alternatives-rejected
@@ -88,12 +88,33 @@ retrieve from the transcript firehose.
 
 ### 2.2 Write discipline (keeps it from becoming a wall of text)
 
-- **One idea per memory.** Small body, a curated `title` (caption, searchable via
-  `memory_find`), a `path`, and `tags`. Atomic notes are what make dedup, linking,
-  and targeted edits possible — you can't cleanly update a fact buried in a 60 KB page.
+- **One idea per memory.** Small body, a curated `title`, a `path`, and `tags`.
+  The title is required for a write that stores content (`MEMGRES_REQUIRE_TITLE`):
+  it names the memory in a result list, and recall weighs a match there higher
+  than one in the body. Atomic notes are what make dedup, linking, and targeted
+  edits possible — you can't cleanly update a fact buried in a 60 KB page.
 - **Attribute everything.** Set `source` on every write. A fact you can't trace you
   can't verify or safely supersede.
-- **Dedup before you write.** `memory_find` (title+tags) or `memory_recall` the topic
+- **Link, don't restate.** Write `[[path]]` in the body (or
+  `[[path#anchor|label]]`) instead of repeating what another memory says. The links
+  become a real graph: `memory_links` walks it in both directions, and the INBOUND
+  half is the one that matters — before changing a fact, it tells you who is relying
+  on it. A link to something not written yet is fine and deliberate: it stands as
+  `resolved: false` and binds itself when the target appears. Moving a memory does
+  not break the links to it: the edges follow, and the bodies that name its old
+  address are rewritten to the new one (recorded as a `relink`, credited to
+  whoever moved it) — so what you read in a body is an address that still works,
+  and copying it out of one memory into another stays safe.
+- **Notice what is never used.** Each memory records how often it has surfaced in
+  a search (`recalled`) and how often it was opened (`gets`) — both on
+  `memory_list` rows, and as `usage` on `memory_get`. Surfaced often but never
+  opened means it is winning result slots it does not deserve: sharpen its title,
+  or fold it into whatever people actually open. Neither surfaced nor opened means
+  nobody can reach it, which is a linking and titling problem, not a storage one.
+- **Reuse the tag vocabulary.** `memory_tags` lists what is already in use;
+  a label you invent that exists in another wording becomes a second, unrelated
+  tag. Case and Unicode form are normalised for you — wording is not.
+- **Dedup before you write.** `memory_recall` the topic (`bodies=false` for a cheap scan)
   first; if it exists, **edit that memory** (`replace_old`→`replace_new` for a
   surgical change, or a `diff`) instead of creating a second copy. *One fact, one
   home.* (Automatic semantic dedup-at-write is not yet enforced by the tool — this is
@@ -129,9 +150,19 @@ the full trail; don't overwrite.
   returns them — so the agent can (and must) **check a fact's age before treating it
   as current**. A fact that was true once ("we're on Postgres") can be stale ("…six
   weeks after migrating to MySQL").
-- A dedicated "last-verified" date and a review-by field are not first-class yet
-  (see Gaps); until then, note re-confirmation in `reason`/body when you re-check a
-  fact.
+- **`valid_at` is the one that actually answers "is this still true?"** The stamped
+  dates say when a row was WRITTEN, which is a different question: fixing a typo
+  moves `updated_at` without anyone having re-checked the content, and a fact
+  distilled today from a letter dated 2021 is not fresh because the row is new.
+  `valid_at` (YYYY-MM-DD, on the history row) is the day the content was last known
+  to be ACCURATE.
+  - Set it when the fact comes from a dated source, or when you have just
+    re-checked one. Omit it and it means "accurate as of now" — the ordinary case.
+  - It may point into the past. That is not a mistake and nothing enforces order.
+  - Sending ONLY `valid_at` records a re-confirmation (`op: revalidate`) without
+    touching the body — so "I checked, still true" is a first-class entry in the
+    history rather than a fake edit.
+- A review-by field and a staleness sweep are still not first-class (see Gaps).
 
 ### 2.5 Conflict resolution (memory says X, someone says Y)
 
@@ -177,10 +208,19 @@ that make the discipline *stick* are **tool** features still on the roadmap:
 
 - **Semantic dedup-at-write** — flag/merge a near-duplicate on write instead of
   relying on the agent to `find` first.
-- **Freshness fields** — a first-class `last_confirmed_at` / review-by driving a
-  staleness sweep.
-- **First-class links** — a real link/backlink graph between memories (validated,
-  indexed) instead of informal `[[path]]` in the body.
+- **Erasing a target still strands the text.** A move repairs the bodies that
+  name the old address; `forget` cannot — there is no new address to point at, so
+  the link is left dangling and visible. Nothing yet offers to repair or remove
+  those.
+- **Staleness sweep** — `valid_at` records how far forward the evidence reaches
+  (§2.4), but nothing yet SURFACES what has gone quiet: no review-by, no "show me
+  facts whose evidence is older than N months". Recording is in, retrieval is not.
+- **Anchors are a hint, not a contract.** `[[path#anchor]]` is recorded, but
+  nothing yet resolves it to a place inside the body — a link lands on the whole
+  memory. When you need to point at part of one, that is usually a sign the target
+  should be split.
 
 Until those land, the instruction in §1 carries the load; the tool supports the rest
-(tree, tags, title, find, replace, hash-chained history, forget).
+(tree, tags with a shared vocabulary, required titles, recall over titles and
+bodies, the link graph with backlinks, replace, hash-chained history with
+`valid_at`, retention, forget).

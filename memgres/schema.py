@@ -18,7 +18,7 @@ from pathlib import Path
 from .config import Config
 
 # The version this build migrates the database TO (the latest migration it carries).
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 21
 
 # The compatibility FLOOR: the schema version of the most recent backward-
 # INCOMPATIBLE migration — one that changed the shape/semantics old code relied on
@@ -49,7 +49,32 @@ SCHEMA_VERSION = 15
 #     (an old client writes v1 rows, which the column defaults to), so this is
 #     the floor purely because of what verification would claim.
 #   v15 (0014): dropped a foreign key → nothing old code reads changes.
-SCHEMA_BREAKING_VERSION = 14
+#   v16 (0015): normalised stored tags to one spelling (NFC + lower) → BREAKING,
+#     and the reasoning is the same as v14's. Nothing about the SHAPE changes; a
+#     pre-0015 client neither normalises nor knows to, so its filter for `X402`
+#     stops matching a row now stored as `x402` and it gets an empty result where
+#     rows exist. Silence shaped like an answer, from a filter that looks fine.
+#   v17 (0016): added memory_history.valid_at → additive, floor stays 16. Unlike
+#     0013 this does NOT change what a stored row_hash says: the dimension folds
+#     in only when the column is set, so every row written without it hashes
+#     exactly as before and an older client verifies it correctly. A row that DOES
+#     carry a date is the only one an older client would misjudge — and no
+#     RELEASED build sits between 0015 and 0016 (both ship in 0.7.0), so every
+#     client that can reach such a row already knows the dimension. Shipping an
+#     optional dimension separately from a floor bump would NOT be safe: that is
+#     the case where an older reader calls an untouched chain tampered.
+#   v18 (0017): added the memory_link table → additive, floor stays 16. An older
+#     client neither writes nor reads it; the edges it fails to record simply go
+#     missing until something re-writes those bodies, which costs completeness of
+#     a new feature, not correctness of an old one.
+#   v19 (0018): added memgres_meta.links_built → additive, floor stays 16.
+#   v20 (0019): added the memory_usage table → additive, floor stays 16. An older
+#     client simply does not count; the statistics have a gap, and nothing an old
+#     reader relies on changed shape.
+#   v21 (0020): dropped 0019's foreign key from databases that already ran it →
+#     additive, floor stays 16. Nothing reads the constraint; removing it only
+#     stops a counted read from locking the memory row it counts.
+SCHEMA_BREAKING_VERSION = 16
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are
 # shipped inside the package (see pyproject) and this still resolves.
@@ -85,6 +110,7 @@ def migrate(conn, cfg: Config) -> None:
                 cur.execute(path.read_text(encoding="utf-8"))
             _apply_tree(cur, cfg)
             _apply_vector(cur, cfg)
+            _backfill_title_fts(cur, cfg)
             _stamp(cur, cfg)
 
 
@@ -133,6 +159,23 @@ def _guard_client_version(cur) -> None:
             f"install) and restart it. Refusing to run below the database's "
             f"compatibility floor."
         )
+
+
+def _backfill_title_fts(cur, cfg: Config) -> None:
+    """Give every row a title tsvector, even an empty one.
+
+    ``0004_title.sql`` left existing rows at ``title=''`` with ``title_fts``
+    NULL, judged harmless because nothing read the column. Recall reads it now,
+    and a NULL tsvector is not an empty one: it makes `ts_rank` NULL, which
+    poisons a summed score and sorts FIRST under `ORDER BY score DESC`. In this
+    repo's own corpus 50 of 95 rows carried that NULL.
+
+    Here rather than in a .sql file because the text-search dictionary is
+    configuration, not schema — the same reason the tree and vector steps live in
+    Python. Touches only NULL rows, so it is a no-op on every later start."""
+    cur.execute(
+        "UPDATE memory SET title_fts = to_tsvector(%s::regconfig, COALESCE(title, '')) "
+        "WHERE title_fts IS NULL", (cfg.fts_language,))
 
 
 def _apply_tree(cur, cfg: Config) -> None:

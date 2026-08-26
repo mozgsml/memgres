@@ -25,6 +25,7 @@ retrieval-by-id.
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
@@ -36,12 +37,21 @@ from .delimiters import write_warnings
 from .lines import parse_line_spec
 from .diffing import DiffConflict, apply_diff, byte_len, content_hash, make_diff
 from .embeddings import Embedder, get_embedder
+from .links import parse_links, rewrite_targets
+from .tags import check_tag_match, normalize_tags
 from .vector import make_backend
+
+_log = logging.getLogger("memgres.store")
 
 
 # The most rows any one call may return. Search and browse share it so a caller
 # cannot pick whichever path forgot to clamp.
 MAX_RESULTS = 500
+
+# The two ways a memory gets used, and the columns that record each. Fixed
+# constants, not caller input — they are interpolated into SQL.
+_USAGE_COLUMNS = {"get": ("get_count", "last_get_at"),
+                  "recall": ("recall_count", "last_recall_at")}
 
 
 class Conflict(RuntimeError):
@@ -54,6 +64,47 @@ class NotFound(KeyError):
 
 class TooLarge(ValueError):
     """A write or resulting body exceeds the configured ceiling."""
+
+
+def _as_date(value: object):
+    """Accept a `date` or an ISO `YYYY-MM-DD` string; refuse anything else.
+
+    Transports hand this over as JSON, so a string is the common case. Parsing it
+    here rather than letting Postgres cast keeps one spelling for the hash — the
+    digest folds the ISO text, and `"2021-3-4"` and `"2021-03-04"` must not be two
+    different dates to the chain."""
+    import datetime as _dt
+    if value is None:
+        return value
+    # datetime IS a date in Python, and this check has to come first. Folded as
+    # `isoformat()` it would hash '2021-03-04T12:30:00' while the `date` column
+    # keeps '2021-03-04' — and `verify_history`, recomputing from the value read
+    # back, would then report an UNTOUCHED chain as tampered, permanently. The
+    # day is what this field means, so the time is dropped rather than refused.
+    if isinstance(value, _dt.datetime):
+        return value.date()
+    if isinstance(value, _dt.date):
+        return value
+    if isinstance(value, str):
+        try:
+            return _dt.date.fromisoformat(value.strip())
+        except ValueError:
+            pass
+    raise ValueError(
+        f"valid_at must be a date as YYYY-MM-DD (got {value!r}) — it is the day "
+        f"the content was last known to be accurate")
+
+
+class MissingTitle(ValueError):
+    """A write stored content without a caption, and the deployment requires one
+    (``MEMGRES_REQUIRE_TITLE``, default on).
+
+    Raised BEFORE the write, so the caller retries with a title rather than
+    leaving a memory it cannot address later. An untitled memory is not broken,
+    it is merely poorer: nothing captions it in a result list, and title-weighted
+    ranking has nothing to weigh. Enforcing it at the moment content is written
+    is also what migrates an existing corpus — each memory gains a title the next
+    time someone actually edits it, with no bulk pass."""
 
 
 class NoParent(ValueError):
@@ -184,6 +235,9 @@ class Memory:
     partial: bool = False
     lines: Optional[List[List[int]]] = None    # contiguous runs actually returned
     total_lines: Optional[int] = None
+    # how much this memory is used — set only by `get`, and only when the
+    # deployment counts (see `_count_usage`). A write does not have it.
+    usage: Optional[dict] = None
 
     def to_dict(self, *, stringify_dates: bool = False) -> dict:
         """Serialize for an API layer. ``stringify_dates`` str()-coerces the
@@ -197,7 +251,11 @@ class Memory:
                 "updated_at": d(self.updated_at), "expires_at": d(self.expires_at),
                 "created": self.created, "moved_from": self.moved_from,
                 "warnings": self.warnings, "partial": self.partial,
-                "lines": self.lines, "total_lines": self.total_lines}
+                "lines": self.lines, "total_lines": self.total_lines,
+                "usage": ({**self.usage,
+                           "last_recall_at": d(self.usage["last_recall_at"]),
+                           "last_get_at": d(self.usage["last_get_at"])}
+                          if self.usage else None)}
 
 
 def _sha(text: str) -> str:
@@ -212,8 +270,15 @@ def _fold(digest: str, label: str, *fields: str) -> str:
     logically different rows. So each field is first reduced to its own
     fixed-width sha (``_sha(f)``) before the join: the label namespaces the
     dimension, and every joined part (label, the inner digest, each field-hash) is
-    now fixed-width with no client bytes spanning a boundary — injective across
-    both dimensions AND the fields within one."""
+    now fixed-width with no client bytes spanning a boundary.
+
+    The JOIN is injective across dimensions and across the fields within one. The
+    EXTRACTORS above are not: they map a NULL and an empty string to the same
+    folded value, so those two spellings of "nothing" collide. Reaching that needs
+    direct database write access and only swaps values that mean the same thing,
+    which is why it is recorded here rather than fixed — separating them would
+    change digests already written, and that is a `hash_version` bump, not a
+    tidy-up."""
     parts = [label, digest, *(_sha(f) for f in fields)]
     return _sha("\x1f".join(parts))
 
@@ -224,6 +289,46 @@ def _fold(digest: str, label: str, *fields: str) -> str:
 HASH_VERSION = 2
 
 
+def _dim_title(d):
+    if d.get("title_before") is not None or d.get("title_after") is not None:
+        return (d.get("title_before") or "", d.get("title_after") or "")
+    return None
+
+
+def _dim_author(d):
+    if d.get("author_user_id"):
+        return (d["author_user_id"], d.get("author_token_id") or "")
+    return None
+
+
+def _dim_valid_at(d):
+    v = d.get("valid_at")
+    return None if v is None else (v.isoformat() if hasattr(v, "isoformat")
+                                   else str(v),)
+
+
+# The optional dimensions of a history row, in the order they fold.
+#
+# ORDER IS PART OF THE RECIPE and entries are APPEND-ONLY: compute and verify walk
+# this same tuple, so reordering or inserting in the middle changes the digest of
+# rows already written and turns an untouched chain into a "tampered" one. A
+# registry rather than a chain of `if`s because that requirement is a property of
+# the list, and a list can be asserted in a test — an implicit ordering buried in
+# statement order cannot.
+#
+# Each extractor returns the fields to fold, or None to fold NOTHING. That is what
+# makes a dimension additive: a row that never used it hashes exactly as it did
+# before the dimension existed, which is why adding one needs no version bump.
+# The corollary matters as much: a build that does not know a dimension will
+# mis-verify a row that USES it, so a new dimension must ship where no released
+# client can meet such a row (see the v17 note in schema.py).
+OPTIONAL_DIMENSIONS = (
+    ("memgres.title.v1", _dim_title),
+    ("memgres.author.v1", _dim_author),
+    ("memgres.valid_at.v1", _dim_valid_at),
+)
+
+
 def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
               diff: Optional[str], hash_after: Optional[str],
               path_after: Optional[str], tags_after: Optional[Sequence[str]],
@@ -232,6 +337,7 @@ def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
               author_token_id: Optional[str] = None,
               title_before: Optional[str] = None,
               title_after: Optional[str] = None,
+              valid_at: object = None,
               version: int = HASH_VERSION) -> str:
     """The chain digest for one history row, computed by recipe ``version``.
 
@@ -266,13 +372,15 @@ def _row_hash(prev: Optional[str], memory_id: str, seq: int, op: str,
             f"history row uses hash recipe v{version}; this build implements "
             f"v1 and v2 — a newer memgres wrote this row")
     # Each optional dimension folds in ONLY when it was touched on this row. A row
-    # that touched neither title nor author — which includes EVERY row written
-    # before those features — returns the base digest unchanged and still
-    # verifies. Order (title then author) is fixed so compute and verify agree.
-    if title_before is not None or title_after is not None:
-        h = _fold(h, "memgres.title.v1", title_before or "", title_after or "")
-    if author_user_id:
-        h = _fold(h, "memgres.author.v1", author_user_id, author_token_id or "")
+    # that touched none of them — which includes EVERY row written before those
+    # features — returns the base digest unchanged and still verifies.
+    dims = {"title_before": title_before, "title_after": title_after,
+            "author_user_id": author_user_id, "author_token_id": author_token_id,
+            "valid_at": valid_at}
+    for label, extract in OPTIONAL_DIMENSIONS:
+        fields = extract(dims)
+        if fields is not None:
+            h = _fold(h, label, *fields)
     return h
 
 
@@ -401,9 +509,29 @@ class Store:
                     (list(ns_ids),))
         return {str(r[0]): r[1] for r in cur.fetchall()}
 
-    def _expiry_sql(self, ttl_days: Optional[int]) -> str:
-        days = ttl_days if ttl_days is not None else self.cfg.retention_days
-        return "NULL" if not days or days <= 0 else f"now() + interval '{int(days)} days'"
+    def _expiry_sql(self) -> str:
+        """The ``expires_at`` every write stamps, from the DEPLOYMENT's retention
+        policy alone.
+
+        There is deliberately no per-write override. The `ttl_days` argument this
+        replaced let a caller set the window itself, in three separate ways: `0`
+        was read as "keep forever", a large value simply outran the policy, and an
+        edit that merely omitted it silently cleared an expiry already set.
+        Deriving the value from config alone makes all three impossible by
+        construction rather than by validation.
+
+        What it does NOT do is pin the clock. The policy is "expire N days after
+        last touch" (`MEMGRES_RENEW_ON_READ`, on by default), so a touch — a read
+        included, with only a `read` ceiling — starts the window again. That is
+        the documented behaviour and not a hole in this function, but it is worth
+        stating next to it: with the sweeper live, "deleted after N days" holds
+        for data nobody touches. A hard ceiling from creation would need a second
+        limit, which is a policy decision and not this parameter's absence.
+
+        `retention_days <= 0` means the deployment keeps everything; that is the
+        operator's choice too, and it is the default."""
+        days = self.cfg.retention_days
+        return "NULL" if days <= 0 else f"now() + interval '{int(days)} days'"
 
     def _check_parent(self, cur, ns: str, path: Optional[str]):
         """When MEMGRES_REQUIRE_PARENT is on, a non-root node's parent path must
@@ -437,8 +565,8 @@ class Store:
               body: Optional[str] = None, diff: Optional[str] = None,
               base_hash: Optional[str] = None, path: Optional[str] = None,
               tags: Optional[Sequence[str]] = None, source: Optional[str] = None,
-              reason: Optional[str] = None, ttl_days: Optional[int] = None,
-              title: Optional[str] = None,
+              reason: Optional[str] = None,
+              title: Optional[str] = None, valid_at: object = None,
               replace: Optional[Sequence[str]] = None, replace_all: bool = False,
               space: Optional[str] = None, space_id: Optional[str] = None) -> Memory:
         """Create a memory, or edit one addressed by `id` or by `at` (its path).
@@ -467,15 +595,21 @@ class Store:
                                          need="write", for_write=True)
             self._check_provenance_size(source, reason)
             self._check_title_size(title)
+            # One spelling per tag, decided here rather than in `_create` and
+            # `_update` separately — two normalisation sites is how a tag ends up
+            # stored one way and filtered another.
+            tags = normalize_tags(tags)
+            valid_at = _as_date(valid_at)
             if id is None and at is None:
                 self._check_path_free(ns, path, if_moved)
                 m = self._create(ns, author, body, path, tags, source, reason,
-                                 ttl_days, title)
+                                 title, valid_at)
             else:
                 id, moved_from = self._address(ns, id, at,
                                                follow=if_moved == "follow")
                 m = self._update(ns, author, id, body, diff, base_hash, path,
-                                 tags, source, reason, ttl_days, title=title,
+                                 tags, source, reason, title=title,
+                                 valid_at=valid_at,
                                  replace=replace, replace_all=replace_all)
                 m.moved_from = moved_from
             # Checked on the STORED body, not the request: a substring edit or a
@@ -547,16 +681,38 @@ class Store:
                 f"reason is {byte_len(reason)}B > MEMGRES_MAX_REASON_BYTES "
                 f"{self.cfg.max_reason_bytes}")
 
+    def _require_title(self, title: Optional[str], path: Optional[str],
+                       body: Optional[str]) -> None:
+        """Refuse content with no caption, naming enough of the memory that the
+        caller can write one without re-reading it.
+
+        Checked only where content is STORED — a create, or an edit that changes
+        the body. Re-addressing (`move`) and relabelling (`retag`) leave the
+        content alone, and demanding a caption there would make an untitled
+        memory unmovable, which is friction unrelated to the point."""
+        if not self.cfg.require_title or (title or "").strip():
+            return
+        first = ((body or "").strip().splitlines() or [""])[0][:120]
+        where = f" at '{path}'" if path else ""
+        raise MissingTitle(
+            f"this memory{where} has no title — give `title` a short caption "
+            f"(it is what names the memory in results and what title search "
+            f"matches). Its first line is: {first!r}")
+
     def _check_title_size(self, title: Optional[str]):
         if title is not None and byte_len(title) > self.cfg.max_title_bytes:
             raise TooLarge(
                 f"title is {byte_len(title)}B > MEMGRES_MAX_TITLE_BYTES "
                 f"{self.cfg.max_title_bytes}")
 
-    def _create(self, ns, author, body, path, tags, source, reason, ttl_days,
-                title=None) -> Memory:
+    def _create(self, ns, author, body, path, tags, source, reason,
+                title=None, valid_at=None) -> Memory:
+        # Body first: a create with nothing to store is not a caption problem,
+        # and saying "no title" to someone who forgot the body sends them to fix
+        # the wrong thing.
         if body is None:
             raise ValueError("create needs a body (diffs apply to an existing memory)")
+        self._require_title(title, path, body)
         self._check_write_size(body)
         self._check_body_size(body)
         chash = content_hash(body)
@@ -571,7 +727,7 @@ class Store:
                 VALUES (%s, %s, %s, %s, %s::ltree,
                         to_tsvector(%s::regconfig, %s),
                         %s, to_tsvector(%s::regconfig, %s),
-                        1, %s, {self._expiry_sql(ttl_days)})
+                        1, %s, {self._expiry_sql()})
                 RETURNING id, created_at, updated_at, expires_at""",
             [ns, body, chash, tags, path, self.cfg.fts_language, body,
              title, self.cfg.fts_language, title, pending],
@@ -582,9 +738,11 @@ class Store:
         # store create as a diff-from-empty so the whole history is a self-contained
         # chain (empty → current), replayable forward for reconstruct/annotate. A
         # non-empty title at creation is audited (title_before None → title_after).
+        self._sync_links(cur, ns, str(mid), body)
+        self._bind_pending_links(cur, ns, str(mid), path)
         self._append_history(str(mid), 1, "create", make_diff("", body), None, chash,
                              None, path, None, tags, source, reason, author,
-                             title_after=(title or None))
+                             title_after=(title or None), valid_at=valid_at)
         return Memory(str(mid), body, chash, tags, path, 1, created_at,
                       updated_at, expires_at, title, created=True)
 
@@ -668,7 +826,7 @@ class Store:
         return cur_body, None             # metadata-only
 
     def _update(self, ns, author, id, body, diff, base_hash, path, tags,
-                source, reason, ttl_days, *, title=None,
+                source, reason, *, title=None, valid_at=None,
                 replace=None, replace_all=False) -> Memory:
         cur = self._conn.cursor()
         cur_body, cur_hash, cur_tags, cur_path, seq, cur_title = self._load(cur, ns, id)
@@ -693,16 +851,22 @@ class Store:
                 op = "retag"
             elif title_changed:
                 op = "retitle"
+            elif valid_at is not None:
+                # Re-confirming a fact changes no content, but it IS an assertion
+                # and belongs in the chain — otherwise the only way to record
+                # "still true on this date" would be a fake edit to the body.
+                op = "revalidate"
             else:
                 # pure touch: renew TTL, no history row
                 cur.execute(
-                    f"UPDATE memory SET updated_at=now(), expires_at={self._expiry_sql(ttl_days)} "
+                    f"UPDATE memory SET updated_at=now(), expires_at={self._expiry_sql()} "
                     "WHERE id=%s", (id,))
-                touched = self.get(None, id, _ns=ns, renew=False)
+                touched = self.get(None, id, _ns=ns, renew=False, _count=False)
                 touched.created = False
                 return touched
 
         if body_changed:
+            self._require_title(new_title, new_path, new_body)
             self._check_body_size(new_body)
 
         if path_changed:
@@ -720,9 +884,10 @@ class Store:
                 raise PathTaken(new_path, str(taken[0]))
 
         # a path change cascades to the whole subtree (keep ltree consistent)
+        cascaded: list = []
         if path_changed and cur_path is not None:
-            self._cascade_move(cur, ns, cur_path, new_path, id, author,
-                               source, reason)
+            cascaded = self._cascade_move(cur, ns, cur_path, new_path, id, author,
+                                          source, reason)
 
         cur.execute(
             f"""UPDATE memory SET body=%s, content_hash=%s, tags=%s, path=%s::ltree,
@@ -730,7 +895,7 @@ class Store:
                     title=%s, title_fts=to_tsvector(%s::regconfig, %s),
                     seq=seq+1, updated_at=now(),
                     embed_pending=(embed_pending OR %s),
-                    expires_at={self._expiry_sql(ttl_days)}
+                    expires_at={self._expiry_sql()}
                 WHERE id=%s
                 RETURNING seq, created_at, updated_at, expires_at""",
             [new_body, new_hash, new_tags, new_path,
@@ -738,6 +903,12 @@ class Store:
              new_title, self.cfg.fts_language, new_title,
              (body_changed and self._vectors is not None), id])
         new_seq, created_at, updated_at, expires_at = cur.fetchone()
+        if body_changed:
+            self._sync_links(cur, ns, str(id), new_body)
+        if path_changed:
+            # The memory's own edges are pinned by id and follow it; what needs
+            # attention is edges that were WAITING for the path it just took.
+            self._bind_pending_links(cur, ns, str(id), new_path)
         if body_changed and self._vectors is not None:
             # only a body change re-chunks; path/tag/title edits leave vectors be.
             self._index_now(str(id), new_body, ns, new_hash)   # inline unless async
@@ -752,13 +923,26 @@ class Store:
                              new_tags if tags_changed else None,
                              source, reason, author,
                              title_before=cur_title if title_changed else None,
-                             title_after=new_title if title_changed else None)
+                             title_after=new_title if title_changed else None,
+                             valid_at=valid_at)
+        if path_changed and cur_path is not None:
+            # Last, so every mover is already at its new address and carries its
+            # own history row: the repair is a consequence of the move and reads
+            # as one. A memory that links into its own subtree is repaired here
+            # too, which is why the result may describe THIS memory.
+            repaired = self._relink_referrers(
+                cur, ns, [(str(id), cur_path, new_path)] + cascaded, author, source)
+            if str(id) in repaired:
+                new_body, new_hash, new_seq = repaired[str(id)]
         return Memory(str(id), new_body, new_hash, new_tags, new_path, new_seq,
                       created_at, updated_at, expires_at, new_title, created=False)
 
     def _cascade_move(self, cur, ns, old_prefix: str, new_prefix: str,
-                      exclude_id, author, source, reason) -> None:
+                      exclude_id, author, source, reason) -> list:
         """Re-address every descendant when a node moves — and RECORD it.
+
+        Returns ``[(id, old_path, new_path), …]`` for what it moved, which the
+        caller needs to repair the bodies that still name those addresses.
 
         This used to be one bulk UPDATE with no history: a descendant's address
         changed with nothing in `history` or `blame` to say so, and afterwards
@@ -782,7 +966,7 @@ class Store:
             (ns, old_prefix, exclude_id))
         rows = cur.fetchall()
         if not rows:
-            return
+            return []
         # `path <@ old_prefix` matches the prefix itself or `prefix.<rest>`, so
         # swapping the prefix is the whole rule.
         moves = [(str(mid), old, new_prefix + old[len(old_prefix):], seq + 1, chash)
@@ -791,6 +975,7 @@ class Store:
             "UPDATE memory SET path=%s::ltree, seq=%s, updated_at=now() WHERE id=%s",
             [(after, seq, mid) for (mid, _b, after, seq, _c) in moves])
         self._append_move_history(cur, moves, author, source, reason)
+        return [(mid, before, after) for (mid, before, after, _s, _c) in moves]
 
     def _append_move_history(self, cur, moves, author, source, reason) -> None:
         """One `move` row per descendant, each chained onto ITS OWN last row.
@@ -824,10 +1009,116 @@ class Store:
                VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             params)
 
+    def _relink_referrers(self, cur, ns: str, moves, author, source) -> dict:
+        """Repair every body that still names an address one of `moves` just left.
+
+        Why this is not cosmetic. `_sync_links` rebuilds a memory's edges FROM ITS
+        BODY on every write, so an edge pinned to an id outlives the target's move
+        only until the REFERRING memory is next edited — and then the stale text
+        wins, silently, in one of two ways: the vacated path is empty and the edge
+        degrades to dangling (a typo fix breaks navigation), or something else has
+        claimed that path and the edge binds to a DIFFERENT memory. A reader who
+        copies the address out of the body spreads the staleness into new memories
+        before either happens.
+
+        So the text has to be repaired, not just the edge: the body is the source
+        of truth for its own links, and fixing only the edge buys exactly one
+        write's worth of correctness.
+
+        Authorship is the person who moved the memory, under a `relink` op — not a
+        service identity. Someone did cause this, and attributing it to a ghost
+        would hide who, which is the opposite of what `blame` is for.
+
+        Retention is deliberately NOT renewed here: the window measures the
+        client's use of the data, and a repair made on their behalf is not use.
+
+        Returns ``{id: (body, content_hash, seq)}`` for what it rewrote — the
+        mover's own body can be among them (a memory that links into its own
+        subtree), and the caller is about to hand that memory back to its writer.
+        """
+        by_id = {mid: (old, new) for (mid, old, new) in moves}
+        if not by_id:
+            return {}
+        # Inbound edges, re-applying the namespace predicate rather than trusting
+        # that the binding rule scoped them (the same defence `links()` uses).
+        cur.execute(
+            "SELECT l.src_id::text, l.ord, l.dst_id::text FROM memory_link l "
+            "JOIN memory src ON src.id = l.src_id "
+            "WHERE l.dst_id = ANY(%s::uuid[]) AND src.namespace = %s "
+            # An expired referrer is invisible to every read and the sweeper is
+            # about to delete it. Rewriting it would spend a history row and a
+            # re-index on a body nobody can see and nothing will keep.
+            "  AND (src.expires_at IS NULL OR src.expires_at > now()) "
+            "ORDER BY l.src_id",
+            (list(by_id), ns))
+        wanted: dict = {}
+        for src_id, ord_, dst_id in cur.fetchall():
+            wanted.setdefault(src_id, {})[ord_] = by_id[dst_id]
+        if not wanted:
+            return {}
+
+        cur.execute(
+            "SELECT id::text, body, content_hash, seq FROM memory "
+            "WHERE id = ANY(%s::uuid[]) ORDER BY id FOR UPDATE", (list(wanted),))
+        rewritten: dict = {}
+        for src_id, body, chash, seq in cur.fetchall():
+            links = {l.ord: l for l in parse_links(body or "")}
+            changes, moved = {}, []
+            for ord_, (old, new) in wanted[src_id].items():
+                l = links.get(ord_)
+                if l is None or l.scheme is not None:
+                    # `ord` is the link's index in this very body and edges are
+                    # re-derived from it on every write, so this should not
+                    # happen; if it does, guessing which link was meant is worse
+                    # than leaving it.
+                    _log.warning("relink: edge %s#%s has no link at that position "
+                                 "in the body — left as written", src_id, ord_)
+                    continue
+                # Deliberately NOT conditional on the text still spelling `old`.
+                # Any corpus that moved a memory before this repair existed has
+                # bodies naming a path the target left long ago, while the edge
+                # stayed pinned by id — the normal state of an upgraded store, and
+                # invisible to a test suite whose every fixture starts empty.
+                # Skipping those would leave exactly the stale text that the next
+                # edit re-resolves onto whoever now holds that path.
+                changes[ord_] = new
+                moved.append(f"{l.raw_target} → {new}")
+            new_body = rewrite_targets(body or "", changes)
+            if new_body == (body or ""):
+                continue                      # nothing to write, so write nothing
+            if byte_len(new_body) > self.cfg.max_body_bytes:
+                # Repairing must not push a body past the ceiling: the owner could
+                # then no longer edit their own memory, because every write of it
+                # would be refused for size. The edge stays pinned by id, so the
+                # link still resolves — the text is what goes unrepaired.
+                _log.warning("relink: repairing %s would exceed MEMGRES_MAX_BODY_BYTES "
+                             "(%dB > %d) — text left as written; its edges still "
+                             "resolve by id", src_id, byte_len(new_body),
+                             self.cfg.max_body_bytes)
+                continue
+            new_hash = content_hash(new_body)
+            new_seq = seq + 1
+            cur.execute(
+                "UPDATE memory SET body=%s, content_hash=%s, "
+                "    fts=to_tsvector(%s::regconfig, %s), seq=%s, updated_at=now(), "
+                "    embed_pending=(embed_pending OR %s) "
+                "WHERE id=%s",
+                (new_body, new_hash, self.cfg.fts_language, new_body, new_seq,
+                 self._vectors is not None, src_id))
+            self._sync_links(cur, ns, src_id, new_body)
+            reason = "relink: " + "; ".join(sorted(set(moved)))
+            self._append_history(src_id, new_seq, "relink",
+                                 make_diff(body or "", new_body), chash, new_hash,
+                                 None, None, None, None, source, reason[:500],
+                                 author)
+            self._index_now(src_id, new_body, ns, new_hash)
+            rewritten[src_id] = (new_body, new_hash, new_seq)
+        return rewritten
+
     def _append_history(self, memory_id, seq, op, diff, hash_before, hash_after,
                         path_before, path_after, tags_before, tags_after,
                         source, reason, author=None, *,
-                        title_before=None, title_after=None):
+                        title_before=None, title_after=None, valid_at=None):
         author_user_id, author_token_id = author or (None, None)
         cur = self._conn.cursor()
         cur.execute("SELECT row_hash FROM memory_history WHERE memory_id=%s "
@@ -837,18 +1128,18 @@ class Store:
         rhash = _row_hash(prev_hash, memory_id, seq, op, diff, hash_after,
                           path_after, tags_after, source, reason,
                           author_user_id, author_token_id,
-                          title_before, title_after)
+                          title_before, title_after, valid_at)
         cur.execute(
             """INSERT INTO memory_history (memory_id, seq, op, diff, hash_before,
                    hash_after, path_before, path_after, tags_before, tags_after,
                    source, reason, author_user_id, author_token_id,
                    title_before, title_after, prev_row_hash, row_hash,
-                   hash_version)
-               VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                   hash_version, valid_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (memory_id, seq, op, diff, hash_before, hash_after, path_before,
              path_after, tags_before, tags_after, source, reason,
              author_user_id, author_token_id, title_before, title_after,
-             prev_hash, rhash, HASH_VERSION))
+             prev_hash, rhash, HASH_VERSION, valid_at))
 
     # ─── recall: lexical / semantic / hybrid ────────────────────────────────
     def recall(self, token: Optional[str], query: str, *, k: int = 10,
@@ -856,41 +1147,148 @@ class Store:
                path_prefix: Optional[str] = None, mode: str = "auto",
                match: Optional[str] = None,
                snippet: Optional[bool] = None, full_body: Optional[bool] = None,
+               bodies: bool = True, match_tags: Optional[str] = None,
                space=None, space_id=None):
-        """Search. ``space``/``space_id`` may name one namespace, several, or
-        ``'all'`` — see :func:`identity.resolve_spaces`."""
+        """Search bodies AND curated titles. ``space``/``space_id`` may name one
+        namespace, several, or ``'all'`` — see :func:`identity.resolve_spaces`.
+
+        ``bodies=False`` is the light "where is it" pass: ranked hits with
+        id/path/title/tags and no text. It replaces the separate ``find`` tool,
+        which searched titles and nothing else — two half-searches the caller had
+        to choose between, one of which answered "nothing found" for every
+        memory that had no caption."""
         from .search import recall as _recall
         k = self._clamp_k(k)
         ns, names = self._authorize_read(token, space=space, space_id=space_id)
         hits = _recall(self._conn, self.cfg, self.embedder, ns,
                        query, k=k, tags=tags, path_prefix=path_prefix, mode=mode,
                        match=match, backend=self._vectors,
-                       snippet=snippet, full_body=full_body)
+                       snippet=snippet, full_body=full_body, bodies=bodies,
+                       tags_match=check_tag_match(match_tags))
         for h in hits:
             h.space = names.get(h.namespace)
+        # A hit is a surfacing: this memory was findable for what someone asked.
+        # Counted for what came BACK, not for what was considered — a candidate
+        # the ranking discarded showed nobody anything.
+        self._count_usage("recall", [h.id for h in hits])
         return hits
 
-    # ─── find: locate by title (+ tags), no body ────────────────────────────
-    def find(self, token: Optional[str], query: str, *, k: int = 10,
-             tags: Optional[Sequence[str]] = None,
-             path_prefix: Optional[str] = None, match: Optional[str] = None,
-             space=None, space_id=None) -> List[dict]:
-        """Locate memories whose curated `title` matches — a light "where is it"
-        search over titles + tags, never the body. Returns light rows; works
-        without an embedder. Spans namespaces like ``recall``. See ``search.find``."""
-        from .search import find as _find
-        k = self._clamp_k(k)
-        ns, names = self._authorize_read(token, space=space, space_id=space_id)
-        rows = _find(self._conn, self.cfg, ns, query, tags=tags,
-                     path_prefix=path_prefix, k=k, match=match)
-        for r in rows:
-            r["space"] = names.get(r["space_id"])
-        return rows
+    # ─── links: the graph between memories ──────────────────────────────────
+    def _sync_links(self, cur, ns: str, memory_id: str,
+                    body: Optional[str]) -> None:
+        """Re-derive this memory's outgoing edges from its body.
+
+        Resolution is scoped to the memory's OWN namespace: `[[ops.x]]` written by
+        one tenant must never bind to another tenant's `ops.x`. Paths are not a
+        global address space, and an edge is a read path like any other.
+
+        Rewritten wholesale rather than diffed — the body is the source of truth
+        for its own links, and reconciling insert/update/delete against it would
+        be more code with more ways to drift."""
+        links = parse_links(body)
+        cur.execute("DELETE FROM memory_link WHERE src_id=%s", (memory_id,))
+        if not links:
+            return
+        wanted = [l.raw_target for l in links if l.scheme is None]
+        found: dict = {}
+        if wanted:
+            cur.execute(
+                "SELECT path::text, id FROM memory "
+                "WHERE namespace=%s AND path = ANY(%s::ltree[])", (ns, wanted))
+            found = {p: str(i) for p, i in cur.fetchall()}
+        cur.executemany(
+            "INSERT INTO memory_link (src_id, ord, dst_id, raw_target, label, "
+            "anchor, scheme) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            [(memory_id, l.ord,
+              found.get(l.raw_target) if l.scheme is None else None,
+              l.raw_target, l.label, l.anchor, l.scheme) for l in links])
+
+    def _bind_pending_links(self, cur, ns: str, memory_id: str,
+                            path: Optional[str]) -> None:
+        """Attach edges that were written pointing at `path` before anything lived
+        there. A link to something not yet written is a deliberate marker, so it
+        stays dangling until the target appears — and then it must actually bind,
+        or the marker was a lie."""
+        if not path:
+            return
+        cur.execute(
+            "UPDATE memory_link l SET dst_id=%s "
+            "FROM memory src "
+            "WHERE src.id = l.src_id AND src.namespace = %s "
+            "  AND l.dst_id IS NULL AND l.scheme IS NULL AND l.raw_target = %s",
+            (memory_id, ns, path))
+
+    def links(self, token: Optional[str], id: Optional[str] = None, *,
+              at: Optional[str] = None, direction: str = "both",
+              space=None, space_id=None) -> dict:
+        """This memory's links: `out` (what it points at) and/or `in` (what points
+        at it). Returns ``{"out": [...], "in": [...]}``.
+
+        Inbound is the half a body cannot answer: "who relies on this?" is the
+        question that matters when a fact changes, and reading the memory itself
+        never tells you. Outbound is here too because it is where a DANGLING edge
+        shows up — a link whose target was never written, or has since been
+        erased."""
+        if direction not in ("in", "out", "both"):
+            raise ValueError(
+                f"direction must be 'in', 'out' or 'both' (got {direction!r})")
+        # One memory is addressed, so this authorizes like `get`/`history` (a
+        # single namespace) rather than like `recall` (a set). That is also
+        # exactly the right scope for the inbound half: an edge is only ever
+        # bound within its source's namespace, so every backlink to this memory
+        # lives in this namespace by construction.
+        ns, _ = self._authorize(token, space=space, space_id=space_id,
+                                need="read")
+        mid, _moved = self._address(ns, id, at, follow=True)
+        cur = self._conn.cursor()
+        out: dict = {}
+        if direction in ("out", "both"):
+            cur.execute(
+                "SELECT l.ord, l.raw_target, l.label, l.anchor, l.scheme, "
+                "       l.dst_id::text, m.path::text, m.title "
+                "FROM memory_link l LEFT JOIN memory m ON m.id = l.dst_id "
+                "WHERE l.src_id = %s ORDER BY l.ord", (mid,))
+            out["out"] = [
+                {"target": r[1], "label": r[2], "anchor": r[3], "scheme": r[4],
+                 "id": r[5], "path": r[6], "title": r[7],
+                 "resolved": r[5] is not None}
+                for r in cur.fetchall()]
+        if direction in ("in", "both"):
+            # The namespace predicate is re-applied rather than trusted to the
+            # binding rule — a backlink names a memory, and naming one from a
+            # namespace the caller cannot read would leak that it exists, where
+            # it lives and what it is called. Same defence in depth as
+            # `fetch_hit_rows` re-checking every vector candidate.
+            cur.execute(
+                "SELECT src.id::text, src.path::text, src.title, l.label, l.anchor "
+                "FROM memory_link l JOIN memory src ON src.id = l.src_id "
+                "WHERE l.dst_id = %s AND src.namespace = %s "
+                "  AND (src.expires_at IS NULL OR src.expires_at > now()) "
+                "ORDER BY src.path, src.id", (mid, ns))
+            out["in"] = [{"id": r[0], "path": r[1], "title": r[2],
+                          "label": r[3], "anchor": r[4]}
+                         for r in cur.fetchall()]
+        return out
+
+    # ─── tags: the vocabulary actually in use ───────────────────────────────
+    def tags(self, token: Optional[str], *, prefix: Optional[str] = None,
+             k: int = 50, space=None, space_id=None) -> List[dict]:
+        """The tags in use across the namespaces you reach, most-used first.
+
+        A caller cannot reuse a label it has never seen. Without this, every
+        writer invents its own spelling and the tag filter decays into a pile of
+        single-use labels — which is exactly what happened here (265 distinct
+        tags across 97 memories) before normalisation and this call existed."""
+        from .tags import tag_counts
+        ns, _ = self._authorize_read(token, space=space, space_id=space_id)
+        return tag_counts(self._conn, ns, prefix=prefix,
+                          k=max(1, min(int(k), MAX_RESULTS)))
 
     # ─── list: enumerate a subtree (no query, no ranking) ───────────────────
     def list(self, token: Optional[str], *, path_prefix: Optional[str] = None,
              tags: Optional[Sequence[str]] = None, limit: int = 50,
              offset: int = 0, bodies: bool = False,
+             match_tags: Optional[str] = None,
              space=None, space_id=None) -> List[dict]:
         """Browse (enumerate) memories under a subtree — NOT a search: no FTS, no
         vectors, no scoring. Rows are ordered by path so a subtree reads in tree
@@ -908,7 +1306,8 @@ class Store:
         ns, names = self._authorize_read(token, space=space, space_id=space_id)
         limit = max(1, min(int(limit), MAX_RESULTS))
         offset = max(0, int(offset))
-        where, params = build_filters(ns, tags, path_prefix)
+        where, params = build_filters(ns, tags, path_prefix,
+                                      check_tag_match(match_tags))
         cur = self._conn.cursor()
         # The page itself never carries bodies: in `bodies` mode it carries each
         # body's SIZE instead. Deciding what fits from the sizes means the bodies
@@ -921,12 +1320,16 @@ class Store:
         head = [] if bodies else [self.cfg.list_preview_chars]
         cur.execute(
             f"SELECT id, path::text, tags, title, {shown} AS shown, "
-            "created_at, updated_at, namespace "
-            f"FROM memory WHERE {where} ORDER BY namespace, path, id "
+            "created_at, updated_at, namespace, "
+            # Browsing is where usage becomes actionable: it is how you find the
+            # subtree nobody reads. No row yet means never used, which is zero.
+            "COALESCE(u.recall_count, 0), COALESCE(u.get_count, 0) "
+            "FROM memory LEFT JOIN memory_usage u ON u.memory_id = memory.id "
+            f"WHERE {where} ORDER BY namespace, path, id "
             "LIMIT %s OFFSET %s",
             head + params + [limit, offset])
         cols = ["id", "path", "tags", "title", "shown", "created_at",
-                "updated_at", "space_id"]
+                "updated_at", "space_id", "recalled", "gets"]
         budget = self.cfg.list_bodies_max_bytes
         rows, wanted = [], []
         for r in cur.fetchall():
@@ -935,6 +1338,12 @@ class Store:
             d["tags"] = list(d["tags"]) if d["tags"] is not None else []
             d["space_id"] = str(d["space_id"])
             d["space"] = names.get(d["space_id"])
+            if not self.cfg.usage_counters:
+                # Null, not zero. Nothing is being counted here, and reporting
+                # "0 recalls, 0 reads" would read as a measurement — on a
+                # deployment with counting off (a read-only replica) it would
+                # present the entire corpus as dead weight.
+                d["recalled"] = d["gets"] = None
             shown_value = d.pop("shown")
             if not bodies:
                 d["preview"] = shown_value
@@ -1040,10 +1449,60 @@ class Store:
                           source=source, reason=reason,
                           space=space, space_id=space_id)
 
+    # ─── usage counters ─────────────────────────────────────────────────────
+    def _count_usage(self, kind: str, ids: Sequence[str], *,
+                     want: bool = False) -> Optional[dict]:
+        """Record that these memories were used — `kind` is ``"get"`` (read in
+        full) or ``"recall"`` (came back as a search hit) — and, with `want`,
+        return the totals including this one.
+
+        Best-effort: statistics must never be the reason a read fails, so a
+        counter that cannot be written is logged and the caller still gets their
+        answer. None of it touches `memory` or the hash chain — a read must not
+        rewrite a row that holds a body, and `verify_history` must not become a
+        function of how often a memory was read (see migration 0019, which also
+        explains why there is no foreign key).
+
+        Honest about the transaction: a read has already issued its SELECT by the
+        time this runs, so the `transaction()` below is a SAVEPOINT on the
+        caller's open transaction, not a top-level one. The counts therefore
+        commit when the CALLER commits, and are discarded if it rolls back —
+        acceptable for a statistic, and the reason this holds no lock on anything
+        but its own row.
+
+        Rows appear on first use, so "never used" needs no storage.
+        """
+        if not self.cfg.usage_counters or not ids:
+            return None
+        # `ON CONFLICT DO UPDATE` refuses to touch the same row twice in one
+        # statement, and it fails the WHOLE statement — every count in the call
+        # would be lost together over a duplicate that changes nothing.
+        ids = list(dict.fromkeys(ids))
+        col, ts = _USAGE_COLUMNS[kind]
+        try:
+            with self._conn.transaction(), self._conn.cursor() as cur:
+                cur.execute(
+                    f"INSERT INTO memory_usage (memory_id, {col}, {ts}) "
+                    f"SELECT u, 1, clock_timestamp() FROM unnest(%s::uuid[]) AS u "
+                    f"ON CONFLICT (memory_id) DO UPDATE "
+                    f"    SET {col} = memory_usage.{col} + 1, {ts} = clock_timestamp() "
+                    + ("RETURNING recall_count, get_count, last_recall_at, "
+                       "last_get_at" if want else ""),
+                    (list(ids),))
+                row = cur.fetchone() if want else None
+        except Exception:
+            _log.warning("usage counters: could not record %s", kind,
+                         exc_info=True)
+            return None
+        if row is None:
+            return None
+        return {"recalled": int(row[0]), "gets": int(row[1]),
+                "last_recall_at": row[2], "last_get_at": row[3]}
+
     # ─── read ───────────────────────────────────────────────────────────────
     def get(self, token: Optional[str], id: Optional[str] = None, *,
             at: Optional[str] = None, if_moved: str = "follow",
-            lines: Optional[str] = None,
+            lines: Optional[str] = None, _count: bool = True,
             renew: bool = True, _ns: Optional[str] = None,
             space: Optional[str] = None, space_id: Optional[str] = None) -> Memory:
         """Fetch one memory by `id`, or by `at` — the path it lives at.
@@ -1075,10 +1534,15 @@ class Store:
         if renew and self.cfg.renew_on_read and self.cfg.retention_days > 0:
             with self._conn.transaction():
                 cur.execute(
-                    f"UPDATE memory SET expires_at={self._expiry_sql(None)} WHERE id=%s",
+                    f"UPDATE memory SET expires_at={self._expiry_sql()} WHERE id=%s",
                     (id,))
         m = Memory(str(row[0]), row[1], row[2], list(row[3]), row[4], row[5],
                    row[6], row[7], row[8], row[9], moved_from=moved_from)
+        # Counted only for a read someone ASKED for. `_count=False` is how the
+        # write path reads a row back mid-edit, and counting that would measure
+        # the store working rather than the memory being used.
+        if _count:
+            m.usage = self._count_usage("get", [m.id], want=True)
         return _slice_lines(m, lines) if lines else m
 
     def history(self, token: Optional[str], id: Optional[str] = None, *,
@@ -1099,14 +1563,14 @@ class Store:
             "h.source, h.reason, h.author_user_id::text, h.author_token_id::text, "
             "COALESCE(NULLIF(u.full_name, ''), NULLIF(u.name, '')) AS author_name, "
             "NULLIF(u.email, '') AS author_email, "
-            "h.title_before, h.title_after, h.hash_version, "
+            "h.title_before, h.title_after, h.hash_version, h.valid_at, "
             "h.prev_row_hash, h.row_hash, h.created_at FROM memory_history h "
             "LEFT JOIN app_user u ON u.id = h.author_user_id "
             "WHERE h.memory_id=%s ORDER BY h.seq", (id,))
         cols = ["seq", "op", "diff", "hash_before", "hash_after", "path_before",
                 "path_after", "tags_before", "tags_after", "source", "reason",
                 "author_user_id", "author_token_id", "author_name", "author_email",
-                "title_before", "title_after", "hash_version",
+                "title_before", "title_after", "hash_version", "valid_at",
                 "prev_row_hash", "row_hash", "created_at"]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
@@ -1167,6 +1631,7 @@ class Store:
                                r["source"], r["reason"],
                                r["author_user_id"], r["author_token_id"],
                                r["title_before"], r["title_after"],
+                               r["valid_at"],
                                version=int(r["hash_version"] or 1))
             if expect != r["row_hash"] or (r["prev_row_hash"] or None) != prev:
                 return False
@@ -1190,15 +1655,52 @@ class Store:
             cur = self._conn.cursor()
             cur.execute("DELETE FROM memory WHERE id=%s AND namespace=%s", (id, ns))
             deleted = cur.rowcount > 0
+            if deleted:
+                # No cascade to do this for us — see migration 0019 for why the
+                # foreign key is absent. Same transaction as the delete, so the
+                # counts cannot outlive the memory they counted.
+                cur.execute("DELETE FROM memory_usage WHERE memory_id=%s", (id,))
         if deleted and self._vectors is not None:
             # drop this memory's chunk vectors (pgvector: FK-cascaded already;
             # qdrant: an out-of-band collection, so this is the real cleanup there)
             self._vectors.delete_chunks(self._conn, id, ns)
         return deleted
 
-    def purge_expired(self) -> int:
+    def purge_expired(self, limit: int = 1000) -> int:
+        """Delete the memories whose retention window has closed; returns how many.
+
+        ``build_filters`` already hides expired rows from every read, so this is
+        not what makes them invisible — it is what makes them GONE, and the two
+        are not interchangeable. A retention promise is about no longer HOLDING
+        the data; a row that is merely filtered out of results is still held.
+
+        Chunk vectors go with them, as in :meth:`forget`. pgvector cascades on
+        the foreign key; qdrant is an out-of-band collection, so its points are
+        deleted here explicitly — skip that and they outlive the memory, keep
+        taking candidate slots in every search, and are then dropped when
+        ``fetch_hit_rows`` finds no row behind them, recall quietly thinning out
+        rather than an error.
+
+        Honest about the ordering: the row delete COMMITS first, then the point
+        deletes run. A crash or a qdrant outage in between leaves exactly those
+        orphans — the sequence narrows the window, it does not close it, and the
+        next sweep does not retry them. Closing it needs a durable outbox, which
+        is more machinery than this has earned.
+
+        ``limit`` bounds one pass so a large expired backlog is not one long
+        transaction holding row locks; the sweeper simply comes back."""
         with self._conn.transaction():
             cur = self._conn.cursor()
-            cur.execute("DELETE FROM memory WHERE expires_at IS NOT NULL "
-                        "AND expires_at < now()")
-            return cur.rowcount
+            cur.execute(
+                "DELETE FROM memory WHERE id IN ("
+                "  SELECT id FROM memory WHERE expires_at IS NOT NULL "
+                "   AND expires_at < now() LIMIT %s) "
+                "RETURNING id, namespace", (limit,))
+            gone = [(str(r[0]), r[1]) for r in cur.fetchall()]
+            if gone:
+                cur.execute("DELETE FROM memory_usage WHERE memory_id = ANY(%s::uuid[])",
+                            ([m for m, _ns in gone],))
+        if gone and self._vectors is not None:
+            for mid, ns in gone:
+                self._vectors.delete_chunks(self._conn, mid, ns)
+        return len(gone)

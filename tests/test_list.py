@@ -41,6 +41,9 @@ def store(monkeypatch):
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
+    # Captions are not what most of this suite is about; the requirement
+    # has its own file (test_require_title.py) covering both settings.
+    monkeypatch.setenv("MEMGRES_REQUIRE_TITLE", "false")
     monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
     monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
     monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
@@ -64,7 +67,8 @@ def test_lists_subtree_ordered_by_path(store):
     assert all(r["path"].startswith("decisions") for r in rows)
     # shape of each row
     assert set(rows[0]) == {"id", "path", "tags", "title", "preview",
-                            "created_at", "updated_at", "space_id", "space"}
+                            "created_at", "updated_at", "space_id", "space",
+                            "recalled", "gets"}
 
 
 def test_preview_is_first_line_truncated(store):
@@ -107,6 +111,9 @@ def managed(monkeypatch):
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
+    # Captions are not what most of this suite is about; the requirement
+    # has its own file (test_require_title.py) covering both settings.
+    monkeypatch.setenv("MEMGRES_REQUIRE_TITLE", "false")
     monkeypatch.setenv("MEMGRES_DATABASE_URL", DSN)
     monkeypatch.setenv("MEMGRES_EMBED_PROVIDER", "none")
     monkeypatch.setenv("MEMGRES_FTS_LANGUAGE", "simple")
