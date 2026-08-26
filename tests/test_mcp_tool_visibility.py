@@ -153,7 +153,12 @@ def _listed(mcp):
         handler = mcp._mcp_server.request_handlers[mcp_types.ListToolsRequest]
         result = asyncio.run(handler(None))
         return [t.name for t in result.root.tools]
-    return [t.name for t in asyncio.run(mcp.list_tools())]   # mcp 2.x
+    # mcp 2.x: go through the REGISTERED REQUEST HANDLER for the same reason.
+    # `mcp.list_tools()` is the unfiltered inventory — the filter now wraps the
+    # handler, because that is the only place the caller is knowable. Calling
+    # the attribute here would assert against a list no client ever receives.
+    handler = mcp._lowlevel_server._request_handlers["tools/list"].handler
+    return [t.name for t in asyncio.run(handler(None, None)).tools]
 
 
 @pytest.fixture

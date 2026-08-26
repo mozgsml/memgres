@@ -270,12 +270,20 @@ def build_server(cfg: Optional[Config] = None):
 
         Security does not depend on the schema-pruning below: even if the `token`
         argument stays visible, a header/env pin still wins here."""
+        # The two SDK generations hand the request out differently: 1.x wraps it
+        # in a `Context` (`.request_context.request`), 2.x passes the
+        # `ServerRequestContext` itself, which carries `.request`. Accept both —
+        # reading only one shape is how the header stopped being seen at all.
         req = None
-        if ctx is not None:
+        for probe in (lambda: ctx.request_context.request, lambda: ctx.request):
+            if ctx is None:
+                break
             try:
-                req = ctx.request_context.request
+                req = probe()
             except Exception:
                 req = None
+            if req is not None:
+                break
         if req is not None:
             try:
                 tok = identity.bearer_token(req.headers.get("authorization"),
@@ -952,7 +960,7 @@ def build_server(cfg: Optional[Config] = None):
                       "can_manage_own_tokens", "can_administer_deployment",
                       "has_admin_ceiling", "is_admin")}
 
-        def _caps_for_caller():
+        def _caps_for_caller(ctx):
             """This request's capabilities, or None if the caller is unknown.
 
             Only a failed CREDENTIAL answers None. A database that is briefly
@@ -966,10 +974,6 @@ def build_server(cfg: Optional[Config] = None):
                 # One implicit caller who may do everything; there is no
                 # credential to resolve and nothing to withhold.
                 return _all_caps
-            try:
-                ctx = mcp.get_context()
-            except Exception:
-                ctx = None
             with pool.connection() as conn:
                 try:
                     # `touch=False`: listing tools is asking ABOUT the
@@ -982,9 +986,9 @@ def build_server(cfg: Optional[Config] = None):
                     return None
                 return admin.capabilities(conn, p)
 
-        def _keep(tools):
+        def _keep(tools, ctx):
             allowed = set(visible_tools([t.name for t in tools],
-                                        _caps_for_caller(), _identity_on))
+                                        _caps_for_caller(ctx), _identity_on))
             return [t for t in tools if t.name in allowed]
 
         # Where the filter attaches differs by SDK generation, so both are
@@ -1002,16 +1006,37 @@ def build_server(cfg: Optional[Config] = None):
         # every client still seeing every tool, no error anywhere. A guard that
         # turns "this build cannot do what you configured" into silence is worse
         # than the crash it prevents, so an unrecognised SDK now says so.
-        if hasattr(mcp, "_handle_list_tools"):              # mcp 2.x
-            _unfiltered = mcp.list_tools
+        if hasattr(mcp, "_lowlevel_server"):                # mcp 2.x
+            # Wrap the REQUEST HANDLER, not `list_tools()`. The handler is the
+            # only place the caller is knowable: it is handed the
+            # `ServerRequestContext` carrying the HTTP request, while
+            # `list_tools()` takes no arguments at all. Filtering there meant
+            # asking who was calling with nothing to ask — on 2.x `MCPServer` has
+            # no `get_context()` either, so every caller resolved to "unknown"
+            # and every HTTP client, whatever its rights, was shown the read-only
+            # subset. Registered through the public `add_request_handler`, which
+            # documents that it replaces an existing entry; assigning the bound
+            # method on the instance would not have worked, because the lowlevel
+            # server captures it at construction.
+            from mcp_types import PaginatedRequestParams
 
-            async def _list_visible_tools():
-                return _keep(await _unfiltered())
+            _low = mcp._lowlevel_server
+            _inner = _low._request_handlers["tools/list"].handler
 
-            mcp.list_tools = _list_visible_tools
+            async def _list_visible_tools(ctx, params=None):
+                res = await _inner(ctx, params)
+                return res.model_copy(update={"tools": _keep(res.tools, ctx)})
+
+            _low.add_request_handler("tools/list", PaginatedRequestParams,
+                                     _list_visible_tools)
         elif hasattr(mcp, "_mcp_server"):                   # mcp 1.x
             async def _list_visible_tools():
-                return _keep(await mcp.list_tools())
+                # 1.x keeps the request in a contextvar `get_context()` reads.
+                try:
+                    ctx = mcp.get_context()
+                except Exception:
+                    ctx = None
+                return _keep(await mcp.list_tools(), ctx)
 
             mcp._mcp_server.list_tools()(_list_visible_tools)
         else:                                               # pragma: no cover

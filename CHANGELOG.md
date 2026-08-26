@@ -5,6 +5,32 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.7.2] — 2026-08-26
+
+### Fixed
+- **On mcp 2.x, a managed HTTP endpoint showed every caller the read-only tool
+  list** — superadmin included. The per-caller filter asked `MCPServer` for the
+  request context, which only mcp 1.x's `FastMCP` has; the `AttributeError` was
+  swallowed into "caller unknown", and everything requiring a capability
+  (`memory_write`, `memory_move`, `memory_forget`, `memory_create_space`, every
+  `memory_admin_*`) vanished from the listing. Never a security hole — calls
+  authorize on their own path, which is why `memory_whoami` cheerfully reported
+  rights the client could not see any tool for — but an agent only calls what it
+  is shown, so the store was effectively read-only for every HTTP client.
+  - The filter now wraps the tools/list REQUEST HANDLER, which is handed the
+    context, rather than `list_tools()`, which takes no arguments and therefore
+    cannot know who is asking. Registered through the public
+    `add_request_handler`; assigning the method on the instance does nothing,
+    because the lowlevel server captures it at construction.
+  - Token resolution understands both context shapes: 1.x's `Context`
+    (`.request_context.request`) and 2.x's `ServerRequestContext` (`.request`).
+- Every visibility test supplied the caller through `MEMGRES_TOKEN` — the env
+  pin, the one path that needs no request context — so the header path that every
+  HTTP deployment uses was never exercised and the suite stayed green. There is
+  now a test file that speaks the wire protocol to a real server: header vs no
+  header, reader / writer / user-manager / superadmin / namespace-scoped /
+  invalid, both header spellings, single-tenant, env-pinned, and visibility off.
+
 ## [0.7.1] — 2026-08-26
 
 ### Changed
