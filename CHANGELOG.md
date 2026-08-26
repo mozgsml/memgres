@@ -81,6 +81,13 @@ along.
   - Counted for what came BACK from a search, not for what the ranking
     considered; reads the store makes for itself are not counted. Best-effort, so
     a statistic that cannot be written is never the reason a read fails.
+  - **No foreign key to `memory`**, which is counter-intuitive and load-bearing:
+    one would make every counted read take `FOR KEY SHARE` on the memory row —
+    held until the reader's transaction ended — and that conflicts with the
+    `SELECT … FOR UPDATE` every write begins with. A plain `get()` would block
+    writes, `forget` and the retention sweep for that memory. Statistics must not
+    be able to block the data they describe, so `forget` and `purge_expired`
+    delete the counts themselves.
   - Visible where each is useful: `usage` on `memory_get`, `recalled`/`gets` per
     row on `memory_list` — which is how a subtree nobody reads becomes visible.
   - `MEMGRES_USAGE_COUNTERS=false` turns counting off (read-only replicas).
