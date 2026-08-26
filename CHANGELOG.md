@@ -5,7 +5,7 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
-## [0.10.0] — 2026-08-26
+## [0.9.0] — 2026-08-26
 
 ### Added
 - **Enrollment keys: onboard someone without a secret ever being in flight.**
@@ -47,7 +47,8 @@ patch = fixes).
   whose transcript the secret would land in.
 - Schema 22 (`enrollment_key`). Compatibility floor unchanged at 16.
 
-## [0.9.0] — 2026-08-26
+#### Also in this release
+
 
 ### Added
 - **`server_info` reports retention.** A client had no way to learn whether what
