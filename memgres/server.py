@@ -610,12 +610,42 @@ def create_app(cfg: Optional[Config] = None):
                 conn, p, namespace_id=space_id, user_id=req.user_id,
                 permission=req.permission))
 
+    @app.delete("/admin/namespaces/{space_id}/members/{user_id}")
+    def admin_remove_member(space_id: str, user_id: str, p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.remove_member(
+                conn, p, namespace_id=space_id, user_id=user_id))
+
+    class Transfer(BaseModel):
+        new_owner_user_id: str
+        keep_previous_owner: Optional[str] = "admin"
+
+    @app.post("/admin/namespaces/{space_id}/transfer")
+    def admin_transfer_namespace(space_id: str, req: Transfer,
+                                 p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.transfer_namespace(
+                conn, p, namespace_id=space_id,
+                new_owner_user_id=req.new_owner_user_id,
+                keep_previous_owner=req.keep_previous_owner))
+
+    class SetDisabled(BaseModel):
+        disabled: bool = True
+
+    @app.post("/admin/users/{user_id}/disabled")
+    def admin_set_disabled(user_id: str, req: SetDisabled,
+                           p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.set_disabled(
+                conn, p, user_id=user_id, disabled=req.disabled))
+
     class SetRole(BaseModel):
         role: str
 
     class EditNamespace(BaseModel):
         description: Optional[str] = None
         instruction: Optional[str] = None
+        name: Optional[str] = None
 
     # These exist so the HTTP surface offers what the service layer does. They
     # were reachable over MCP only, which left a panel — the reason this API is
@@ -647,7 +677,7 @@ def create_app(cfg: Optional[Config] = None):
         with pool.connection() as conn:
             return _guard(lambda: admin.edit_namespace(
                 conn, p, namespace_id=space_id, description=req.description,
-                instruction=req.instruction))
+                instruction=req.instruction, name=req.name))
 
     @app.get("/admin/namespaces/{space_id}/members")
     def admin_list_members(space_id: str, p=Depends(principal)):

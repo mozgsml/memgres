@@ -160,7 +160,7 @@ TOOL_VISIBILITY = {
     "memory_admin_list_tokens": ("identity", "can_manage_users"),
     "memory_admin_revoke_token": ("identity", "can_manage_users"),
     "memory_admin_set_role": ("identity", "can_administer_deployment"),
-    "memory_admin_add_member": ("identity", "can_administer_deployment"),
+    "memory_admin_set_disabled": ("identity", "can_manage_users"),
     "memory_admin_count_orphans": ("identity", "can_administer_deployment"),
     "memory_admin_adopt_orphans": ("identity", "can_administer_deployment"),
     # per-namespace admin: any namespace OWNER qualifies, so no deployment-wide
@@ -168,6 +168,13 @@ TOOL_VISIBILITY = {
     # ceiling, since the effective permission is membership ∧ ceiling
     "memory_admin_edit_namespace": ("identity", "has_admin_ceiling"),
     "memory_admin_list_members": ("identity", "has_admin_ceiling"),
+    "memory_admin_add_member": ("identity", "has_admin_ceiling"),
+    "memory_admin_remove_member": ("identity", "has_admin_ceiling"),
+    "memory_admin_transfer_namespace": ("identity", "has_admin_ceiling"),
+    "memory_admin_list_requests": ("identity", "has_admin_ceiling"),
+    "memory_admin_decide_access": ("identity", "has_admin_ceiling"),
+    # asking is not administering — anyone with an account may
+    "memory_request_access": ("identity",),
 }
 
 
@@ -783,6 +790,21 @@ def build_server(cfg: Optional[Config] = None):
         return out
 
     @mcp.tool()
+    def memory_request_access(space_id: str, permission: str = "read",
+                              ctx: Context = None) -> dict:
+        """Ask the owner of a namespace to let you in.
+
+        The push side of sharing needs somebody to know your user id; this is
+        the pull side, for when you know a namespace exists and want in. You
+        need its id — the answer deliberately cannot tell a namespace you cannot
+        reach from one that does not exist, so ids come from a person, not from
+        browsing. `already_reachable` means you are in it already."""
+        with pool.connection() as conn, conn.transaction():
+            return admin.request_access(conn, _principal(conn, _token(ctx)),
+                                        namespace_id=space_id,
+                                        permission=permission)
+
+    @mcp.tool()
     def memory_list_tokens(ctx: Context = None) -> List[dict]:
         """List your tokens (metadata only — never the secret)."""
         with pool.connection() as conn, conn.transaction():
@@ -922,15 +944,20 @@ def build_server(cfg: Optional[Config] = None):
         def memory_admin_edit_namespace(space_id: str,
                                         description: Optional[str] = None,
                                         instruction: Optional[str] = None,
+                                        name: Optional[str] = None,
                                         ctx: Context = None) -> dict:
-            """Amend a namespace's description or routing instruction. Creating
-            it again will not: that call ignores conflicts, so this is the only
-            way to correct the text agents route by."""
+            """Amend a namespace's description, routing instruction, or NAME.
+            Creating it again will not: that call ignores conflicts, so this is
+            the only way to correct the text agents route by.
+
+            Renaming is addressed by id and checked against the owner's other
+            namespaces and aliases. Callers using the old name get "no such
+            namespace" from then on; ids and aliases keep working."""
             with pool.connection() as conn, conn.transaction():
                 return admin.edit_namespace(
                     conn, _principal(conn, _token(ctx)),
                     namespace_id=space_id, description=description,
-                    instruction=instruction)
+                    instruction=instruction, name=name)
 
         @mcp.tool()
         def memory_admin_count_orphans(ctx: Context = None) -> dict:
@@ -959,11 +986,82 @@ def build_server(cfg: Optional[Config] = None):
                                     permission: str = "read",
                                     ctx: Context = None) -> dict:
             """Share a namespace with another user at read | write | admin.
-            Superadmin only — it grants access across tenants."""
+            Yours to give: the owner of a namespace (or a superadmin) may share
+            it, with an admin-ceiling credential for it. Re-adding an existing
+            member changes their permission."""
             with pool.connection() as conn, conn.transaction():
                 return admin.add_member(conn, _principal(conn, _token(ctx)),
                                         namespace_id=space_id, user_id=user_id,
                                         permission=permission)
+
+        @mcp.tool()
+        def memory_admin_remove_member(space_id: str, user_id: str,
+                                       ctx: Context = None) -> dict:
+            """Take a shared namespace away again. `removed: false` means they
+            were not a member.
+
+            Effective immediately — reach is recomputed on every call. A token
+            they hold that was SCOPED to this namespace keeps existing and stops
+            reaching anything; revoke it separately if that is what you meant.
+            The OWNER cannot be removed this way: ownership is not a membership,
+            so hand the namespace over instead."""
+            with pool.connection() as conn, conn.transaction():
+                return admin.remove_member(conn, _principal(conn, _token(ctx)),
+                                           namespace_id=space_id, user_id=user_id)
+
+        @mcp.tool()
+        def memory_admin_transfer_namespace(
+                space_id: str, new_owner_user_id: str,
+                keep_previous_owner: Optional[str] = "admin",
+                ctx: Context = None) -> dict:
+            """Hand a namespace to another account — owner or superadmin only.
+
+            The outgoing owner stays behind as a member at
+            `keep_previous_owner` (default `admin`); pass null for a clean
+            hand-off, knowing that this removes them from a namespace whose
+            contents they may be the only one who knows. Refused if the new
+            owner already owns — or aliases — a namespace by the same name,
+            since the name has to stay addressable for whoever holds it."""
+            with pool.connection() as conn, conn.transaction():
+                return admin.transfer_namespace(
+                    conn, _principal(conn, _token(ctx)), namespace_id=space_id,
+                    new_owner_user_id=new_owner_user_id,
+                    keep_previous_owner=keep_previous_owner)
+
+        @mcp.tool()
+        def memory_admin_list_requests(space_id: str,
+                                       ctx: Context = None) -> List[dict]:
+            """Pending requests to join a namespace you administer — who asked,
+            for what permission, when."""
+            with pool.connection() as conn:
+                out = admin.list_requests(conn, _principal(conn, _token(ctx)),
+                                          namespace_id=space_id)
+            return _iso(out, "created_at")
+
+        @mcp.tool()
+        def memory_admin_decide_access(request_id: str, approve: bool = True,
+                                       ctx: Context = None) -> dict:
+            """Approve or deny a request to join. Approving adds them as a
+            member at the permission they asked for — the same act as
+            `memory_admin_add_member`, reached from their side."""
+            with pool.connection() as conn, conn.transaction():
+                admin.decide_access(conn, _principal(conn, _token(ctx)),
+                                    request_id=request_id, approve=approve)
+            return {"request_id": request_id, "approved": approve}
+
+        @mcp.tool()
+        def memory_admin_set_disabled(user_id: str, disabled: bool = True,
+                                      ctx: Context = None) -> dict:
+            """Switch an account off, or back on.
+
+            Offboarding in one act: every token it holds stops authenticating at
+            once, and so does any token issued to it later. Nothing is
+            destroyed — authorship, namespaces and memberships all survive, and
+            re-enabling restores the account as it was. The last ACTIVE
+            superadmin cannot be switched off."""
+            with pool.connection() as conn, conn.transaction():
+                return admin.set_disabled(conn, _principal(conn, _token(ctx)),
+                                          user_id=user_id, disabled=disabled)
 
         @mcp.tool()
         def memory_admin_list_members(space_id: str,

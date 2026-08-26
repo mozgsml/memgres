@@ -1,0 +1,12 @@
+-- Turning an account off without destroying it (schema v23).
+--
+-- Offboarding had no operation. The only way to stop someone was to revoke
+-- their tokens one at a time — a loop over a list that has to be complete to be
+-- correct, with nothing preventing a fresh token being issued a minute later.
+-- A person leaving is not a person being deleted: their authorship stays, their
+-- namespaces stay, and coming back should not mean being re-provisioned.
+--
+-- A timestamp rather than a boolean: "when did this account stop working" is
+-- the question actually asked afterwards, and a bool cannot answer it. NULL =
+-- active, which makes every existing row correct without a backfill.
+ALTER TABLE app_user ADD COLUMN IF NOT EXISTS disabled_at timestamptz;

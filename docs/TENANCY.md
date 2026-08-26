@@ -48,9 +48,9 @@ that governs the control plane:
 
 | role | can |
 |---|---|
-| `user` (default) | own namespaces; manage access to its **own** spaces (approve requests) |
+| `user` (default) | own namespaces; **share, un-share and hand over its own spaces**, approve requests to join them |
 | `user_manager` | + create users and (re)issue tokens — provisioning only, **no** cross-tenant data access |
-| `superadmin` | + full root: read/write **any** namespace, add members anywhere, grant/revoke roles |
+| `superadmin` | + full root: read/write **any** namespace, share any namespace, grant/revoke roles, switch accounts off |
 
 A `superadmin`'s data access is capped by its token ceiling like anyone's; a
 `user_manager` never gains implicit access to another tenant's memories.
@@ -259,10 +259,14 @@ Tools:
 - `memory_enroll` — claim an account with a one-time key, binding a token you
   generated yourself. Shown ONLY to a client whose credential belongs to nobody
   yet, and it is then the only tool shown (see below);
+- `memory_request_access` — ask the owner of a namespace to let you in (the pull
+  side of sharing; you need its id, since discovery is deliberately impossible);
 - `memory_issue_token` — mint a token (rotate/delegate; secret returned once);
 - `memory_list_tokens` / `memory_revoke_token` — manage them;
 - `memory_admin_*` — the control plane (see below), where the caller has the
-  authority for it.
+  authority for it: `add_member` / `remove_member` / `transfer_namespace` /
+  `list_requests` / `decide_access` for a namespace you administer, and
+  `set_disabled` to switch an account off.
 
 **No MCP tool takes a `token` argument.** Both transports can be configured with
 a credential — http carries an `Authorization` (or `X-Memgres-Token`) header,
@@ -373,8 +377,13 @@ NS=$(curl -s $BASE/admin/namespaces \
 curl -s $BASE/admin/tokens \
   -d "{\"user_id\":\"$UID\",\"permission\":\"write\"}" $A     # → token (once)
 
-# add another user as a member; revoke a token       (member add: superadmin)
+# share, un-share, hand over        (the namespace's OWNER may do all three)
 curl -s $BASE/admin/namespaces/$NS/members -d '{"user_id":"…","permission":"read"}' $A
+curl -s -X DELETE $BASE/admin/namespaces/$NS/members/<user_id> $A
+curl -s $BASE/admin/namespaces/$NS/transfer -d '{"new_owner_user_id":"…"}' $A
+
+# offboarding: one act, reversible, destroys nothing
+curl -s $BASE/admin/users/<user_id>/disabled -d '{"disabled":true}' $A
 curl -s $BASE/admin/tokens/<token_id>/revoke $A
 
 # service-role management (superadmin only)
@@ -484,6 +493,33 @@ memgres-provision --user <uuid> --label laptop --expires-days 90
 It prints the user id, the namespace id and the token id — everything except the
 secret, which goes to `--out`, or to `MEMGRES_TOKEN_SINK` if that is set, and to
 stdout only as a last resort (with a warning naming your shell history).
+
+### Taking access back
+
+Every grant here has an undo, and each one answers a different question.
+
+- **`remove_member`** — they keep their account, lose this namespace. Effective
+  on the next call; reach is recomputed per request, never cached. A token they
+  hold that was *scoped* to this namespace keeps existing and stops reaching
+  anything — revoke it separately if that is what you meant. The **owner**
+  cannot be removed: ownership is not a membership row, so a delete would report
+  success and change nothing.
+- **`transfer_namespace`** — the namespace outlives whoever made it. Owner or
+  superadmin; the outgoing owner stays as an `admin` member unless you pass
+  `keep_previous_owner: null`, because the alternative is one call that removes
+  the caller from a namespace whose contents they may be the only one who knows.
+  Refused if the receiving account already owns — or aliases — that name.
+- **`set_disabled`** — offboarding as ONE act. Every token the account holds
+  stops authenticating at once, and so does any token issued to it afterwards,
+  because the check lives in authentication rather than at each door. Nothing is
+  destroyed: authorship, namespaces and memberships survive and re-enabling
+  restores the account exactly. The last ACTIVE superadmin cannot be switched
+  off — nobody would be left able to switch it back on.
+- **`revoke_token`** — one credential, when it leaked but the person stays.
+
+Deleting a user or a namespace is deliberately **not** here: what those need to
+decide first (what happens to the memories, who inherits, whether authorship
+survives) is not settled by an API shape.
 
 ### Who may act on whom
 

@@ -353,7 +353,8 @@ def create_namespace(conn, p: Principal, *, owner_user_id: str, name: str,
 
 def edit_namespace(conn, p: Principal, *, namespace_id: str,
                    description: Optional[str] = None,
-                   instruction: Optional[str] = None) -> dict:
+                   instruction: Optional[str] = None,
+                   name: Optional[str] = None) -> dict:
     """Amend a namespace's description or routing instruction.
 
     `create_namespace` is an idempotent upsert that ignores conflicts, so
@@ -363,17 +364,90 @@ def edit_namespace(conn, p: Principal, *, namespace_id: str,
     """
     require_namespace_admin(conn, p, namespace_id)
     identity.edit_namespace(conn, namespace_id, description=description,
-                            instruction=instruction)
-    return {"namespace_id": namespace_id}
+                            instruction=instruction, name=name)
+    out = {"namespace_id": namespace_id}
+    if name is not None:
+        out["name"] = name
+        out["warning"] = ("renamed — anyone addressing it by the old name now "
+                          "gets 'no such namespace'. Ids and aliases still work")
+    return out
+
+
+def require_namespace_owner(conn, p: Principal, namespace_id: str) -> None:
+    """Owner-or-superadmin, a tier narrower than `require_namespace_admin`.
+
+    For the acts that dispose of the namespace itself rather than work inside
+    it. An admin MEMBER was given authority over the contents; giving away
+    somebody else's namespace is not part of that, and the difference only
+    matters here — which is why this is its own check rather than a flag.
+    """
+    require_namespace_admin(conn, p, namespace_id)      # ceiling + scope + exists
+    if p.is_admin:
+        return
+    if identity.namespace_owner(conn, namespace_id) != p.user_id:
+        raise Forbidden("only the owner (or a superadmin) may do this")
 
 
 def add_member(conn, p: Principal, *, namespace_id: str, user_id: str,
                permission: str = "read") -> dict:
-    """Share a namespace with another user — cross-tenant, so superadmin only."""
-    require_superadmin(p)
+    """Share a namespace with another user.
+
+    Authorized per-NAMESPACE, not deployment-wide. It used to demand superadmin,
+    on the reasoning that sharing reaches across tenants — but the thing being
+    shared is the caller's OWN namespace, and requiring the deployment's root
+    for that made "let a colleague into my cabinet" an operator ticket. What it
+    still demands is an admin-ceiling credential for that namespace, so a
+    read-only or differently-scoped token cannot hand out access.
+    """
+    require_namespace_admin(conn, p, namespace_id)
     identity.add_member(conn, namespace_id, user_id, permission)
     return {"namespace_id": namespace_id, "user_id": user_id,
             "permission": permission}
+
+
+def remove_member(conn, p: Principal, *, namespace_id: str, user_id: str) -> dict:
+    """Un-share a namespace. `removed: false` means they were not a member.
+
+    The other half of `add_member`, and its absence was the sharpest gap in this
+    control plane: access could be granted and never taken back except by
+    revoking every token the person held, which cuts them off from everything
+    rather than from this.
+    """
+    require_namespace_admin(conn, p, namespace_id)
+    return {"namespace_id": namespace_id, "user_id": user_id,
+            "removed": identity.remove_member(conn, namespace_id, user_id)}
+
+
+def transfer_namespace(conn, p: Principal, *, namespace_id: str,
+                       new_owner_user_id: str,
+                       keep_previous_owner: Optional[str] = "admin") -> dict:
+    """Hand a namespace to another account — owner or superadmin.
+
+    The outgoing owner stays behind as an `admin` member unless
+    `keep_previous_owner` is null. Defaulting to keeping them is the safer
+    footing: the alternative is a single call that removes the caller from a
+    namespace whose contents they may be the only one who knows.
+    """
+    require_namespace_owner(conn, p, namespace_id)
+    return identity.transfer_namespace(
+        conn, namespace_id, new_owner_user_id,
+        keep_previous_owner=keep_previous_owner)
+
+
+def set_disabled(conn, p: Principal, *, user_id: str, disabled: bool) -> dict:
+    """Switch an account off, or back on. Every token it holds stops at once.
+
+    Offboarding as ONE act. Doing it by revoking tokens one at a time is a loop
+    that has to be complete to be correct, and nothing stops a new token being
+    issued afterwards. Reversible and destructive of nothing — authorship,
+    namespaces and memberships all survive, which is what makes it usable for
+    "gone for now" as well as "gone".
+    """
+    require_manage_users(p)
+    _require_target_is_plain_user(conn, p, user_id,
+                                  "disabling an account" if disabled
+                                  else "re-enabling an account")
+    return identity.set_disabled(conn, user_id, disabled)
 
 
 def list_namespaces(conn, p: Principal, *, owner_user_id: Optional[str] = None,
@@ -407,6 +481,27 @@ def list_spaces(conn, p: Principal) -> List[dict]:
 
 # ─── tokens ──────────────────────────────────────────────────────────────────
 
+def _unreachable_warning(conn, user_id: str,
+                         namespace_id: Optional[str]) -> Optional[str]:
+    """Warn when a credential is about to be scoped to a namespace its owner
+    cannot reach.
+
+    Scoping is not granting: reach comes from ownership or membership, and a
+    token pinned to a namespace the account is not in is perfectly valid and
+    reaches nothing. The person enrols, everything answers "no namespace", and
+    it reads as a broken server rather than an unfinished provisioning. A
+    warning rather than a refusal, because issuing the credential first and
+    adding the membership after is a legitimate order.
+    """
+    if not namespace_id:
+        return None
+    if identity.reaches(conn, user_id, namespace_id) is not None:
+        return None
+    return ("that user cannot reach this namespace yet, so the token will be "
+            "valid and see NOTHING — add them with memory_admin_add_member "
+            "(or hand the namespace over) before they try to use it")
+
+
 def issue_token(conn, p: Principal, *, user_id: str,
                 namespace_id: Optional[str] = None, permission: str = "write",
                 label: str = "", expires_days: Optional[int] = None,
@@ -426,10 +521,14 @@ def issue_token(conn, p: Principal, *, user_id: str,
     expires_at = None
     if expires_days:
         expires_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=expires_days)
+    warning = _unreachable_warning(conn, user_id, namespace_id)
     secret, tid = identity.issue_token(conn, user_id, namespace_id=namespace_id,
                                        permission=permission, label=label,
                                        expires_at=expires_at)
-    return deliver_secret(secret, tid, sink_dir)
+    out = deliver_secret(secret, tid, sink_dir)
+    if warning:
+        out["warning"] = warning
+    return out
 
 
 def deliver_secret(secret: str, token_id: str, sink_dir: str) -> dict:
@@ -472,6 +571,9 @@ def create_enrollment(conn, p: Principal, *, user_id: str,
                    "for a meeting link — it is single-use and short-lived. They "
                    "generate their own token, put it in their client's config, "
                    "and call memory_enroll with this key.")
+    warning = _unreachable_warning(conn, user_id, namespace_id)
+    if warning:
+        out["warning"] = warning
     return out
 
 

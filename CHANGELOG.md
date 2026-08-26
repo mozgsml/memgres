@@ -5,6 +5,56 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.10.0] — 2026-08-26
+
+### Added
+- **Administration that can also take back.** This control plane could only add:
+  access could be granted and never withdrawn except by revoking every token a
+  person held — which cuts them off from everything rather than from the one
+  namespace — and a person leaving had no operation at all.
+  - `memory_admin_remove_member` — un-share. Effective on the next call, since
+    reach is recomputed per request. The **owner** cannot be removed this way:
+    ownership is not a membership row, so a delete would report success and
+    change nothing, which is how someone believes they revoked access they did
+    not.
+  - `memory_admin_transfer_namespace` — hand a namespace over, owner or
+    superadmin. The outgoing owner stays as an `admin` member unless
+    `keep_previous_owner` is null: the alternative is one call that removes the
+    caller from a namespace whose contents they may be the only one who knows.
+    Refused — with a sentence rather than a constraint violation — when the
+    receiving account already owns or aliases that name.
+  - `memory_admin_set_disabled` — offboarding as one act. Every token the
+    account holds stops authenticating at once, and so does any token issued to
+    it afterwards, because the check is in authentication rather than at each
+    door. Reversible, destroys nothing. The last ACTIVE superadmin cannot be
+    switched off.
+  - `memory_request_access` / `memory_admin_list_requests` /
+    `memory_admin_decide_access` — the request-to-join flow existed in the
+    service layer since the identity work but had **no MCP tools**, so over the
+    only door a corporate deployment actually opens it did not exist.
+  - `memory_admin_edit_namespace` can now RENAME (`name`), checked against the
+    owner's other namespaces and aliases. Callers using the old name get "no
+    such namespace"; ids and aliases keep working.
+  - REST parity for all of it: `DELETE /admin/namespaces/{id}/members/{user}`,
+    `POST /admin/namespaces/{id}/transfer`, `POST /admin/users/{id}/disabled`.
+- **A warning where a credential would be valid and see nothing.** Scoping a
+  token or an enrollment key to a namespace its owner cannot reach is legal and
+  useless: everything answers "no namespace" and it reads as a broken server
+  rather than unfinished provisioning. Both doors now say so, and name
+  `add_member`. A warning, not a refusal — issuing the credential first and
+  adding the membership after is a legitimate order.
+- `list_users` reports `disabled` and `disabled_at`. An account you cannot see
+  is off is one you re-provision by accident.
+
+### Changed
+- **Sharing a namespace no longer requires superadmin.** `add_member` is
+  authorized per-namespace: its owner (or an admin member, or a superadmin) may
+  share it, with an admin-ceiling credential for it. Requiring the deployment's
+  root made "let a colleague into my cabinet" an operator ticket. Giving the
+  namespace AWAY stays owner-only — delegated authority over the contents is not
+  authority to dispose of it, which is the one place the two tiers differ.
+- Schema 23 (`app_user.disabled_at`). Compatibility floor unchanged at 16.
+
 ## [0.9.0] — 2026-08-26
 
 ### Added

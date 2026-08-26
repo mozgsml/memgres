@@ -24,6 +24,7 @@ resolve a space before every operation.
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import hmac
 import os
@@ -189,16 +190,22 @@ def resolve(conn, cfg, secret: Optional[str], *, touch: bool = True) -> Principa
                 "SELECT t.id, t.user_id, t.namespace_id, t.permission, "
                 "       (t.revoked_at IS NOT NULL) AS revoked, "
                 "       (t.expires_at IS NOT NULL AND t.expires_at <= now()) AS expired, "
-                "       u.role "
+                "       u.role, (u.disabled_at IS NOT NULL) AS disabled "
                 "FROM token t JOIN app_user u ON u.id = t.user_id "
                 "WHERE t.token_hash=%s", (h,))
             row = cur.fetchone()
             if row is not None:
-                tid, uid, nsid, perm, revoked, expired, role = row
+                tid, uid, nsid, perm, revoked, expired, role, disabled = row
                 if revoked:
                     raise AuthError("token revoked")
                 if expired:
                     raise AuthError("token expired")
+                if disabled:
+                    # Checked HERE, on the credential, rather than at each door:
+                    # an account that is off has to be off for every token it
+                    # holds and every one it could still be issued, and the only
+                    # place all of those meet is authentication.
+                    raise AuthError("this account is disabled")
                 if touch:
                     cur.execute("UPDATE token SET last_used_at=now() WHERE id=%s",
                                 (tid,))
@@ -742,7 +749,8 @@ def list_users(conn, *, role: Optional[str] = None, limit: Optional[int] = None,
     if role is not None and role not in SERVICE_ROLES:
         raise ValueError(f"bad role: {role}")
     sql = ("SELECT id, name, description, role, can_create_namespace, "
-           "created_at, email, full_name, department, position FROM app_user")
+           "created_at, email, full_name, department, position, "
+           "disabled_at FROM app_user")
     args: list = []
     if role is not None:
         sql += " WHERE role=%s"                # backed by app_user_role_idx
@@ -755,13 +763,17 @@ def list_users(conn, *, role: Optional[str] = None, limit: Optional[int] = None,
         sql += " OFFSET %s"
         args.append(offset)
     cols = ["id", "name", "description", "role", "can_create_namespace",
-            "created_at", *PROFILE_FIELDS]
+            "created_at", *PROFILE_FIELDS, "disabled_at"]
     with conn.cursor() as cur:
         cur.execute(sql, args)
         out = []
         for r in cur.fetchall():
             d = dict(zip(cols, r))
             d["id"] = str(d["id"])
+            # Both, deliberately: `disabled` is what a caller branches on, and
+            # `disabled_at` answers "since when", which is the question that
+            # follows every time the first one is true.
+            d["disabled"] = d["disabled_at"] is not None
             out.append(d)
         return out
 
@@ -822,10 +834,79 @@ def revoke_superadmin(conn, user_id: str, *, demote_to: str = "user") -> None:
         cur.execute("UPDATE app_user SET role=%s WHERE id=%s", (demote_to, user_id))
 
 
+def set_disabled(conn, user_id: str, disabled: bool) -> dict:
+    """Turn an account off (or back on). Reversible, and destroys nothing.
+
+    Anti-lockout, in the same spirit as `revoke_superadmin`: the last ACTIVE
+    superadmin cannot be switched off, because nobody would be left who could
+    switch it back on. Recovery from such a lockout would mean editing the
+    database by hand.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT role, disabled_at IS NOT NULL FROM app_user WHERE id=%s",
+                    (_as_uuid(user_id),))
+        row = cur.fetchone()
+        if row is None:
+            raise SpaceNotFound(f"no such user {user_id}")
+        role, already = row
+        if bool(already) == bool(disabled):
+            return {"user_id": str(user_id), "disabled": bool(disabled),
+                    "unchanged": True}
+        if disabled and role == "superadmin":
+            cur.execute("SELECT count(*) FROM app_user WHERE role='superadmin' "
+                        "AND disabled_at IS NULL")
+            if int(cur.fetchone()[0]) <= 1:
+                raise AuthError("cannot disable the last active superadmin")
+        cur.execute("UPDATE app_user SET disabled_at = %s WHERE id=%s",
+                    (None if not disabled else dt.datetime.now(dt.timezone.utc),
+                     _as_uuid(user_id)))
+    return {"user_id": str(user_id), "disabled": bool(disabled)}
+
+
 # How many namespaces one account may own. Not a business rule — a bound, so a
 # self-service deployment cannot be turned into an INSERT loop by anyone holding
 # a well-formed token.
 MAX_NAMESPACES_PER_USER = 50
+
+
+def _require_name_free(cur, owner_user_id: str, name: str, *,
+                       except_namespace_id: Optional[str] = None,
+                       upsert: bool = False) -> None:
+    """Refuse a name that would be unaddressable for `owner_user_id`.
+
+    Two ways that happens, and they are the same failure seen from two sides: an
+    ALIAS of theirs already means something else (so the namespace could not be
+    reached by its own name, and their existing calls would silently keep
+    resolving elsewhere), or they already OWN a namespace by that name.
+
+    Extracted from `create_namespace` because renaming and transferring hit the
+    identical wall — and a check that lives at only one of three doors is the
+    kind of duplication this codebase keeps paying for.
+    """
+    cur.execute("SELECT namespace_id FROM namespace_alias "
+                "WHERE user_id=%s AND alias=%s", (owner_user_id, name))
+    if cur.fetchone() is not None:
+        raise SpaceAmbiguous(
+            f"'{name}' is already one of that user's aliases — the namespace "
+            "could not be addressed by its own name, and their existing calls "
+            "using it would keep resolving elsewhere. Drop the alias or choose "
+            "another name")
+    if upsert:
+        # `create_namespace` is an idempotent upsert BY DESIGN: calling it again
+        # with the same name returns the existing id rather than failing, which
+        # is what makes provisioning scripts re-runnable. Only renaming and
+        # transferring must refuse the collision, because for them there is no
+        # "the one you meant" to return.
+        return
+    sql = "SELECT id FROM namespace WHERE owner_user_id=%s AND name=%s"
+    args = [owner_user_id, name]
+    if except_namespace_id is not None:
+        sql += " AND id <> %s"
+        args.append(_as_uuid(except_namespace_id))
+    cur.execute(sql, args)
+    if cur.fetchone() is not None:
+        raise SpaceAmbiguous(
+            f"that account already owns a namespace called '{name}'")
 
 
 def create_namespace(conn, owner_user_id: str, name: str, *,
@@ -841,14 +922,7 @@ def create_namespace(conn, owner_user_id: str, name: str, *,
     codebase keeps paying for.
     """
     with conn.cursor() as cur:
-        cur.execute("SELECT namespace_id FROM namespace_alias "
-                    "WHERE user_id=%s AND alias=%s", (owner_user_id, name))
-        if cur.fetchone() is not None:
-            raise SpaceAmbiguous(
-                f"'{name}' is already one of that user's aliases — the new "
-                "namespace could not be addressed by its own name, and their "
-                "existing calls using it would keep resolving elsewhere. Drop "
-                "the alias or choose another name")
+        _require_name_free(cur, owner_user_id, name, upsert=True)
         cur.execute("SELECT count(*) FROM namespace WHERE owner_user_id=%s",
                     (owner_user_id,))
         if cur.fetchone()[0] >= MAX_NAMESPACES_PER_USER:
@@ -966,8 +1040,25 @@ def add_member(conn, namespace_id: str, user_id: str, permission: str = "read") 
 
 
 def edit_namespace(conn, namespace_id: str, *, description: Optional[str] = None,
-                   instruction: Optional[str] = None) -> None:
+                   instruction: Optional[str] = None,
+                   name: Optional[str] = None) -> None:
+    """Amend a namespace. `name` renames it — checked against the OWNER's other
+    namespaces and aliases, since that is who the name has to stay addressable
+    for. Anyone addressing it by the old name gets "no such namespace" from then
+    on; ids and aliases are unaffected."""
     sets, params = [], []
+    if name is not None:
+        if not name.strip():
+            raise ValueError("a namespace name cannot be blank")
+        with conn.cursor() as cur:
+            cur.execute("SELECT owner_user_id FROM namespace WHERE id=%s",
+                        (_as_uuid(namespace_id),))
+            row = cur.fetchone()
+            if row is None:
+                raise SpaceNotFound(f"no such namespace {namespace_id}")
+            _require_name_free(cur, str(row[0]), name,
+                               except_namespace_id=namespace_id)
+        sets.append("name=%s"); params.append(name)
     if description is not None:
         sets.append("description=%s"); params.append(description)
     if instruction is not None:
@@ -977,6 +1068,93 @@ def edit_namespace(conn, namespace_id: str, *, description: Optional[str] = None
     params.append(namespace_id)
     with conn.cursor() as cur:
         cur.execute(f"UPDATE namespace SET {', '.join(sets)} WHERE id=%s", params)
+
+
+def remove_member(conn, namespace_id: str, user_id: str) -> bool:
+    """Take a shared namespace away again. False if they were not a member.
+
+    Takes effect on the next call: reach is computed per request from the member
+    table, never cached. A token that was SCOPED to this namespace is not
+    revoked — it simply stops reaching anything, which is the same state as a
+    token scoped to a namespace that was never shared. Revoking it as well is
+    the caller's decision, not a side effect of un-sharing.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT owner_user_id FROM namespace WHERE id=%s",
+                    (_as_uuid(namespace_id),))
+        row = cur.fetchone()
+        if row is None:
+            raise SpaceNotFound(f"no such namespace {namespace_id}")
+        if str(row[0]) == str(user_id):
+            # Ownership is not a membership row, so deleting one would report
+            # success and change nothing — the owner would keep full access and
+            # whoever asked would believe they had removed it.
+            raise AuthError(
+                "that user OWNS this namespace — ownership is not a membership "
+                "and cannot be removed. Transfer the namespace instead")
+        cur.execute("DELETE FROM namespace_member WHERE namespace_id=%s "
+                    "AND user_id=%s RETURNING user_id",
+                    (_as_uuid(namespace_id), _as_uuid(user_id)))
+        return cur.fetchone() is not None
+
+
+def namespace_owner(conn, namespace_id: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT owner_user_id FROM namespace WHERE id=%s",
+                    (_as_uuid(namespace_id),))
+        row = cur.fetchone()
+        return str(row[0]) if row else None
+
+
+def transfer_namespace(conn, namespace_id: str, new_owner_user_id: str, *,
+                       keep_previous_owner: Optional[str] = "admin") -> dict:
+    """Hand a namespace to somebody else.
+
+    `keep_previous_owner` leaves the outgoing owner behind as a member at that
+    permission (default `admin`), and defaults to doing so for a reason: without
+    it, one call removes the caller from a namespace they may be the only person
+    who knows the contents of, and nothing in the reply would have warned them.
+    Pass None for a clean hand-off.
+
+    The new owner's stale membership row, if any, is dropped — ownership already
+    grants more than any membership can, and leaving a `read` row behind means a
+    later transfer silently demotes them.
+    """
+    if keep_previous_owner is not None and keep_previous_owner not in _RANK:
+        raise ValueError(f"bad permission: {keep_previous_owner}")
+    with conn.cursor() as cur:
+        cur.execute("SELECT owner_user_id, name FROM namespace WHERE id=%s "
+                    "FOR UPDATE", (_as_uuid(namespace_id),))
+        row = cur.fetchone()
+        if row is None:
+            raise SpaceNotFound(f"no such namespace {namespace_id}")
+        old_owner, name = str(row[0]), row[1]
+        if old_owner == str(new_owner_user_id):
+            return {"namespace_id": str(namespace_id), "owner_user_id": old_owner,
+                    "unchanged": True}
+        cur.execute("SELECT 1 FROM app_user WHERE id=%s",
+                    (_as_uuid(new_owner_user_id),))
+        if cur.fetchone() is None:
+            raise SpaceNotFound(f"no such user {new_owner_user_id}")
+        # The receiving account has its own names and aliases, and (owner, name)
+        # is unique: without this the transfer dies on a constraint violation
+        # rather than on an explanation.
+        _require_name_free(cur, str(new_owner_user_id), name,
+                           except_namespace_id=namespace_id)
+        cur.execute("DELETE FROM namespace_member WHERE namespace_id=%s AND "
+                    "user_id=%s", (_as_uuid(namespace_id), _as_uuid(new_owner_user_id)))
+        cur.execute("UPDATE namespace SET owner_user_id=%s WHERE id=%s",
+                    (_as_uuid(new_owner_user_id), _as_uuid(namespace_id)))
+        if keep_previous_owner is not None:
+            cur.execute(
+                "INSERT INTO namespace_member (namespace_id, user_id, permission) "
+                "VALUES (%s, %s, %s) ON CONFLICT (namespace_id, user_id) "
+                "DO UPDATE SET permission=EXCLUDED.permission",
+                (_as_uuid(namespace_id), _as_uuid(old_owner), keep_previous_owner))
+    return {"namespace_id": str(namespace_id),
+            "owner_user_id": str(new_owner_user_id),
+            "previous_owner_user_id": old_owner,
+            "previous_owner_permission": keep_previous_owner}
 
 
 def list_spaces(conn, user_id: str) -> List[dict]:
