@@ -44,7 +44,17 @@ _NO_BACKEND = _NoBackend()
 
 def rebuild(conn, cfg, *, force: bool = False) -> int:
     """Re-derive every memory's outgoing edges. Returns how many memories were
-    scanned; 0 when the backfill has already run and `force` is not set."""
+    scanned; 0 when the backfill has already run and `force` is not set.
+
+    COMMITS before returning, and that is not a convenience. The first statement
+    below opens an implicit transaction on the connection, so every
+    `conn.transaction()` block after it is a SAVEPOINT rather than a top-level
+    transaction — releasing a savepoint commits nothing. A caller that then closed
+    the connection (which is exactly what `maybe_backfill` does with its own) rolled
+    the entire backfill back, logged "link index rebuilt over N memories", and left
+    the flag false — so the server came up serving a link graph that was perfectly
+    empty while saying it had built one. Owning the commit here means the work is
+    durable when this returns, whatever the caller does next."""
     from .store import Store
     with conn.cursor() as cur:
         cur.execute("SELECT links_built FROM memgres_meta")
@@ -73,6 +83,7 @@ def rebuild(conn, cfg, *, force: bool = False) -> int:
         last = rows[-1][0]
     with conn.transaction(), conn.cursor() as cur:
         cur.execute("UPDATE memgres_meta SET links_built = true")
+    conn.commit()
     _log.info("link index rebuilt over %d memories", scanned)
     return scanned
 
@@ -87,11 +98,43 @@ def maybe_backfill(cfg, connect) -> Optional[int]:
         _log.exception("link backfill could not connect; link graph may be empty")
         return None
     try:
-        return rebuild(conn, cfg)
+        scanned = rebuild(conn, cfg)
     except Exception:
         _log.exception("link backfill failed; link graph may be incomplete until "
                        "`memgres-relink` is run")
         return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _confirm_built(connect)
+    return scanned
+
+
+def _confirm_built(connect) -> None:
+    """Check from a SECOND connection that the backfill actually stuck.
+
+    Not paranoia — the thing this guards against has happened: `rebuild` reported
+    "rebuilt over N memories" while every row it wrote was rolled back by closing
+    the connection, and the server came up serving an empty link graph. The return
+    value cannot detect that; only another connection can, because a connection
+    always sees its own uncommitted work.
+    """
+    try:
+        conn = connect()
+    except Exception:
+        return                      # already logged upstream if it mattered
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT links_built FROM memgres_meta")
+            row = cur.fetchone()
+        if not (row and row[0]):
+            _log.error("link backfill did not persist — the link graph is EMPTY and "
+                       "`memory_links` will answer 'nothing points here' for every "
+                       "memory. Run `memgres-relink` to rebuild it.")
+    except Exception:
+        _log.exception("could not confirm the link backfill persisted")
     finally:
         try:
             conn.close()

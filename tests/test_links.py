@@ -574,3 +574,34 @@ def test_the_repair_stays_inside_the_namespace(monkeypatch, tenants):
     kept = s.get(b_tok, b_src.id, space="beta")
     assert kept.body == "see [[ops.deploy]]"          # untouched
     assert [r["op"] for r in s.history(b_tok, b_src.id, space="beta")] == ["create"]
+
+
+# ─── the backfill has to SURVIVE the process that ran it ─────────────────────
+def test_the_backfill_persists_after_the_server_starts_it(store):
+    """`maybe_backfill` opens its OWN connection and closes it when done. If the
+    work is not committed, closing rolls all of it back — and the server then
+    serves a link graph that is perfectly empty while the log says it rebuilt one.
+    That is the exact silence this backfill exists to prevent, and it shipped: our
+    live corpus had 0 edges and `links_built` false after every start.
+
+    Asserted from a SECOND connection on purpose. A connection always sees its own
+    uncommitted work, so checking on the same one — or letting a fixture commit
+    afterwards, which is what every other test here does — hides the bug
+    completely."""
+    from memgres.relink import maybe_backfill
+    store.write(body="the runbook", path="ops.deploy")
+    store.write(body="see [[ops.deploy]]", path="notes.a")
+    store._conn.commit()
+
+    with store._conn.cursor() as cur:                  # pretend it never ran
+        cur.execute("DELETE FROM memory_link")
+        cur.execute("UPDATE memgres_meta SET links_built = false")
+    store._conn.commit()
+
+    assert maybe_backfill(store.cfg, lambda: psycopg.connect(DSN)) == 2
+
+    with psycopg.connect(DSN) as check, check.cursor() as cur:
+        cur.execute("SELECT count(*) FROM memory_link")
+        assert cur.fetchone()[0] == 1                  # the edge is really there
+        cur.execute("SELECT links_built FROM memgres_meta")
+        assert cur.fetchone()[0] is True               # and it will not run again
