@@ -25,6 +25,7 @@ retrieval-by-id.
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
@@ -36,9 +37,11 @@ from .delimiters import write_warnings
 from .lines import parse_line_spec
 from .diffing import DiffConflict, apply_diff, byte_len, content_hash, make_diff
 from .embeddings import Embedder, get_embedder
-from .links import parse_links
+from .links import parse_links, rewrite_targets
 from .tags import check_tag_match, normalize_tags
 from .vector import make_backend
+
+_log = logging.getLogger("memgres.store")
 
 
 # The most rows any one call may return. Search and browse share it so a caller
@@ -869,9 +872,10 @@ class Store:
                 raise PathTaken(new_path, str(taken[0]))
 
         # a path change cascades to the whole subtree (keep ltree consistent)
+        cascaded: list = []
         if path_changed and cur_path is not None:
-            self._cascade_move(cur, ns, cur_path, new_path, id, author,
-                               source, reason)
+            cascaded = self._cascade_move(cur, ns, cur_path, new_path, id, author,
+                                          source, reason)
 
         cur.execute(
             f"""UPDATE memory SET body=%s, content_hash=%s, tags=%s, path=%s::ltree,
@@ -909,12 +913,24 @@ class Store:
                              title_before=cur_title if title_changed else None,
                              title_after=new_title if title_changed else None,
                              valid_at=valid_at)
+        if path_changed and cur_path is not None:
+            # Last, so every mover is already at its new address and carries its
+            # own history row: the repair is a consequence of the move and reads
+            # as one. A memory that links into its own subtree is repaired here
+            # too, which is why the result may describe THIS memory.
+            repaired = self._relink_referrers(
+                cur, ns, [(str(id), cur_path, new_path)] + cascaded, author, source)
+            if str(id) in repaired:
+                new_body, new_hash, new_seq = repaired[str(id)]
         return Memory(str(id), new_body, new_hash, new_tags, new_path, new_seq,
                       created_at, updated_at, expires_at, new_title, created=False)
 
     def _cascade_move(self, cur, ns, old_prefix: str, new_prefix: str,
-                      exclude_id, author, source, reason) -> None:
+                      exclude_id, author, source, reason) -> list:
         """Re-address every descendant when a node moves — and RECORD it.
+
+        Returns ``[(id, old_path, new_path), …]`` for what it moved, which the
+        caller needs to repair the bodies that still name those addresses.
 
         This used to be one bulk UPDATE with no history: a descendant's address
         changed with nothing in `history` or `blame` to say so, and afterwards
@@ -938,7 +954,7 @@ class Store:
             (ns, old_prefix, exclude_id))
         rows = cur.fetchall()
         if not rows:
-            return
+            return []
         # `path <@ old_prefix` matches the prefix itself or `prefix.<rest>`, so
         # swapping the prefix is the whole rule.
         moves = [(str(mid), old, new_prefix + old[len(old_prefix):], seq + 1, chash)
@@ -947,6 +963,7 @@ class Store:
             "UPDATE memory SET path=%s::ltree, seq=%s, updated_at=now() WHERE id=%s",
             [(after, seq, mid) for (mid, _b, after, seq, _c) in moves])
         self._append_move_history(cur, moves, author, source, reason)
+        return [(mid, before, after) for (mid, before, after, _s, _c) in moves]
 
     def _append_move_history(self, cur, moves, author, source, reason) -> None:
         """One `move` row per descendant, each chained onto ITS OWN last row.
@@ -979,6 +996,91 @@ class Store:
                    hash_version)
                VALUES (%s,%s,%s,%s,%s,%s,%s::ltree,%s::ltree,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             params)
+
+    def _relink_referrers(self, cur, ns: str, moves, author, source) -> dict:
+        """Repair every body that still names an address one of `moves` just left.
+
+        Why this is not cosmetic. `_sync_links` rebuilds a memory's edges FROM ITS
+        BODY on every write, so an edge pinned to an id outlives the target's move
+        only until the REFERRING memory is next edited — and then the stale text
+        wins, silently, in one of two ways: the vacated path is empty and the edge
+        degrades to dangling (a typo fix breaks navigation), or something else has
+        claimed that path and the edge binds to a DIFFERENT memory. A reader who
+        copies the address out of the body spreads the staleness into new memories
+        before either happens.
+
+        So the text has to be repaired, not just the edge: the body is the source
+        of truth for its own links, and fixing only the edge buys exactly one
+        write's worth of correctness.
+
+        Authorship is the person who moved the memory, under a `relink` op — not a
+        service identity. Someone did cause this, and attributing it to a ghost
+        would hide who, which is the opposite of what `blame` is for.
+
+        Retention is deliberately NOT renewed here: the window measures the
+        client's use of the data, and a repair made on their behalf is not use.
+
+        Returns ``{id: (body, content_hash, seq)}`` for what it rewrote — the
+        mover's own body can be among them (a memory that links into its own
+        subtree), and the caller is about to hand that memory back to its writer.
+        """
+        by_id = {mid: (old, new) for (mid, old, new) in moves}
+        if not by_id:
+            return {}
+        # Inbound edges, re-applying the namespace predicate rather than trusting
+        # that the binding rule scoped them (the same defence `links()` uses).
+        cur.execute(
+            "SELECT l.src_id::text, l.ord, l.dst_id::text FROM memory_link l "
+            "JOIN memory src ON src.id = l.src_id "
+            "WHERE l.dst_id = ANY(%s::uuid[]) AND src.namespace = %s "
+            "ORDER BY l.src_id",
+            (list(by_id), ns))
+        wanted: dict = {}
+        for src_id, ord_, dst_id in cur.fetchall():
+            wanted.setdefault(src_id, {})[ord_] = by_id[dst_id]
+        if not wanted:
+            return {}
+
+        cur.execute(
+            "SELECT id::text, body, content_hash, seq FROM memory "
+            "WHERE id = ANY(%s::uuid[]) ORDER BY id FOR UPDATE", (list(wanted),))
+        rewritten: dict = {}
+        for src_id, body, chash, seq in cur.fetchall():
+            links = {l.ord: l for l in parse_links(body or "")}
+            changes, moved = {}, []
+            for ord_, (old, new) in wanted[src_id].items():
+                l = links.get(ord_)
+                # The edge and the text disagreeing should be impossible — edges
+                # are re-derived from the body on every write. If it happens,
+                # leave the link alone: a repair that guesses which one was meant
+                # is worse than one that skips.
+                if l is None or l.scheme is not None or l.raw_target != old:
+                    _log.warning("relink: edge %s#%s says %r, body does not — "
+                                 "left as written", src_id, ord_, old)
+                    continue
+                changes[ord_] = new
+                moved.append(f"{old} → {new}")
+            new_body = rewrite_targets(body or "", changes)
+            if new_body == (body or ""):
+                continue                      # nothing to write, so write nothing
+            new_hash = content_hash(new_body)
+            new_seq = seq + 1
+            cur.execute(
+                "UPDATE memory SET body=%s, content_hash=%s, "
+                "    fts=to_tsvector(%s::regconfig, %s), seq=%s, updated_at=now(), "
+                "    embed_pending=(embed_pending OR %s) "
+                "WHERE id=%s",
+                (new_body, new_hash, self.cfg.fts_language, new_body, new_seq,
+                 self._vectors is not None, src_id))
+            self._sync_links(cur, ns, src_id, new_body)
+            reason = "relink: " + "; ".join(sorted(set(moved)))
+            self._append_history(src_id, new_seq, "relink",
+                                 make_diff(body or "", new_body), chash, new_hash,
+                                 None, None, None, None, source, reason[:500],
+                                 author)
+            self._index_now(src_id, new_body, ns, new_hash)
+            rewritten[src_id] = (new_body, new_hash, new_seq)
+        return rewritten
 
     def _append_history(self, memory_id, seq, op, diff, hash_before, hash_after,
                         path_before, path_after, tags_before, tags_after,

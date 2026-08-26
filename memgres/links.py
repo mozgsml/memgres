@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 # Stores other than this one that a memory may legitimately point at. Recorded as
 # edges so they are visible, never resolved — we do not own the address space.
@@ -65,12 +65,21 @@ _CODE_SPAN = re.compile(r"`[^`\n]*`")
 @dataclass
 class Link:
     """One parsed link. `target` is verbatim as written; `scheme` is None for an
-    ordinary path and the scheme name for a pointer at another store."""
+    ordinary path and the scheme name for a pointer at another store.
+
+    `start`/`end` are the link's half-open span in the ORIGINAL body — the whole
+    `[[…]]`, brackets included. They are what lets a rewriter replace one link
+    without touching the rest of the text, and in particular without touching a
+    `[[path]]` written inside backticks: the parser never saw it, so it has no
+    span, so a rewrite cannot reach it.
+    """
     raw_target: str
     label: Optional[str] = None
     anchor: Optional[str] = None
     scheme: Optional[str] = None
     ord: int = 0
+    start: int = 0
+    end: int = 0
 
 
 def _blank_code(body: str) -> str:
@@ -111,5 +120,42 @@ def parse_links(body: Optional[str]) -> List[Link]:
         out.append(Link(raw_target=target, label=label or None,
                         anchor=anchor or None,
                         scheme=None if kind is None else kind,
-                        ord=len(out)))
+                        ord=len(out), start=m.start(), end=m.end()))
+    return out
+
+
+def render(target: str, anchor: Optional[str] = None,
+           label: Optional[str] = None) -> str:
+    """The canonical text for a link. Inverse of the parse, in its normal form:
+    whitespace the author put inside the brackets is not preserved, because there
+    is nothing to preserve it for and a single spelling is easier to read."""
+    inner = target
+    if anchor:
+        inner += "#" + anchor
+    if label:
+        inner += "|" + label
+    return f"[[{inner}]]"
+
+
+def rewrite_targets(body: str, new_targets: Dict[int, str]) -> str:
+    """Point selected links somewhere else, leaving the rest of the body alone.
+
+    `new_targets` maps a link's `ord` — its index among the links this parser
+    RECOGNISES, which is exactly what the edge table stores — to the target it
+    should now carry. Anchor and label ride along unchanged: a rename moves the
+    address, not what the author called it or which section they meant.
+
+    Addressed by ord rather than by text on purpose. A body that links to the same
+    path twice has two edges, and only one of them may be the one to change; and a
+    body that mentions the old path in prose or in a code span must not be touched
+    at all. Substituting text would get both of those wrong.
+
+    Rewrites run back-to-front so each span is still valid when it is reached.
+    """
+    if not new_targets:
+        return body
+    links = [l for l in parse_links(body) if l.ord in new_targets]
+    out = body
+    for l in sorted(links, key=lambda l: l.start, reverse=True):
+        out = out[:l.start] + render(new_targets[l.ord], l.anchor, l.label) + out[l.end:]
     return out

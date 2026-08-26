@@ -11,7 +11,10 @@ The tests below split into three claims:
 * the parser recognises links and, just as importantly, LEAVES ALONE things that
   merely sit in double brackets — documentation of the syntax, URLs, prose;
 * an edge pins the target's id at write time, so it survives the target moving
-  and cannot be hijacked by something later claiming the vacated path;
+  and cannot be hijacked by something later claiming the vacated path — AND the
+  move repairs the bodies that name the old address, because edges are re-derived
+  from body text on every write and the pin alone would last only until the
+  referring memory was next edited;
 * a link across a tenant boundary does not exist — paths are not a global
   address space, and a backlink names a memory.
 """
@@ -202,6 +205,10 @@ def test_it_also_binds_when_a_memory_moves_onto_the_awaited_path(store):
 
 
 def test_an_edge_follows_its_target_when_it_moves(store):
+    """And the BODY is repaired to match. Leaving the old address written there
+    would be a delayed break, not a cosmetic one: edges are re-derived from the
+    body on every write, so the next edit to `src` — a typo fix — would rebuild
+    this edge from text that no longer resolves."""
     target = store.write(body="the runbook", path="ops.deploy")
     src = store.write(body="see [[ops.deploy]]", path="notes.a")
     store.move(None, target.id, "ops.deploy_v2")
@@ -209,7 +216,8 @@ def test_an_edge_follows_its_target_when_it_moves(store):
     [edge] = store.links(None, src.id)["out"]
     assert edge["resolved"] is True and edge["id"] == target.id
     assert edge["path"] == "ops.deploy_v2"       # where it lives NOW
-    assert edge["target"] == "ops.deploy"        # what the body still says
+    assert edge["target"] == "ops.deploy_v2"     # and what the body says
+    assert store.get(None, src.id).body == "see [[ops.deploy_v2]]"
 
 
 def test_a_new_memory_cannot_hijack_the_vacated_path(store):
@@ -385,3 +393,184 @@ def test_the_backfill_does_not_cross_namespaces(tenants):
 
     [edge] = s.links(a_tok, a_src.id)["out"]
     assert edge["resolved"] is False and edge["id"] != b_target.id
+
+
+# ─── a move repairs the bodies that still name the old address ───────────────
+#
+# Pinning the edge to an id is not enough on its own, and the gap is easy to miss:
+# `_sync_links` rebuilds a memory's edges FROM ITS BODY on every write, so the pin
+# lasts exactly until the REFERRING memory is next touched. After that the stale
+# text wins — silently, in one of two directions.
+
+def test_the_repair_survives_the_next_edit_of_the_referrer(store):
+    """Half one: the vacated path is empty, so a rebuild from stale text turns a
+    resolved edge into a dangling one. The edit that does it can be a typo fix."""
+    target = store.write(body="the runbook", path="ops.deploy")
+    src = store.write(body="see [[ops.deploy]]", path="notes.a")
+    store.move(None, target.id, "ops.deploy_v2")
+
+    store.write(id=src.id, body=store.get(None, src.id).body + "\nps: typo fixed")
+
+    [edge] = store.links(None, src.id)["out"]
+    assert edge["resolved"] is True and edge["id"] == target.id
+
+
+def test_a_later_occupant_cannot_capture_the_link_on_the_next_edit(store):
+    """Half two, and the worse one: something else has claimed the vacated path,
+    so the rebuild binds the edge to a DIFFERENT memory. Nothing is raised — the
+    link simply points somewhere else from then on."""
+    target = store.write(body="the runbook", path="ops.deploy")
+    src = store.write(body="see [[ops.deploy]]", path="notes.a")
+    store.move(None, target.id, "ops.deploy_v2")
+    impostor = store.write(body="something else", path="ops.deploy",
+                           if_moved="create")
+
+    store.write(id=src.id, body=store.get(None, src.id).body + "\nps: edited")
+
+    [edge] = store.links(None, src.id)["out"]
+    assert edge["id"] == target.id and edge["id"] != impostor.id
+
+
+def test_the_repair_keeps_the_label_and_the_anchor(store):
+    """A rename moves the address — not what the author called it, nor which
+    section they meant."""
+    target = store.write(body="the runbook", path="ops.deploy")
+    src = store.write(body="see [[ops.deploy#шаги|инструкция]]", path="notes.a")
+    store.move(None, target.id, "ops.deploy_v2")
+    assert store.get(None, src.id).body == "see [[ops.deploy_v2#шаги|инструкция]]"
+
+
+def test_the_repair_does_not_touch_a_link_written_in_backticks(store):
+    """Documentation that explains the syntax writes `[[path]]` in a code span.
+    The parser never scanned it, so it has no edge and no span — which is exactly
+    why the repair addresses links by ord instead of substituting text."""
+    target = store.write(body="the runbook", path="ops.deploy")
+    src = store.write(
+        body="live [[ops.deploy]], quoted `[[ops.deploy]]`, fenced:\n"
+             "```\n[[ops.deploy]]\n```",
+        path="notes.a")
+    store.move(None, target.id, "ops.deploy_v2")
+
+    after = store.get(None, src.id).body
+    assert "live [[ops.deploy_v2]]" in after
+    assert "quoted `[[ops.deploy]]`" in after
+    assert "```\n[[ops.deploy]]\n```" in after
+
+
+def test_only_the_links_that_pointed_at_the_mover_are_rewritten(store):
+    store.write(body="unrelated", path="ops.other")
+    target = store.write(body="the runbook", path="ops.deploy")
+    src = store.write(body="[[ops.deploy]] and [[ops.other]] and [[ops.deploy]]",
+                      path="notes.a")
+    store.move(None, target.id, "ops.deploy_v2")
+    assert store.get(None, src.id).body == (
+        "[[ops.deploy_v2]] and [[ops.other]] and [[ops.deploy_v2]]")
+
+
+def test_a_move_writes_nothing_to_memories_that_do_not_link_to_it(store):
+    """No phantom history: a memory nobody had to repair must come out of a move
+    byte-identical, with nothing appended to its chain."""
+    target = store.write(body="the runbook", path="ops.deploy")
+    bystander = store.write(body="unrelated, and [[ops.nothing]] is unwritten",
+                            path="notes.b")
+    before = store.get(None, bystander.id)
+
+    store.move(None, target.id, "ops.deploy_v2")
+
+    after = store.get(None, bystander.id)
+    assert (after.seq, after.content_hash) == (before.seq, before.content_hash)
+    assert [r["op"] for r in store.history(None, bystander.id)] == ["create"]
+
+
+def test_a_subtree_move_repairs_links_to_the_descendants_too(store):
+    """A descendant is re-addressed by the cascade exactly like the node itself,
+    so a link to one goes just as stale."""
+    parent = store.write(body="parent", path="ops.deploy")
+    child = store.write(body="child", path="ops.deploy.step1")
+    src = store.write(body="see [[ops.deploy.step1]]", path="notes.a")
+
+    store.move(None, parent.id, "ops.release")
+
+    assert store.get(None, src.id).body == "see [[ops.release.step1]]"
+    [edge] = store.links(None, src.id)["out"]
+    assert edge["resolved"] is True and edge["id"] == child.id
+
+
+def test_a_memory_linking_into_its_own_subtree_comes_back_repaired(store):
+    """The mover can be its own referrer, and it is the one memory the caller is
+    holding — returning it with the pre-repair body would hand back a body that
+    is not what the store now has."""
+    parent = store.write(body="root, see [[ops.deploy.step1]]", path="ops.deploy")
+    store.write(body="child", path="ops.deploy.step1")
+
+    moved = store.move(None, parent.id, "ops.release")
+
+    assert moved.body == "root, see [[ops.release.step1]]"
+    stored = store.get(None, parent.id)
+    assert (moved.body, moved.content_hash, moved.seq) == (
+        stored.body, stored.content_hash, stored.seq)
+
+
+def test_the_repair_is_recorded_as_relink_and_the_chain_still_verifies(store):
+    """The repair is a real change to a real memory: it appends a row, carries a
+    diff, and leaves the tamper-evident chain verifiable."""
+    target = store.write(body="the runbook", path="ops.deploy")
+    src = store.write(body="see [[ops.deploy]]", path="notes.a")
+
+    store.move(None, target.id, "ops.deploy_v2", reason="renamed for clarity")
+
+    rows = store.history(None, src.id)
+    assert [r["op"] for r in rows] == ["create", "relink"]
+    assert "ops.deploy → ops.deploy_v2" in rows[-1]["reason"]
+    assert rows[-1]["diff"]
+    assert store.verify_history(None, src.id) is True
+
+
+def test_the_repair_is_credited_to_whoever_moved_the_memory(monkeypatch):
+    """Authorship goes to the person whose move caused it, under a `relink` op —
+    not to a service identity. Someone did cause this, and crediting a ghost
+    hides who, which is the opposite of what blame is for."""
+    _clean_env(monkeypatch)
+    base = load()
+    setup = psycopg.connect(DSN, autocommit=True)
+    migrate(setup, base)
+    cfg = dataclasses.replace(base, key_mode="managed")
+    s = Store(cfg, conn=psycopg.connect(DSN))
+
+    uid_a = ident.create_user(setup, name="Alice")
+    uid_b = ident.create_user(setup, name="Bob")
+    nsid = ident.create_namespace(setup, uid_a, "shared")
+    ident.add_member(setup, nsid, uid_b, "write")
+    tok_a, _ = ident.issue_token(setup, uid_a, namespace_id=nsid, permission="write")
+    tok_b, tid_b = ident.issue_token(setup, uid_b, namespace_id=nsid,
+                                     permission="write")
+
+    target = s.write(tok_a, body="the runbook", path="ops.deploy", space_id=nsid)
+    src = s.write(tok_a, body="see [[ops.deploy]]", path="notes.a", space_id=nsid)
+
+    s.move(tok_b, target.id, "ops.deploy_v2", space_id=nsid)   # Bob moves it
+
+    last = s.history(tok_a, src.id, space_id=nsid)[-1]
+    assert last["op"] == "relink"
+    assert last["author_user_id"] == uid_b and last["author_token_id"] == tid_b
+    assert last["author_name"] == "Bob"
+    assert s.verify_history(tok_a, src.id, space_id=nsid) is True
+    s._conn.close()
+    setup.close()
+
+
+def test_the_repair_stays_inside_the_namespace(monkeypatch, tenants):
+    """Two tenants may both own `ops.deploy`. One moving theirs must not rewrite
+    a single character of the other's body."""
+    s, user = tenants
+    a_tok, _ = user("alice", "alpha")
+    b_tok, _ = user("bob", "beta")
+    a_target = s.write(a_tok, body="alice's runbook", path="ops.deploy", space="alpha")
+    s.write(b_tok, body="bob's runbook", path="ops.deploy", space="beta")
+    b_src = s.write(b_tok, body="see [[ops.deploy]]", path="notes.b", space="beta")
+
+    s.move(a_tok, a_target.id, "ops.deploy_v2", space="alpha")
+
+    kept = s.get(b_tok, b_src.id, space="beta")
+    assert kept.body == "see [[ops.deploy]]"          # untouched
+    assert [r["op"] for r in s.history(b_tok, b_src.id, space="beta")] == ["create"]
