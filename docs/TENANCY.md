@@ -416,9 +416,13 @@ durable credential created on the far side.
 
 Three things make it safe rather than merely convenient:
 
-- **The token is never an argument.** `memory_enroll` takes only the key; the
-  credential is read from the configuration the server is already running with.
-  An argument would put the secret straight back into the conversation.
+- **The token is never an argument.** `memory_enroll` takes only the key and
+  reads the credential exactly where authentication reads it: the request's
+  `Authorization` header on http, or `MEMGRES_TOKEN` for a stdio server the
+  client spawned itself. Both are the JOINER's own configuration — on a shared
+  box the server's environment belongs to the deployment, not to the person
+  arriving. An argument would put the secret straight back into the
+  conversation.
 - **The key is single-use, and says so afterwards.** That refusal is the entire
   theft-detection story: whoever holds a stolen key spends it, and its rightful
   owner finds it already redeemed. A stolen *token* gives no such signal.

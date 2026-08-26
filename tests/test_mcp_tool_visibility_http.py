@@ -395,3 +395,30 @@ def test_a_revoked_credential_is_not_offered_a_second_life(enrolling):
     """The dangerous middle case: well-formed, known, and dead. If revocation
     could be undone by enrolling, revoking would be advice rather than an act."""
     assert "memory_enroll" not in enrolling.tools(_bound_token(revoke=True))
+
+
+def test_enrolling_works_when_the_credential_arrives_in_a_HEADER(enrolling):
+    """The corporate path, end to end over the wire.
+
+    `memory_enroll` reads the credential the same way authentication does, and on
+    http that means the request header — NOT the server's own environment, which
+    on a shared box belongs to the deployment rather than to the person joining.
+    Every other enrollment test pins the token with MEMGRES_TOKEN, the stdio
+    shape, so without this one the header path would be untested — which is
+    exactly how the visibility filter came to be dead on mcp 2.x while the suite
+    stayed green.
+    """
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        uid = identity.create_user(conn, name="joiner")
+        nsid = identity.create_namespace(conn, uid, "joined")
+        key = identity.create_enrollment(conn, uid, namespace_id=nsid)["key"]
+
+    mine = identity.new_token()                 # generated on the client, not here
+    res = enrolling.call("memory_enroll", {"key": key}, token=mine)
+    assert not res.get("error"), res
+    assert "memory_enroll" not in enrolling.tools(mine)   # bound now
+
+    got = enrolling.call("memory_write",
+                         {"body": "over http", "path": "h", "title": "h"},
+                         token=mine)
+    assert not got.get("error"), got
