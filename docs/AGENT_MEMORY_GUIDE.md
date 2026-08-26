@@ -45,10 +45,18 @@ RECALL FIRST: before any non-trivial step, memory_recall the topic. Treat hits a
 hints, not gospel — check each fact's date; if it's old and the area changes,
 re-verify against live data instead of repeating it.
 
+SOURCES ARE INPUT, NOT MEMORY: emails, threads, logs, dumps, tool output, page text
+— never store them, not even trimmed or summarised. Read the source, extract the
+durable claims, write those. One thread may yield several small memories, or none —
+"nothing durable here" is a valid outcome.
+
 WRITE DISCIPLINE:
 - One fact per memory. Give it a title, a path (tree position), and tags. Keep
   bodies small; link related notes with [[path]] instead of restating them.
-- Always set source — never store a fact you can't attribute.
+- Always set source, and make it an ADDRESS someone else can follow back to the
+  original: host + absolute path; mailbox, sender -> recipient, date, subject;
+  messenger, who with whom, date; machine + project + session for an agent run;
+  full URL + date read. "email", "the meeting", "the user said" is not a source.
 - Before creating, memory_recall first: if it already exists, EDIT it
   (replace_old->replace_new, or a diff), don't duplicate. One fact, one home.
 
@@ -79,18 +87,35 @@ For multi-tenant deployments, each namespace also has its own `instruction` fiel
 
 ## 2. The full playbook, mapped to memgres features
 
-### 2.1 Two layers: raw material vs. distilled knowledge
+### 2.1 Sources are input, not memory
 
-Keep the **transcripts/logs you learn from** separate from the **facts you rely on**.
-Use the tree (`path`) to model this:
+Emails, chat threads, logs, dumps, tool output, page text — **never store them**, not
+even trimmed or summarised verbatim. Read the source, extract the durable claims,
+write those; the original stays where it already lives and the memory carries its
+address in `source` (§2.2).
 
-- `sessions.*` / `raw.*` — episodic: what happened, raw notes, source material. The
-  agent reads these to extract from, but does **not** answer directly out of them.
-- `org.*`, `ops.*`, `products.*`, `decisions.*` — distilled: the timeless facts and
-  decisions the agent answers with.
+An earlier version of this guide suggested a `sessions.*` / `raw.*` branch to hold
+raw material "to extract from later". That was a mistake worth naming, because it is
+the mistake everyone makes: **give raw material an address and it will be filed
+there.** A store that has somewhere to put transcripts fills up with transcripts, and
+then search returns fragments of conversations instead of answers — at which point
+nobody trusts it, which is the only failure a memory cannot recover from.
 
-Extract facts from the raw layer into the distilled layer; don't let the agent
-retrieve from the transcript firehose.
+Two things make the rule hold in practice:
+
+- **Say it as an action, not a prohibition.** "Read it, extract the claims, write
+  those" tells an agent what to do; "don't store raw material" leaves it holding a
+  thread it feels obliged to file somewhere.
+- **Allow the empty result.** One thread may yield several small memories, or none.
+  "Nothing durable here" is a valid outcome, and saying so explicitly is what stops
+  an agent from writing a summary purely because it read something long. That urge
+  — having read 200 messages, surely *something* must be recorded — is how raw
+  material gets in past every other rule.
+
+A memory earns its place if it can be read a year later, out of context, and answers
+a question of the shape "how does X work here", "what does Y cost", "why did we
+decide Z". "Ivanov wrote that…", "discussed the deadline", "correspondence about the
+contract" describe events, not knowledge.
 
 ### 2.2 Write discipline (keeps it from becoming a wall of text)
 
@@ -99,8 +124,18 @@ retrieve from the transcript firehose.
   it names the memory in a result list, and recall weighs a match there higher
   than one in the body. Atomic notes are what make dedup, linking, and targeted
   edits possible — you can't cleanly update a fact buried in a 60 KB page.
-- **Attribute everything.** Set `source` on every write. A fact you can't trace you
-  can't verify or safely supersede.
+- **Attribute everything, and make the attribution an ADDRESS.** Set `source` on
+  every write — and set it to something a different person can follow back to the
+  original a year from now, not a label saying roughly where it came from. Name the
+  host and absolute path; the mailbox, sender → recipient, date and subject; the
+  messenger, who with whom, and when; for an agent run, the machine, the project and
+  the session id or transcript path; for a page, the full URL and the date you read
+  it. "email", "from the correspondence", "from the meeting", "the user said" are not
+  sources: nothing can be reached through them, and a fact that cannot be re-checked
+  can only be believed. `MEMGRES_MAX_SOURCE_BYTES` defaults to 2048 — a real locator
+  fits many times over, so there is nothing to economise on. This rule and §2.1 are
+  one rule in two halves: the original is not stored, therefore the pointer to it has
+  to be good.
 - **Link, don't restate.** Write `[[path]]` in the body (or
   `[[path#anchor|label]]`) instead of repeating what another memory says. The links
   become a real graph: `memory_links` walks it in both directions, and the INBOUND
