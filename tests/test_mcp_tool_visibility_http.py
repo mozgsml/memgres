@@ -256,15 +256,23 @@ def test_a_garbage_token_gets_the_same_read_surface(managed):
 
 
 def test_hiding_is_not_how_a_tool_is_refused(managed):
-    """A hidden tool called anyway must fail on AUTHORIZATION. If it came back
-    "unknown tool", a rights problem would read as a broken server and the real
-    check would live in a display table."""
+    """A hidden tool called anyway must still FAIL, and must not come back as if
+    it did not exist. Hiding is a display economy; the refusal is the call path's
+    job, and if a rights problem surfaced as "unknown tool" it would read as a
+    broken server while the real check sat in a display table.
+
+    Only the failure and the absence of a not-found story are asserted. Whether
+    the reason survives into the client's view is the SDK's rendering, and newer
+    mcp releases replace a tool's exception with a generic "error executing
+    tool" — an argument for reading the server log, not for asserting wording
+    this project does not own."""
     srv, tok = managed
     res = srv.call("memory_write", {"body": "x", "path": "a.b", "title": "T"},
                    token=tok["reader"])
     text = json.dumps(res).lower()
-    assert "unknown tool" not in text
-    assert "permission" in text or "denied" in text or "read" in text
+    assert res["result"]["isError"] is True or res["result"].get("iserror") is True
+    for missing in ("unknown tool", "not found", "no such tool"):
+        assert missing not in text
 
 
 # ─── the other deployment shapes ─────────────────────────────────────────────
