@@ -23,6 +23,30 @@ along.
     point at other stores and are recorded but never resolved here.
   - Edges pin the target's `id` at write time, so a link survives its target
     moving and cannot be hijacked by something later claiming the vacated path.
+  - **And a move repairs the bodies that still name the old address.** The pin
+    alone was not enough, which is easy to miss: edges are re-derived from body
+    text on every write, so a pinned edge lasts only until the REFERRING memory
+    is next edited — and then the stale text wins, silently. Either the vacated
+    path is empty and a resolved edge degrades to dangling (the edit that does it
+    can be a typo fix), or something else has claimed that path and the edge
+    binds to a DIFFERENT memory. A reader copying the address out of the body
+    spreads it into new memories before either happens. So the text is repaired
+    too: the body is the source of truth for its own links, and fixing only the
+    edge buys one write's worth of correctness.
+    - Rewrites go by parsed span and link order, never by substituting text —
+      a body that links to the same path twice has two edges and may need only
+      one changed, and a body that writes `[[path]]` in backticks to document
+      the syntax must come out untouched. Label and anchor ride along unchanged.
+    - Recorded as a `relink` operation with a diff, authored by **whoever moved
+      the memory**, not by a service identity: someone did cause the change, and
+      crediting a ghost hides who. Retention is deliberately not renewed — the
+      window measures the client's use of their data, and a repair made on their
+      behalf is not use.
+    - A subtree move repairs links to the descendants too, and the mover may be
+      its own referrer (a memory linking into its own subtree), so `move` returns
+      the repaired body rather than one the store no longer has.
+    - Still open, and different in kind: `forget` leaves the text with nowhere to
+      point, so it cannot be repaired this way.
   - Unresolved is a real state, not an error: a link to something not yet
     written stands as `resolved: false` and binds itself when the target appears
     (or when a memory moves onto that path). A target later erased nulls the
@@ -38,6 +62,28 @@ along.
   corpus into an empty graph that answered "nothing points here" for every
   memory — a fact-shaped silence, which is the failure this release is mostly
   about.
+
+### Usage
+- **Every memory now records how often it surfaces in search and how often it is
+  read in full** (`recalled` / `gets`, with the time of each). Two counts rather
+  than one, because they answer different questions: surfacing says the memory is
+  findable — its words match what people ask; being fetched says it was worth
+  opening once found. Surfaced often but never opened is noise in every result
+  list it appears in; neither is a memory reachable only by already knowing it
+  exists, which is how 42 of this corpus's 97 memories sat.
+  - Kept in a separate `memory_usage` table, never on the `memory` row. Postgres
+    writes a new version of the whole row on every UPDATE and a memory row
+    carries its body, so counting a read there would rewrite kilobytes per read,
+    bloat the largest table in the schema and contend with real writes for the
+    same lock — and it would muddy `updated_at`, which means "the content
+    changed". For the same reason none of it enters the hash chain:
+    `verify_history` must not become a function of how often a memory was read.
+  - Counted for what came BACK from a search, not for what the ranking
+    considered; reads the store makes for itself are not counted. Best-effort, so
+    a statistic that cannot be written is never the reason a read fails.
+  - Visible where each is useful: `usage` on `memory_get`, `recalled`/`gets` per
+    row on `memory_list` — which is how a subtree nobody reads becomes visible.
+  - `MEMGRES_USAGE_COUNTERS=false` turns counting off (read-only replicas).
 
 ### Breaking
 - **`memory_find` is gone.** It searched titles and nothing else, while

@@ -100,7 +100,17 @@ retrieve from the transcript firehose.
   become a real graph: `memory_links` walks it in both directions, and the INBOUND
   half is the one that matters — before changing a fact, it tells you who is relying
   on it. A link to something not written yet is fine and deliberate: it stands as
-  `resolved: false` and binds itself when the target appears.
+  `resolved: false` and binds itself when the target appears. Moving a memory does
+  not break the links to it: the edges follow, and the bodies that name its old
+  address are rewritten to the new one (recorded as a `relink`, credited to
+  whoever moved it) — so what you read in a body is an address that still works,
+  and copying it out of one memory into another stays safe.
+- **Notice what is never used.** Each memory records how often it has surfaced in
+  a search (`recalled`) and how often it was opened (`gets`) — both on
+  `memory_list` rows, and as `usage` on `memory_get`. Surfaced often but never
+  opened means it is winning result slots it does not deserve: sharpen its title,
+  or fold it into whatever people actually open. Neither surfaced nor opened means
+  nobody can reach it, which is a linking and titling problem, not a storage one.
 - **Reuse the tag vocabulary.** `memory_tags` lists what is already in use;
   a label you invent that exists in another wording becomes a second, unrelated
   tag. Case and Unicode form are normalised for you — wording is not.
@@ -198,6 +208,10 @@ that make the discipline *stick* are **tool** features still on the roadmap:
 
 - **Semantic dedup-at-write** — flag/merge a near-duplicate on write instead of
   relying on the agent to `find` first.
+- **Erasing a target still strands the text.** A move repairs the bodies that
+  name the old address; `forget` cannot — there is no new address to point at, so
+  the link is left dangling and visible. Nothing yet offers to repair or remove
+  those.
 - **Staleness sweep** — `valid_at` records how far forward the evidence reaches
   (§2.4), but nothing yet SURFACES what has gone quiet: no review-by, no "show me
   facts whose evidence is older than N months". Recording is in, retrieval is not.
