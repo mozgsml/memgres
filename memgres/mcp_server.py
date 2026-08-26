@@ -1040,13 +1040,20 @@ def build_server(cfg: Optional[Config] = None):
 
         @mcp.tool()
         def memory_admin_decide_access(request_id: str, approve: bool = True,
+                                       expect_permission: Optional[str] = None,
                                        ctx: Context = None) -> dict:
             """Approve or deny a request to join. Approving adds them as a
             member at the permission they asked for — the same act as
-            `memory_admin_add_member`, reached from their side."""
+            `memory_admin_add_member`, reached from their side.
+
+            Pass `expect_permission` — the permission you SAW in
+            `memory_admin_list_requests`. If the request no longer asks for
+            that, the approval is refused instead of granting something you did
+            not agree to."""
             with pool.connection() as conn, conn.transaction():
                 admin.decide_access(conn, _principal(conn, _token(ctx)),
-                                    request_id=request_id, approve=approve)
+                                    request_id=request_id, approve=approve,
+                                    expect_permission=expect_permission)
             return {"request_id": request_id, "approved": approve}
 
         @mcp.tool()
@@ -1090,11 +1097,20 @@ def build_server(cfg: Optional[Config] = None):
             that never carries the secret at all; use this only when you have
             none, and then give it a short `expires_days` and rotate it once
             delivered."""
-            with pool.connection() as conn, conn.transaction():
-                return admin.issue_token(
-                    conn, _principal(conn, _token(ctx)), user_id=user_id,
-                    namespace_id=space_id, permission=permission, label=label,
-                    expires_days=expires_days, sink_dir=cfg.token_sink)
+            with pool.connection() as conn:
+                with conn.transaction():
+                    minted = admin.issue_token(
+                        conn, _principal(conn, _token(ctx)), user_id=user_id,
+                        namespace_id=space_id, permission=permission,
+                        label=label, expires_days=expires_days,
+                        defer_delivery=True)
+            # Committed. Only now is the secret written anywhere: a file naming
+            # a token that a rollback removed is worse than a failed call.
+            out = admin.deliver_secret(minted["secret"], minted["id"],
+                                       cfg.token_sink)
+            if minted.get("warning"):
+                out["warning"] = minted["warning"]
+            return out
 
         @mcp.tool()
         def memory_admin_create_enrollment(
@@ -1112,19 +1128,23 @@ def build_server(cfg: Optional[Config] = None):
             holds their credential. `permission` and `space_id` fix what the
             resulting token may do — redeeming cannot ask for more.
 
-            The KEY is still a credential while it lives (whoever redeems it
-            first gets the account), so hand it over the way you would a meeting
-            link and keep `expires_minutes` short — it defaults to 30, and takes
+            ⚠️ The KEY is still a credential while it lives — whoever redeems it
+            first gets the account, and no prior identity is needed to do it. If
+            this deployment sets a token sink, the reply carries only the path of
+            the file it was written to; otherwise the key comes back HERE, in a
+            conversation that is logged and summarized, so hand it over the way
+            you would a meeting link and keep `expires_minutes` short — it defaults to 30, and takes
             any value above zero when someone will not be at their desk today. A
             key works once; `memory_admin_list_enrollments` shows whether it has
             been used, which is how a stolen one is noticed."""
-            with pool.connection() as conn, conn.transaction():
-                out = admin.create_enrollment(
-                    conn, _principal(conn, _token(ctx)), user_id=user_id,
-                    namespace_id=space_id, permission=permission, label=label,
-                    expires_minutes=expires_minutes)
+            with pool.connection() as conn:
+                with conn.transaction():
+                    out = admin.create_enrollment(
+                        conn, _principal(conn, _token(ctx)), user_id=user_id,
+                        namespace_id=space_id, permission=permission,
+                        label=label, expires_minutes=expires_minutes)
             out["expires_at"] = out["expires_at"].isoformat()
-            return out
+            return admin.deliver_key(out, cfg.token_sink)
 
         @mcp.tool()
         def memory_admin_list_enrollments(user_id: Optional[str] = None,

@@ -44,22 +44,26 @@ def _read_or_create_token_file(path: str) -> Tuple[str, Optional[str]]:
     """Return ``(secret, generated_path)``. If the file has a token, read it
     (``generated_path`` None). If missing/empty, generate a fresh ``mgk_`` token,
     write it ``0600``, and return the path so the caller can log it."""
+    # O_NOFOLLOW on the READ as well: whoever can plant a symlink here would
+    # otherwise CHOOSE the deployment's bootstrap admin token by pointing this
+    # at a file they wrote. Reading through it is the more dangerous half.
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
             existing = f.read().strip()
     except FileNotFoundError:
         existing = ""
     except OSError as e:                                  # unreadable → fail loud
-        raise BootstrapError(f"cannot read MEMGRES_ADMIN_TOKEN_FILE {path!r}: {e}")
+        raise BootstrapError(
+            f"cannot read MEMGRES_ADMIN_TOKEN_FILE {path!r}: {e}"
+            + (" (a symlink is refused here on purpose)"
+               if os.path.islink(path) else ""))
     if existing:
         return existing, None
 
     secret = identity.new_token()
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(secret + "\n")
-        os.chmod(path, 0o600)            # tighten even if the file pre-existed
+        identity.write_private(path, secret + "\n")
     except OSError as e:
         raise BootstrapError(f"cannot write MEMGRES_ADMIN_TOKEN_FILE {path!r}: {e}")
     return secret, path

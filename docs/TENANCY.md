@@ -49,11 +49,15 @@ that governs the control plane:
 | role | can |
 |---|---|
 | `user` (default) | own namespaces; **share, un-share and hand over its own spaces**, approve requests to join them |
-| `user_manager` | + create users and (re)issue tokens — provisioning only, **no** cross-tenant data access |
+| `user_manager` | + create users and (re)issue tokens. Provisioning, not readership — but note it can issue a token FOR a plain user and act as them, so treat it as trusted staff, not as a limited operator |
 | `superadmin` | + full root: read/write **any** namespace, share any namespace, grant/revoke roles, switch accounts off |
 
-A `superadmin`'s data access is capped by its token ceiling like anyone's; a
-`user_manager` never gains implicit access to another tenant's memories.
+A `superadmin`'s data access is capped by its token ceiling like anyone's. A
+`user_manager` gains no *implicit* access to another tenant's memories — but it
+may issue that tenant a token and use it, which since sharing became a
+per-namespace act can leave a durable membership behind. The tier is a
+convenience boundary, not a containment one; where that matters, do not hand it
+out.
 
 ## Addressing a space
 
@@ -417,11 +421,20 @@ python3 -c "import secrets; print('mgk_' + secrets.token_urlsafe(32))"
 memory_enroll(key="mge_…")
 ```
 
-The server stores the token's **hash**, exactly as if it had minted it. Nobody
-else ever holds the credential — not you, not the transcript, not a mailbox, not
-a file on the server. It is the shape ssh keys, Tailscale pre-auth keys,
+The server stores the token's **hash**, exactly as if it had minted it. The
+TOKEN is never held by anyone else — not you, not the transcript, not a mailbox,
+not a file on the server. It is the shape ssh keys, Tailscale pre-auth keys,
 `kubeadm join` and Vault's AppRole all arrived at: a one-time grant to bind, a
 durable credential created on the far side.
+
+The KEY is a different object and must not be read as covered by that sentence:
+for as long as it lives it is a bearer credential, and whoever redeems it first
+gets the account it names — no prior identity is needed, since `/enroll` is the
+one route that does not resolve its caller. Where `MEMGRES_TOKEN_SINK` is set,
+keys are diverted to a file like every other secret; where it is not, the key
+comes back in the reply, so treat it the way you would a meeting link: short
+`expires_minutes`, an out-of-band channel, and `memory_admin_list_enrollments`
+to see whether it was spent by the person you gave it to.
 
 Three things make it safe rather than merely convenient:
 

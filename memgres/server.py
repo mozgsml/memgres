@@ -423,11 +423,16 @@ def create_app(cfg: Optional[Config] = None):
                 conn, identity.resolve(conn, cfg, tok), namespace_id=space_id))
 
     @app.post("/access-requests/{req_id}/approve")
-    def approve_access(req_id: str, tok: Optional[str] = Depends(token)):
-        with pool.connection() as conn:
+    def approve_access(req_id: str, expect_permission: Optional[str] = None,
+                       tok: Optional[str] = Depends(token)):
+        # `expect_permission` is what the approver saw when they decided; the
+        # grant is refused if the request has since changed. Not wrapped in a
+        # transaction before, which widened that window further.
+        with pool.connection() as conn, conn.transaction():
             _guard(lambda: admin.decide_access(
                 conn, identity.resolve(conn, cfg, tok),
-                request_id=req_id, approve=True))
+                request_id=req_id, approve=True,
+                expect_permission=expect_permission))
             return {"approved": req_id}
 
     @app.post("/access-requests/{req_id}/deny")
@@ -544,18 +549,25 @@ def create_app(cfg: Optional[Config] = None):
     @app.post("/admin/tokens", status_code=201)
     def admin_issue_token(req: NewToken, p=Depends(principal)):
         with pool.connection() as conn:
-            return _guard(lambda: admin.issue_token(
+            minted = _guard(lambda: admin.issue_token(
                 conn, p, user_id=req.user_id, namespace_id=req.namespace_id,
                 permission=req.permission, label=req.label,
-                expires_days=req.expires_days, sink_dir=cfg.token_sink))
+                expires_days=req.expires_days, defer_delivery=True))
+        # Outside the connection block, so the secret reaches disk only after
+        # the token row is committed (see admin.issue_token's defer_delivery).
+        out = admin.deliver_secret(minted["secret"], minted["id"], cfg.token_sink)
+        if minted.get("warning"):
+            out["warning"] = minted["warning"]
+        return out
 
     @app.post("/admin/enrollments", status_code=201)
     def admin_create_enrollment(req: NewEnrollment, p=Depends(principal)):
         with pool.connection() as conn:
-            return _guard(lambda: admin.create_enrollment(
+            out = _guard(lambda: admin.create_enrollment(
                 conn, p, user_id=req.user_id, namespace_id=req.namespace_id,
                 permission=req.permission, label=req.label,
                 expires_minutes=req.expires_minutes))
+        return admin.deliver_key(out, cfg.token_sink)
 
     @app.get("/admin/enrollments")
     def admin_list_enrollments(user_id: Optional[str] = None,

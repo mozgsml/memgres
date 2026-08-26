@@ -27,11 +27,14 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import hmac
+import logging
 import os
 import re
 import secrets
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
+
+logger = logging.getLogger("memgres.identity")
 
 # ─── token format: mgk_ + 43 url-safe chars (256-bit) ────────────────────────
 TOKEN_RE = re.compile(r"^mgk_[A-Za-z0-9_-]{43}$")
@@ -205,7 +208,22 @@ def resolve(conn, cfg, secret: Optional[str], *, touch: bool = True) -> Principa
                     # an account that is off has to be off for every token it
                     # holds and every one it could still be issued, and the only
                     # place all of those meet is authentication.
-                    raise AuthError("this account is disabled")
+                    #
+                    # One exception, and it is the recovery path: bootstrap
+                    # stores the env secret AS A TOKEN of the seeded admin, so
+                    # this lookup matches it first and disabling that account
+                    # would take the operator's out-of-band way back in with it.
+                    # Two ordinary control-plane calls could then leave a
+                    # deployment nobody can enter. The env secret keeps working,
+                    # as the anonymous root it is when no account holds it.
+                    if not (cfg.admin_token
+                            and hmac.compare_digest(secret, cfg.admin_token)):
+                        raise AuthError("this account is disabled")
+                    logger.warning(
+                        "memgres: the bootstrap admin account is disabled; the "
+                        "env break-glass token authenticated as anonymous root")
+                    return Principal(user_id=None, permission="admin",
+                                     scope_namespace_id=None, is_admin=True)
                 if touch:
                     cur.execute("UPDATE token SET last_used_at=now() WHERE id=%s",
                                 (tid,))
@@ -779,19 +797,41 @@ def list_users(conn, *, role: Optional[str] = None, limit: Optional[int] = None,
 
 
 # ─── service roles (control plane; see SERVICE_ROLES) ────────────────────────
+# Every anti-lockout count asks the same question — "is anyone left who can
+# undo this?" — and a disabled account is not anyone. Two of these used to count
+# disabled admins as present, which let the guards be walked around: disable the
+# second superadmin (allowed, two are active), then DEMOTE the first through
+# `revoke_superadmin`, which saw two superadmins and agreed. End state: zero
+# active superadmins and recovery by hand-editing the database.
+_ACTIVE_ADMIN = "role IN ('user_manager','superadmin') AND disabled_at IS NULL"
+_ACTIVE_SUPERADMIN = "role='superadmin' AND disabled_at IS NULL"
+
+
 def count_service_admins(conn) -> int:
-    """How many users hold an admin role (user_manager or superadmin). Zero ⇒ a
-    fresh install with no control plane — the trigger for bootstrap seeding."""
+    """How many users hold an admin role AND can still use it. Zero ⇒ nobody is
+    running the control plane — the trigger for bootstrap seeding, which is
+    exactly what should happen when the last admin has been switched off."""
     with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM app_user WHERE role IN "
-                    "('user_manager','superadmin')")
+        cur.execute(f"SELECT count(*) FROM app_user WHERE {_ACTIVE_ADMIN}")
         return int(cur.fetchone()[0])
 
 
 def count_superadmins(conn) -> int:
+    """Active superadmins. See `_ACTIVE_ADMIN` for why `disabled_at` matters."""
     with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM app_user WHERE role='superadmin'")
+        cur.execute(f"SELECT count(*) FROM app_user WHERE {_ACTIVE_SUPERADMIN}")
         return int(cur.fetchone()[0])
+
+
+def _lock_admin_rows(cur) -> None:
+    """Serialize the anti-lockout guards against each other.
+
+    Both `set_disabled` and `revoke_superadmin` read a count and then write.
+    Two sessions removing the last two superadmins each saw two, and both were
+    allowed. Locking the admin rows first makes the second one read the first
+    one's result instead of the state it started from.
+    """
+    cur.execute(f"SELECT id FROM app_user WHERE {_ACTIVE_ADMIN} FOR UPDATE")
 
 
 def get_role(conn, user_id: str) -> Optional[str]:
@@ -828,9 +868,10 @@ def revoke_superadmin(conn, user_id: str, *, demote_to: str = "user") -> None:
             raise SpaceNotFound(f"no such user {user_id}")
         if row[0] != "superadmin":
             return                        # nothing to revoke
-        cur.execute("SELECT count(*) FROM app_user WHERE role='superadmin'")
+        _lock_admin_rows(cur)
+        cur.execute(f"SELECT count(*) FROM app_user WHERE {_ACTIVE_SUPERADMIN}")
         if int(cur.fetchone()[0]) <= 1:
-            raise AuthError("cannot revoke the last superadmin")
+            raise AuthError("cannot revoke the last active superadmin")
         cur.execute("UPDATE app_user SET role=%s WHERE id=%s", (demote_to, user_id))
 
 
@@ -853,8 +894,8 @@ def set_disabled(conn, user_id: str, disabled: bool) -> dict:
             return {"user_id": str(user_id), "disabled": bool(disabled),
                     "unchanged": True}
         if disabled and role == "superadmin":
-            cur.execute("SELECT count(*) FROM app_user WHERE role='superadmin' "
-                        "AND disabled_at IS NULL")
+            _lock_admin_rows(cur)
+            cur.execute(f"SELECT count(*) FROM app_user WHERE {_ACTIVE_SUPERADMIN}")
             if int(cur.fetchone()[0]) <= 1:
                 raise AuthError("cannot disable the last active superadmin")
         cur.execute("UPDATE app_user SET disabled_at = %s WHERE id=%s",
@@ -1139,8 +1180,28 @@ def transfer_namespace(conn, namespace_id: str, new_owner_user_id: str, *,
         # The receiving account has its own names and aliases, and (owner, name)
         # is unique: without this the transfer dies on a constraint violation
         # rather than on an explanation.
-        _require_name_free(cur, str(new_owner_user_id), name,
-                           except_namespace_id=namespace_id)
+        #
+        # The message deliberately does NOT say which of theirs it collides
+        # with. Quoting the target's inventory made this a free, repeatable
+        # probe of another tenant's namespace names — the check runs before the
+        # UPDATE, so a positive costs the prober nothing.
+        try:
+            _require_name_free(cur, str(new_owner_user_id), name,
+                               except_namespace_id=namespace_id)
+        except SpaceAmbiguous:
+            raise SpaceAmbiguous(
+                "the receiving account cannot hold a namespace by this name — "
+                "rename it first, then transfer") from None
+        # The per-account cap is enforced where namespaces are CREATED; a
+        # transfer is the other way one arrives. Without this an account could
+        # mint its 50, push them onto someone else, and repeat — leaving a
+        # victim owning namespaces they never asked for and cannot delete.
+        cur.execute("SELECT count(*) FROM namespace WHERE owner_user_id=%s",
+                    (_as_uuid(new_owner_user_id),))
+        if cur.fetchone()[0] >= MAX_NAMESPACES_PER_USER:
+            raise SpaceAmbiguous(
+                f"the receiving account already owns {MAX_NAMESPACES_PER_USER} "
+                "namespaces, which is the cap")
         cur.execute("DELETE FROM namespace_member WHERE namespace_id=%s AND "
                     "user_id=%s", (_as_uuid(namespace_id), _as_uuid(new_owner_user_id)))
         cur.execute("UPDATE namespace SET owner_user_id=%s WHERE id=%s",
@@ -1258,8 +1319,9 @@ def issue_token(conn, user_id: str, *, namespace_id: Optional[str] = None,
         return secret, str(cur.fetchone()[0])
 
 
-def stash_secret(sink_dir: str, token_id: str, secret: str) -> str:
-    """Write a freshly minted secret to ``<sink_dir>/<token_id>.token`` (0600)
+def stash_secret(sink_dir: str, token_id: str, secret: str,
+                 *, suffix: str = ".token") -> str:
+    """Write a freshly minted secret to ``<sink_dir>/<token_id><suffix>`` (0600)
     and return the path.
 
     The out-of-band delivery channel for a deployment whose callers are agents.
@@ -1271,13 +1333,55 @@ def stash_secret(sink_dir: str, token_id: str, secret: str) -> str:
     The directory is created 0700 if missing, and the file is opened with
     ``O_CREAT`` at 0600 so the secret is never briefly world-readable.
     """
-    os.makedirs(sink_dir, mode=0o700, exist_ok=True)
-    path = os.path.join(sink_dir, f"{token_id}.token")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(secret + "\n")
-    os.chmod(path, 0o600)               # tighten even if the file pre-existed
+    _make_private_dir(sink_dir)
+    path = os.path.join(sink_dir, f"{token_id}{suffix}")
+    write_private(path, secret + "\n")
     return path
+
+
+def _make_private_dir(path: str) -> None:
+    """Create `path` (and its parents) 0700, and tighten it if it already exists.
+
+    `os.makedirs(mode=…)` applies the mode to the LEAF only, and not at all to a
+    directory that is already there — so a sink an operator made by hand at 0755
+    stayed 0755, and every intermediate directory was created 0775. The
+    docstring above used to promise otherwise, which is the worse half: an
+    operator who read it believed the secrets were private.
+    """
+    parts = []
+    head = os.path.abspath(path)
+    while head and not os.path.isdir(head):
+        head, tail = os.path.split(head)
+        parts.append(os.path.join(head, tail))
+    for d in reversed(parts):
+        os.mkdir(d, 0o700)
+    if os.path.isdir(path) and not os.path.islink(path):
+        os.chmod(path, 0o700)
+
+
+def write_private(path: str, text: str) -> None:
+    """Write `text` to `path` as a fresh 0600 file, refusing to follow a symlink.
+
+    Three defects this closes, all measured:
+
+    * without ``O_NOFOLLOW`` the write follows a symlink, so anyone who can
+      plant one where a secret is about to land redirects it into a file they
+      own — proven end to end with the provisioning CLI;
+    * without ``O_EXCL`` (and the unlink before it), ``O_CREAT``'s mode is
+      IGNORED for a file that already exists, so the secret sat in a 0644 file
+      for the duration of the write and only became 0600 afterwards;
+    * a partially written secret is never left behind, because the target is
+      removed and recreated rather than truncated in place.
+    """
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except IsADirectoryError:
+        raise ValueError(f"{path} is a directory") from None
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
 
 
 # ─── enrollment: bind a token the client generated itself ────────────────────
@@ -1381,6 +1485,15 @@ def redeem_enrollment(conn, key: str, secret: str) -> dict:
         if cur.fetchone() is not None:
             raise AuthError("that credential is already known to this server — "
                             "generate a fresh one")
+        # An offboarded account still had usable keys in flight: the binding
+        # succeeded, the key was spent, the reply said "bound" — and the token
+        # was refused at the first call. No access was gained, but the answer
+        # was a lie and the key was gone. Refuse while it still costs nothing.
+        cur.execute("SELECT 1 FROM app_user WHERE id=%s AND disabled_at IS NOT NULL",
+                    (uid,))
+        if cur.fetchone() is not None:
+            raise AuthError("that account is disabled — ask whoever issued this "
+                            "key to re-enable it first")
         tid = register_token(conn, str(uid), secret, namespace_id=
                              str(nsid) if nsid else None,
                              permission=perm, label=label or "enrolled")
@@ -1391,19 +1504,31 @@ def redeem_enrollment(conn, key: str, secret: str) -> dict:
             "enrollment_id": str(eid)}
 
 
-def list_enrollments(conn, *, user_id: Optional[str] = None) -> List[dict]:
-    """Pending and spent keys — metadata only, never the key itself."""
+def list_enrollments(conn, *, user_id: Optional[str] = None,
+                     plain_users_only: bool = False) -> List[dict]:
+    """Pending and spent keys — metadata only, never the key itself.
+
+    `plain_users_only` hides keys belonging to admin-role accounts, which is
+    what the provisioning tier is allowed to see (see `admin.list_enrollments`).
+    """
     # `expired` is computed by the DATABASE: the key's clock and the reader's
     # are not the same clock, and a listing that disagreed with what redeeming
     # does would be worse than no listing.
-    sql = ("SELECT id, user_id, namespace_id, permission, label, created_by, "
-           "created_at, expires_at, used_at, used_token_id, revoked_at, "
-           "expires_at <= now() AS expired FROM enrollment_key")
+    sql = ("SELECT k.id, k.user_id, k.namespace_id, k.permission, k.label, "
+           "k.created_by, k.created_at, k.expires_at, k.used_at, "
+           "k.used_token_id, k.revoked_at, k.expires_at <= now() AS expired "
+           "FROM enrollment_key k")
     args: list = []
+    where = []
     if user_id is not None:
-        sql += " WHERE user_id=%s"
+        where.append("k.user_id=%s")
         args.append(user_id)
-    sql += " ORDER BY created_at DESC, id"
+    if plain_users_only:
+        sql += " JOIN app_user u ON u.id = k.user_id"
+        where.append("u.role = 'user'")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY k.created_at DESC, k.id"
     with conn.cursor() as cur:
         cur.execute(sql, args)
         cols = [c.name for c in cur.description]
@@ -1578,14 +1703,42 @@ def request_access(conn, requester_user_id: str, namespace_id: str,
                 raise ValueError(
                     f"you already have {MAX_PENDING_REQUESTS_PER_USER} requests "
                     "waiting to be decided, which is the cap")
+        # 🔴 A PENDING request may be LOWERED but never RAISED. It used to be
+        # freely rewritable, so a requester could file `read`, let the owner see
+        # `read` in `list_requests`, and raise it to `admin` before — or
+        # during — the approval: approval grants what the row says when it is
+        # read, so the admin authorized one thing and granted another. Measured
+        # working both across the natural gap and inside the approver's own
+        # transaction, since READ COMMITTED gives each statement its own
+        # snapshot.
+        #
+        # Lowering stays allowed because it cannot be an over-grant, and because
+        # a caller at the cap has no other way to withdraw an `admin` ask (an
+        # amendment adds no row, so the cap does not apply to it). A DECIDED
+        # request may be re-opened at any level: that is a fresh decision the
+        # owner makes with the value in front of them.
+        rank = "array_position(ARRAY['read','write','admin'], %s)"
         cur.execute(
             "INSERT INTO access_request (requester_user_id, namespace_id, "
             "requested_permission) VALUES (%s, %s, %s) "
             "ON CONFLICT (requester_user_id, namespace_id) DO UPDATE "
             "SET requested_permission=EXCLUDED.requested_permission, "
-            "    status='pending', decided_at=NULL RETURNING id",
+            "    status='pending', decided_at=NULL "
+            "WHERE access_request.status <> 'pending' "
+            f"   OR {rank % 'EXCLUDED.requested_permission'} < "
+            f"      {rank % 'access_request.requested_permission'} "
+            "RETURNING id, requested_permission",
             (requester_user_id, namespace_id, permission))
-        return str(cur.fetchone()[0])
+        row = cur.fetchone()
+        if row is not None:
+            return str(row[0])
+        # The conflicting row was pending and at least as strong: it stands, and
+        # the caller is told which permission is actually on the table.
+        cur.execute("SELECT id, requested_permission FROM access_request "
+                    "WHERE requester_user_id=%s AND namespace_id=%s",
+                    (requester_user_id, namespace_id))
+        row = cur.fetchone()
+        return str(row[0])
 
 
 def list_requests(conn, namespace_id: str, *, pending_only: bool = True) -> List[dict]:
@@ -1607,16 +1760,30 @@ def list_requests(conn, namespace_id: str, *, pending_only: bool = True) -> List
         return out
 
 
-def approve_request(conn, request_id: str) -> None:
-    """Grant the requested membership and close the request."""
+def approve_request(conn, request_id: str, *,
+                    expect_permission: Optional[str] = None) -> None:
+    """Grant the requested membership and close the request.
+
+    `expect_permission` is what the approver SAW when they decided. Supplying it
+    turns "the request changed under me" from a silent over-grant into a refusal.
+    """
     with conn.cursor() as cur:
+        # FOR UPDATE so the row cannot change between the authorization above
+        # and the grant below. Belt to the braces in `request_access`: that stops
+        # a pending request being amended at all, this stops any future writer
+        # from reintroducing the race.
         cur.execute("SELECT requester_user_id, namespace_id, requested_permission "
-                    "FROM access_request WHERE id=%s AND status='pending'",
+                    "FROM access_request WHERE id=%s AND status='pending' "
+                    "FOR UPDATE",
                     (request_id,))
         row = cur.fetchone()
         if row is None:
             raise SpaceNotFound(f"no pending request {request_id}")
         requester, nsid, perm = row
+        if expect_permission is not None and perm != expect_permission:
+            raise AuthError(
+                f"this request now asks for '{perm}', not '{expect_permission}' "
+                "— look at it again before approving")
     add_member(conn, str(nsid), str(requester), perm)
     with conn.cursor() as cur:
         cur.execute("UPDATE access_request SET status='approved', decided_at=now() "

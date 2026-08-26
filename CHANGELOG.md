@@ -5,6 +5,81 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.11.0] — 2026-08-26
+
+Two adversarial reviews of the 0.9.0/0.10.0 waves — one on authorization, one on
+secrets and disclosure. The loosening itself held: no path was found by which a
+`user` gains authority it was not granted, or a `user_manager` reaches
+superadmin-equivalent power. Everything below is what the reviews DID find, each
+with a regression test that fails when the fix is removed.
+
+### Fixed — authorization
+- **An approval could grant more than the approver agreed to.** A requester
+  filed `read`, let the owner see `read` in `list_requests`, then raised the
+  same pending request to `admin` before — or during — the decision; approval
+  read the row at grant time. A pending request may now be **lowered but never
+  raised**, `approve_request` reads it `FOR UPDATE`, and `decide_access` takes
+  `expect_permission` — what the approver actually saw — and refuses if it no
+  longer matches.
+- **The two anti-lockout guards disagreed about what an admin is.**
+  `set_disabled` counted active superadmins; `revoke_superadmin` counted them
+  all. Disable the second, demote the first, and a deployment had zero active
+  superadmins and no way back except editing the database. All three counters
+  (`count_service_admins`, `count_superadmins`, and the guards) now count
+  ACTIVE admins, under a row lock so two concurrent sessions cannot both pass.
+- **Disabling the bootstrap account killed the env break-glass token**, because
+  bootstrap stores it as an ordinary token of that account and the row matches
+  before the env comparison. It now falls through to the anonymous root it is
+  when no live account holds it, with a warning in the log.
+- **A transfer could push a victim past the namespace cap** (mint 50, push,
+  repeat — and there is no `delete_namespace` to undo it), and a
+  **namespace-scoped token could give that namespace away**: a pin says "work in
+  here", not "dispose of this".
+- **Renaming is now owner-only.** An admin member holds authority over the
+  contents; renaming breaks every by-name call the owner and every other member
+  makes.
+- **A read-only credential could ask for `admin`** in an access request. The ask
+  is clamped by the ceiling of the credential making it, and the receipt reports
+  what is actually pending rather than agreeing with what was asked.
+- **An enrollment key could bind to a disabled account** — the key was spent,
+  the reply said "bound", and the token was refused at the first call.
+
+### Fixed — secrets and disclosure
+- **Enrollment keys now obey `MEMGRES_TOKEN_SINK`.** The 0.9.0 wave took the
+  token out of the reply and left the key in it, and a key is a bearer
+  credential that grants the account to whoever redeems it first. The docs
+  claimed "nobody else ever holds the credential", which was true of the token
+  and false of the key; both are fixed.
+- **`memgres-provision --enroll` printed the key to stdout**, ignoring `--out`
+  and the sink, and without the warning the token path emits.
+- **Secret writes no longer follow symlinks** (`O_NOFOLLOW`/`O_EXCL` plus an
+  unlink, in the sink, the CLI's `--out`, and bootstrap's read-or-create — where
+  reading through a planted symlink let an attacker CHOOSE the bootstrap token).
+- **A secret is no longer briefly world-readable**: `O_CREAT`'s mode is ignored
+  for an existing file, so the bytes landed in a 0644 file and the `chmod`
+  arrived after them. Sink directories and their parents are now created and
+  tightened to 0700 rather than left as found.
+- **A minted secret reaches disk only after its token row is committed** — the
+  admin doors wrote the file inside the transaction, so a rollback left a file
+  naming a token that never existed.
+- **`list_enrollments` without a target skipped the plain-user guard**, letting
+  a `user_manager` enumerate the credential timeline of the accounts above it.
+- **A transfer no longer quotes the recipient's inventory** when a name
+  collides. The check runs before the write, so a positive answer was free and
+  repeatable: a dictionary attack on another tenant's namespace names.
+- **`decide_access` answers "no such request" identically** whether the request
+  does not exist or is one you may not decide.
+
+### Known and deliberately not fixed here
+- A transfer still needs no CONSENT from the recipient, so an unsolicited
+  namespace (with an attacker-authored `instruction`) can be pushed onto
+  someone, and the same is true of an unsolicited share. Closing it properly
+  means invitations — an offer the recipient accepts — which is a design change,
+  not a patch.
+- `tools/list` still tells an unauthenticated prober whether a `mgk_` value it
+  already holds is registered here. Distinguishing that is what makes the
+  enrollment surface possible at all.
+
 ## [0.10.0] — 2026-08-26
 
 ### Added

@@ -371,7 +371,11 @@ def test_request_access_does_not_reveal_which_uuids_are_namespaces(env):
 
     real = admin.request_access(setup, p, namespace_id=hidden)
     fake = admin.request_access(setup, p, namespace_id=str(uuid.uuid4()))
-    assert real == fake == {"status": "submitted"}
+    # Identical answers is the property; the receipt also reports which
+    # permission is actually pending (a held request may be lowered but not
+    # raised), and that value comes from the CALLER's own request, never from
+    # the namespace — so it is the same in both cases too.
+    assert real == fake == {"status": "submitted", "permission": "read"}
 
     # the request against the namespace that exists was in fact recorded…
     assert len(ident.list_requests(setup, hidden)) == 1
@@ -572,9 +576,9 @@ def test_a_request_for_a_nonexistent_namespace_is_recorded_like_any_other(env):
 
     ghost = str(uuid.uuid4())
     assert admin.request_access(setup, p, namespace_id=hidden) == {
-        "status": "submitted"}
+        "status": "submitted", "permission": "read"}
     assert admin.request_access(setup, p, namespace_id=ghost) == {
-        "status": "submitted"}
+        "status": "submitted", "permission": "read"}
 
     with setup.cursor() as cur:
         cur.execute("SELECT namespace_id::text FROM access_request "

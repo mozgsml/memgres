@@ -87,22 +87,25 @@ def _namespace(conn, args, uid: str) -> str | None:
     return nsid
 
 
-def _deliver(secret: str, tid: str, out: str | None, sink: str) -> None:
-    """Put the secret where the operator asked, and say only where that was."""
+def _deliver(secret: str, tid: str, out: str | None, sink: str,
+             *, kind: str = "token") -> None:
+    """Put the secret where the operator asked, and say only where that was.
+
+    `kind` is what to call it in the output — an enrollment key travels through
+    exactly this path, because it is a bearer credential for as long as it lives
+    and an operator who set a sink meant all of them.
+    """
     if out:
-        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(secret + "\n")
-        os.chmod(out, 0o600)
-        print(f"token     {tid}  → {out}")
+        identity.write_private(out, secret + "\n")
+        print(f"{kind:9} {tid}  → {out}")
         return
     if sink:
-        print(f"token     {tid}  → {identity.stash_secret(sink, tid, secret)}")
+        print(f"{kind:9} {tid}  → {identity.stash_secret(sink, tid, secret)}")
         return
-    print("memgres: no --out and no MEMGRES_TOKEN_SINK — printing the secret to "
+    print(f"memgres: no --out and no MEMGRES_TOKEN_SINK — printing the {kind} to "
           "stdout, where your shell history and your terminal scrollback will "
           "keep it.", file=sys.stderr)
-    print(f"token     {tid}")
+    print(f"{kind:9} {tid}")
     print(secret)
 
 
@@ -174,8 +177,15 @@ def main(argv=None) -> None:  # pragma: no cover - thin entrypoint
                            else {"expires_minutes": args.enroll_minutes}))
                     # The key is printed: unlike a token it is single-use and
                     # dies within the hour, and it has to reach a human somehow.
-                    print(f"key       {out['id']}  expires {out['expires_at']:%Y-%m-%d %H:%M %Z}")
-                    print(out["key"])
+                    print(f"key       {out['id']}  expires "
+                          f"{out['expires_at']:%Y-%m-%d %H:%M %Z}")
+                    # Through the SAME delivery as a token. It used to print the
+                    # key regardless — ignoring --out, ignoring the sink, and
+                    # without even the stderr warning the token path emits —
+                    # while an operator who configured a sink believed every
+                    # credential was being diverted to it.
+                    _deliver(out["key"], out["id"], args.out, cfg.token_sink,
+                             kind="key")
                     print("\nGive that key to its owner. They run:\n"
                           "  python3 -c \"import secrets; print('mgk_' + "
                           "secrets.token_urlsafe(32))\"\n"

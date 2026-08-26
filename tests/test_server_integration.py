@@ -294,7 +294,10 @@ def test_admin_provisioning_and_request_access(monkeypatch):
         # distinguishes an unreachable namespace from one that doesn't exist.
         r = client.post(f"/spaces/{ns}/access-requests", json={"permission": "read"},
                         headers=hj)
-        assert r.status_code == 202 and r.json() == {"status": "submitted"}
+        # …and `permission` — what is actually pending, which is the caller's
+        # own ask clamped by their ceiling, never anything about the namespace.
+        assert r.status_code == 202 and r.json() == {"status": "submitted",
+                                                     "permission": "read"}
         pending = client.get(f"/spaces/{ns}/access-requests", headers=ho).json()
         assert len(pending) == 1
         rid = pending[0]["id"]                  # the id lives with the decider

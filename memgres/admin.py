@@ -362,7 +362,14 @@ def edit_namespace(conn, p: Principal, *, namespace_id: str,
     the instruction agents read to choose a namespace could not be fixed through
     any door at all.
     """
-    require_namespace_admin(conn, p, namespace_id)
+    # Description and instruction are administration; the NAME is closer to
+    # disposal — renaming out from under an owner breaks every by-name call they
+    # and every member make, and an admin member was given authority over the
+    # contents, not over how the namespace is addressed.
+    if name is not None:
+        require_namespace_owner(conn, p, namespace_id)
+    else:
+        require_namespace_admin(conn, p, namespace_id)
     identity.edit_namespace(conn, namespace_id, description=description,
                             instruction=instruction, name=name)
     out = {"namespace_id": namespace_id}
@@ -382,6 +389,11 @@ def require_namespace_owner(conn, p: Principal, namespace_id: str) -> None:
     matters here — which is why this is its own check rather than a flag.
     """
     require_namespace_admin(conn, p, namespace_id)      # ceiling + scope + exists
+    # A namespace-pinned token is issued to WORK in that namespace; disposing of
+    # it is a step beyond what the pin implies, and the deployment-wide acts all
+    # demand an unscoped credential for the same reason.
+    if p.scope_namespace_id is not None:
+        raise Forbidden("this act needs an unscoped admin credential")
     if p.is_admin:
         return
     if identity.namespace_owner(conn, namespace_id) != p.user_id:
@@ -505,7 +517,7 @@ def _unreachable_warning(conn, user_id: str,
 def issue_token(conn, p: Principal, *, user_id: str,
                 namespace_id: Optional[str] = None, permission: str = "write",
                 label: str = "", expires_days: Optional[int] = None,
-                sink_dir: str = "") -> dict:
+                sink_dir: str = "", defer_delivery: bool = False) -> dict:
     """Mint a token for `user_id`. The secret is returned once and never again.
 
     `expires_days` rather than a timestamp: both doors were converting the same
@@ -525,9 +537,36 @@ def issue_token(conn, p: Principal, *, user_id: str,
     secret, tid = identity.issue_token(conn, user_id, namespace_id=namespace_id,
                                        permission=permission, label=label,
                                        expires_at=expires_at)
+    if defer_delivery:
+        # The caller will commit and THEN write the file. Writing it inside the
+        # transaction leaves a 0600 file holding a live-looking secret for a
+        # token that a rollback removed — the CLI already delivers outside its
+        # transaction for exactly this reason, and the doors did not.
+        return {"secret": secret, "id": tid, "warning": warning}
     out = deliver_secret(secret, tid, sink_dir)
     if warning:
         out["warning"] = warning
+    return out
+
+
+def deliver_key(out: dict, sink_dir: str) -> dict:
+    """Apply the deployment's delivery policy to a freshly minted ENROLLMENT KEY.
+
+    The 0.9.0 wave took the token out of the reply and left the key in it — but
+    a key is a bearer credential for as long as it lives, and whoever reads it
+    first gets the account it names. An operator who set a sink said "secrets do
+    not come back in replies", and meant this one too.
+    """
+    if not sink_dir or "key" not in out:
+        return out
+    key = out.pop("key")
+    out["path"] = identity.stash_secret(sink_dir, out["id"], key,
+                                        suffix=".key")
+    out["delivered"] = "file"
+    out["exposed"] = False
+    out["note"] = ("the key was written to that file on the server and "
+                   "deliberately NOT returned here — read it there and hand it "
+                   "to its owner")
     return out
 
 
@@ -583,7 +622,11 @@ def list_enrollments(conn, p: Principal, *,
     require_manage_users(p)
     if user_id is not None:
         _require_target_is_plain_user(conn, p, user_id, "listing enrollment keys")
-    return identity.list_enrollments(conn, user_id=user_id)
+        return identity.list_enrollments(conn, user_id=user_id)
+    # Unfiltered, the listing handed a user_manager the credential timeline of
+    # the accounts ABOVE it — `list_tokens` refuses exactly that. The guard has
+    # to apply to the shape without a target too, or it is only a speed bump.
+    return identity.list_enrollments(conn, plain_users_only=not p.is_admin)
 
 
 def revoke_enrollment(conn, p: Principal, *, enrollment_id: str) -> bool:
@@ -692,11 +735,26 @@ def request_access(conn, p: Principal, *, namespace_id: str,
     """
     if p.user_id is None:
         raise identity.AuthError("this token has no owning user")
+    # You may not ask for more than this credential could exercise if granted.
+    # A read-only agent token filing an `admin` request is the input half of an
+    # over-grant: the approver sees a plausible ask and the account keeps the
+    # membership long after that token is gone.
+    permission = identity.perm_min(permission, p.permission)
     perm = identity.reaches(conn, p.user_id, namespace_id)
     if perm is not None:
         return {"status": "already_reachable", "permission": perm}
     identity.request_access(conn, p.user_id, namespace_id, permission)
-    return {"status": "submitted"}
+    # What is actually pending, which is not always what was asked: a request
+    # you already hold may be lowered but not raised, and a read-only credential
+    # cannot ask beyond its ceiling. Saying so beats a receipt that agrees with
+    # you and a grant that does not.
+    with conn.cursor() as cur:
+        cur.execute("SELECT requested_permission FROM access_request WHERE "
+                    "requester_user_id=%s AND namespace_id=%s",
+                    (p.user_id, identity._as_uuid(namespace_id)))
+        row = cur.fetchone()
+    return {"status": "submitted",
+            "permission": row[0] if row else permission}
 
 
 def list_requests(conn, p: Principal, *, namespace_id: str) -> List[dict]:
@@ -705,16 +763,32 @@ def list_requests(conn, p: Principal, *, namespace_id: str) -> List[dict]:
     return identity.list_requests(conn, namespace_id)
 
 
-def decide_access(conn, p: Principal, *, request_id: str, approve: bool) -> None:
-    """Approve or deny a request, authorized against the namespace it targets."""
+def decide_access(conn, p: Principal, *, request_id: str, approve: bool,
+                  expect_permission: Optional[str] = None) -> None:
+    """Approve or deny a request, authorized against the namespace it targets.
+
+    `expect_permission` is the permission the approver SAW in `list_requests`.
+    Pass it: without it, approval grants whatever the row says when it is read,
+    and a requester can raise their own pending ask between the listing and the
+    decision. `request_access` no longer amends a pending request, so this is
+    the second lock on the same door rather than the only one.
+
+    Both "no such request" and "a request you may not decide" answer the same
+    way, for the same reason `request_access` does: which uuids are real is not
+    something a refusal should confirm.
+    """
     with conn.cursor() as cur:
         cur.execute("SELECT namespace_id FROM access_request WHERE id=%s",
                     (request_id,))
         row = cur.fetchone()
     if row is None:
         raise identity.SpaceNotFound("no such request")
-    require_namespace_admin(conn, p, str(row[0]))
+    try:
+        require_namespace_admin(conn, p, str(row[0]))
+    except (Forbidden, identity.SpaceNotFound):
+        raise identity.SpaceNotFound("no such request") from None
     if approve:
-        identity.approve_request(conn, request_id)
+        identity.approve_request(conn, request_id,
+                                 expect_permission=expect_permission)
     else:
         identity.deny_request(conn, request_id)

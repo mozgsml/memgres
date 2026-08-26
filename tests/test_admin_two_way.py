@@ -203,15 +203,28 @@ def test_a_clean_handoff_is_possible_but_must_be_asked_for(box):
 
 def test_transfer_is_refused_when_the_name_is_taken_over_there(box):
     """(owner, name) is unique. Without the check this dies on a constraint —
-    a driver fault the caller cannot act on — instead of a sentence."""
+    a driver fault the caller cannot act on — instead of a sentence.
+
+    And the sentence must not quote the RECIPIENT's inventory: the check runs
+    before the UPDATE, so a positive answer costs the prober nothing and can be
+    repeated forever. Naming what it collided with turned a transfer into a free
+    dictionary attack on another tenant's namespace names, which routinely
+    encode customers and projects.
+    """
     conn, _ = box
     owner_id, owner = _person(conn, "owner")
     heir_id, _ = _person(conn, "heir")
     ns = identity.create_namespace(conn, owner_id, "notes")
     identity.create_namespace(conn, heir_id, "notes")
-    with pytest.raises(identity.SpaceAmbiguous, match="already owns"):
+    other = identity.create_namespace(conn, heir_id, "other")
+    identity.create_alias(conn, heir_id, "secret-client", other)
+    with pytest.raises(identity.SpaceAmbiguous) as e:
         admin.transfer_namespace(conn, owner, namespace_id=ns,
                                  new_owner_user_id=heir_id)
+    assert "cannot hold a namespace by this name" in str(e.value)
+    # neither what it hit, nor whether it was a namespace or an alias
+    for leak in ("already owns", "alias", "other", "secret-client"):
+        assert leak not in str(e.value)
     assert identity.namespace_owner(conn, ns) == owner_id       # nothing moved
 
 
