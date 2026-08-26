@@ -5,6 +5,48 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.10.0] — 2026-08-26
+
+### Added
+- **Enrollment keys: onboard someone without a secret ever being in flight.**
+  `memory_admin_create_enrollment` mints a single-use `mge_` key; the person
+  generates their own `mgk_` token on their own machine, configures their client
+  with it, and calls `memory_enroll` with the key. The server stores the hash,
+  exactly as if it had minted the token. Nobody else ever holds the
+  credential — not the administrator, not the transcript, not a mailbox, not a
+  file on the server. Same shape as ssh keys, Tailscale pre-auth keys, `kubeadm
+  join` and Vault AppRole. Also `POST /enroll` over REST (the route a browser
+  enrollment page will call), and `memgres-provision --enroll`.
+  - **The token is never an argument.** `memory_enroll` takes only the key and
+    reads the credential from the configuration the server is already running
+    with — an argument would put the secret straight back in the conversation.
+  - **A key works once and says so afterwards.** That refusal is the whole
+    theft-detection story: a stolen key gets spent, and its rightful owner finds
+    it already redeemed. A stolen token gives no such signal. The listing
+    reports `state` and `used_token_id`, so the answer is to revoke what it made.
+  - **Permission and namespace come from the key**, so redeeming cannot ask for
+    more authority than was granted.
+  - `expires_minutes` defaults to 30 with **no upper cap** — a key for someone
+    who is away this week is a legitimate need, and the window is the issuer's
+    judgement, reported in every listing.
+  - `memory_admin_list_enrollments` / `memory_admin_revoke_enrollment` ship with
+    it: a control plane that can only create is how the existing one got its
+    gaps. A *redeemed* key is not revocable, because what needs killing then is
+    the token it produced.
+- **An unbound client is shown the way in.** A well-formed token a managed
+  deployment has never seen used to be handed the read-only tool list, every
+  entry of which would refuse it. It now gets `memory_enroll` and
+  `memory_server_info` and nothing else. A **revoked** or **expired** token is
+  well-formed and *known*, and is deliberately not offered that door — otherwise
+  re-binding would make revocation undoable.
+
+### Changed
+- The two token-minting tools now say in their descriptions that returning a
+  secret in a reply is **unsafe**, and the payload itself carries `exposed:
+  true` and says to rotate. The model reading those descriptions is the one
+  whose transcript the secret would land in.
+- Schema 22 (`enrollment_key`). Compatibility floor unchanged at 16.
+
 ## [0.9.0] — 2026-08-26
 
 ### Added

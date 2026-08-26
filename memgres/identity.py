@@ -35,6 +35,21 @@ from typing import List, Optional, Sequence, Tuple
 # ─── token format: mgk_ + 43 url-safe chars (256-bit) ────────────────────────
 TOKEN_RE = re.compile(r"^mgk_[A-Za-z0-9_-]{43}$")
 
+# ─── enrollment key format: mge_ + the same 256 bits ─────────────────────────
+# A DIFFERENT prefix on purpose. The two are handled by different code paths and
+# have opposite lifetimes — one is durable, one dies in half an hour — so a
+# credential that leaks should be identifiable on sight, by a human reading a
+# log and by the server refusing it in the wrong slot.
+ENROLL_RE = re.compile(r"^mge_[A-Za-z0-9_-]{43}$")
+
+# An enrollment key is a credential for as long as it lives, so the default is
+# short. There is deliberately NO upper limit: an operator provisioning someone
+# who is on holiday for two weeks needs a key that survives until they are back,
+# and a server-side cap would only push them into re-issuing keys by hand. The
+# risk of a long window is real and belongs to whoever chooses it, which is why
+# the listing reports every key's expiry.
+DEFAULT_ENROLL_MINUTES = 30
+
 
 def bearer_token(authorization: Optional[str],
                  x_memgres_token: Optional[str]) -> Optional[str]:
@@ -1085,6 +1100,167 @@ def stash_secret(sink_dir: str, token_id: str, secret: str) -> str:
         fh.write(secret + "\n")
     os.chmod(path, 0o600)               # tighten even if the file pre-existed
     return path
+
+
+# ─── enrollment: bind a token the client generated itself ────────────────────
+def new_enrollment_key() -> str:
+    """A fresh one-time key: ``mge_`` + 43 url-safe chars."""
+    return "mge_" + secrets.token_urlsafe(32)
+
+
+def valid_enrollment_format(key: str) -> bool:
+    return bool(key) and bool(ENROLL_RE.match(key))
+
+
+def is_unbound(conn, cfg, secret: Optional[str]) -> bool:
+    """Is this a well-formed credential that simply doesn't belong to anyone yet?
+
+    The question `resolve` cannot answer: it raises ``AuthError`` for an unknown
+    token, a revoked one and an expired one alike, and only the first of those
+    may enroll. Asked separately rather than folded into `resolve` so that
+    authentication keeps exactly one outcome — a Principal or a refusal — and no
+    caller can accidentally treat "may enroll" as "is authenticated".
+    """
+    if cfg.key_mode != "managed" or not valid_format(secret or ""):
+        return False
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM token WHERE token_hash=%s",
+                    (token_hash(secret),))
+        return cur.fetchone() is None
+
+
+def create_enrollment(conn, user_id: str, *, namespace_id: Optional[str] = None,
+                      permission: str = "write", label: str = "",
+                      created_by: Optional[str] = None,
+                      expires_minutes: int = DEFAULT_ENROLL_MINUTES) -> dict:
+    """Mint a one-time key that lets its holder bind ONE self-generated token to
+    `user_id`. Returns the key (once) plus its id and expiry.
+
+    The ceiling and the scope are decided HERE, by whoever provisions — not by
+    the person redeeming it. Otherwise enrolling would be a way to ask for more
+    authority than you were given.
+
+    `expires_minutes` defaults to 30 and accepts anything above zero — a key for
+    someone who will not be at their desk today is a legitimate need, and the
+    window is the issuer's judgement, not the server's.
+    """
+    if permission not in _RANK:
+        raise ValueError(f"bad permission: {permission}")
+    minutes = int(expires_minutes or DEFAULT_ENROLL_MINUTES)
+    if minutes < 1:
+        raise ValueError("expires_minutes must be at least 1")
+    key = new_enrollment_key()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO enrollment_key (key_hash, user_id, namespace_id, "
+            "permission, label, created_by, expires_at) VALUES "
+            "(%s, %s, %s, %s, %s, %s, now() + make_interval(mins => %s)) "
+            "RETURNING id, expires_at",
+            (token_hash(key), user_id, namespace_id, permission, label,
+             created_by, minutes))
+        eid, exp = cur.fetchone()
+    return {"key": key, "id": str(eid), "expires_at": exp,
+            "user_id": user_id, "permission": permission,
+            "namespace_id": namespace_id}
+
+
+def redeem_enrollment(conn, key: str, secret: str) -> dict:
+    """Bind `secret` — a token the caller generated — to the account `key` names.
+
+    Every refusal here is deliberate and distinct:
+
+    * a spent key says so, because that is the ONLY signal a stolen key gives.
+      Its rightful holder finding it already redeemed is how the theft is
+      noticed at all; collapsing it into "invalid key" would erase the alarm.
+    * a secret the server already knows is refused rather than re-bound. A
+      revoked token could otherwise be revived by enrolling it somewhere else,
+      which would make revocation a suggestion.
+    """
+    if not valid_enrollment_format(key):
+        raise AuthError("malformed enrollment key (expected mge_ + 43 url-safe chars)")
+    if not valid_format(secret or ""):
+        raise AuthError("the credential to bind must be mgk_ + 43 url-safe chars")
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, user_id, namespace_id, permission, label, "
+            "       used_at IS NOT NULL, revoked_at IS NOT NULL, "
+            "       expires_at <= now() "
+            "FROM enrollment_key WHERE key_hash=%s FOR UPDATE",
+            (token_hash(key),))
+        row = cur.fetchone()
+        if row is None:
+            raise AuthError("unknown enrollment key")
+        eid, uid, nsid, perm, label, used, revoked, expired = row
+        if used:
+            raise AuthError("this enrollment key was already redeemed — if that "
+                            "was not you, tell whoever issued it: the token it "
+                            "created belongs to someone else")
+        if revoked:
+            raise AuthError("enrollment key revoked")
+        if expired:
+            raise AuthError("enrollment key expired")
+        cur.execute("SELECT 1 FROM token WHERE token_hash=%s", (token_hash(secret),))
+        if cur.fetchone() is not None:
+            raise AuthError("that credential is already known to this server — "
+                            "generate a fresh one")
+        tid = register_token(conn, str(uid), secret, namespace_id=
+                             str(nsid) if nsid else None,
+                             permission=perm, label=label or "enrolled")
+        cur.execute("UPDATE enrollment_key SET used_at=now(), used_token_id=%s "
+                    "WHERE id=%s", (tid, eid))
+    return {"user_id": str(uid), "token_id": tid, "permission": perm,
+            "namespace_id": str(nsid) if nsid else None,
+            "enrollment_id": str(eid)}
+
+
+def list_enrollments(conn, *, user_id: Optional[str] = None) -> List[dict]:
+    """Pending and spent keys — metadata only, never the key itself."""
+    # `expired` is computed by the DATABASE: the key's clock and the reader's
+    # are not the same clock, and a listing that disagreed with what redeeming
+    # does would be worse than no listing.
+    sql = ("SELECT id, user_id, namespace_id, permission, label, created_by, "
+           "created_at, expires_at, used_at, used_token_id, revoked_at, "
+           "expires_at <= now() AS expired FROM enrollment_key")
+    args: list = []
+    if user_id is not None:
+        sql += " WHERE user_id=%s"
+        args.append(user_id)
+    sql += " ORDER BY created_at DESC, id"
+    with conn.cursor() as cur:
+        cur.execute(sql, args)
+        cols = [c.name for c in cur.description]
+        out = []
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            for k in ("id", "user_id", "namespace_id", "created_by",
+                      "used_token_id"):
+                d[k] = str(d[k]) if d[k] else None
+            d["state"] = ("revoked" if d["revoked_at"] else
+                          "redeemed" if d["used_at"] else
+                          "expired" if d.pop("expired") else "pending")
+            d.pop("expired", None)
+            out.append(d)
+        return out
+
+
+def revoke_enrollment(conn, enrollment_id: str) -> bool:
+    """Kill an unredeemed key. False if it was already spent, revoked or absent —
+    a redeemed key is NOT revocable, because what needs killing then is the token
+    it produced, and pretending otherwise would leave that token alive."""
+    with conn.cursor() as cur:
+        cur.execute("UPDATE enrollment_key SET revoked_at=now() WHERE id=%s "
+                    "AND revoked_at IS NULL AND used_at IS NULL RETURNING id",
+                    (enrollment_id,))
+        return cur.fetchone() is not None
+
+
+def enrollment_owner(conn, enrollment_id: str) -> Optional[str]:
+    """Whose account a key would bind to — the target for an authority check."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT user_id FROM enrollment_key WHERE id=%s",
+                    (enrollment_id,))
+        r = cur.fetchone()
+        return str(r[0]) if r else None
 
 
 def register_token(conn, user_id: str, secret: str, *,

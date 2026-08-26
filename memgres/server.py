@@ -487,6 +487,16 @@ def create_app(cfg: Optional[Config] = None):
         label: str = ""
         expires_days: Optional[int] = None
 
+    class NewEnrollment(BaseModel):
+        user_id: str
+        namespace_id: Optional[str] = None
+        permission: str = "write"
+        label: str = ""
+        expires_minutes: Optional[int] = None
+
+    class Redeem(BaseModel):
+        key: str
+
     class NewMember(BaseModel):
         user_id: str
         permission: str = "read"
@@ -538,6 +548,49 @@ def create_app(cfg: Optional[Config] = None):
                 conn, p, user_id=req.user_id, namespace_id=req.namespace_id,
                 permission=req.permission, label=req.label,
                 expires_days=req.expires_days, sink_dir=cfg.token_sink))
+
+    @app.post("/admin/enrollments", status_code=201)
+    def admin_create_enrollment(req: NewEnrollment, p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.create_enrollment(
+                conn, p, user_id=req.user_id, namespace_id=req.namespace_id,
+                permission=req.permission, label=req.label,
+                expires_minutes=req.expires_minutes))
+
+    @app.get("/admin/enrollments")
+    def admin_list_enrollments(user_id: Optional[str] = None,
+                               p=Depends(principal)):
+        with pool.connection() as conn:
+            return _guard(lambda: admin.list_enrollments(conn, p,
+                                                         user_id=user_id))
+
+    @app.post("/admin/enrollments/{enrollment_id}/revoke")
+    def admin_revoke_enrollment(enrollment_id: str, p=Depends(principal)):
+        with pool.connection() as conn:
+            return {"revoked": _guard(lambda: admin.revoke_enrollment(
+                conn, p, enrollment_id=enrollment_id))}
+
+    @app.post("/enroll")
+    def enroll(req: Redeem, authorization: Optional[str] = Header(None),
+               x_memgres_token: Optional[str] = Header(None)):
+        """Bind the credential in this request's own Authorization header to the
+        account the key names.
+
+        The one route that does NOT go through `principal`: the whole point is
+        that the credential is not yet known, so resolving it would refuse the
+        request before it could claim anything. What authorizes here is the key.
+        The token still never appears in a body — it arrives the way every
+        credential arrives, in the header — so a proxy log of request bodies
+        does not become a list of people's secrets.
+        """
+        tok = identity.bearer_token(authorization, x_memgres_token)
+        if not tok:
+            raise HTTPException(400, "send the token to bind as a Bearer credential")
+        with pool.connection() as conn, conn.transaction():
+            try:
+                return identity.redeem_enrollment(conn, req.key, tok)
+            except identity.AuthError as e:
+                raise HTTPException(403, str(e))
 
     @app.post("/admin/tokens/{token_id}/revoke")
     def admin_revoke_token(token_id: str, p=Depends(principal)):

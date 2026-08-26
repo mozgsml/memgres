@@ -33,8 +33,13 @@ from mcp import types as mcp_types  # noqa: E402
 from memgres import identity  # noqa: E402
 from memgres.config import load  # noqa: E402
 from memgres.mcp_server import (  # noqa: E402
-    TOOL_VISIBILITY, build_server, visible_tools,
+    TOOL_VISIBILITY, UNBOUND_TOOLS, build_server, visible_tools,
 )
+
+# Tools only an UNBOUND caller is shown — no identified caller, superadmin
+# included, has any use for them.
+UNBOUND_ONLY = tuple(n for n, needs in TOOL_VISIBILITY.items()
+                     if needs == ("unbound",))
 
 try:                                    # mcp 2.x
     from mcp.server.mcpserver.exceptions import ToolError
@@ -91,7 +96,10 @@ def test_the_two_admin_tiers_are_distinguished():
         assert root_only not in manager
 
     root = visible_tools(TOOL_VISIBILITY, ALL_CAPS, True)
-    assert set(root) == set(TOOL_VISIBILITY)          # a superadmin sees it all
+    # A superadmin sees it all — except the tools that exist only for a caller
+    # who has no account yet. Authority does not make `memory_enroll` usable:
+    # there is nothing to claim when you already are somebody.
+    assert set(root) == set(TOOL_VISIBILITY) - set(UNBOUND_ONLY)
 
 
 def test_without_identities_only_the_identity_tools_go():
@@ -283,9 +291,19 @@ def test_a_database_blip_fails_the_listing_rather_than_shrinking_it(deployment,
     finally:
         monkeypatch.setattr(ms.identity, "resolve", real)
 
-    # a token that simply fails to authenticate is NOT a blip: it answers
+    # a token that simply fails to authenticate is NOT a blip: it answers. In a
+    # MANAGED deployment an unknown but well-formed token is someone who has
+    # generated a credential and not yet claimed an account, so what it answers
+    # with is the way in — not the read surface, every tool of which would
+    # refuse it.
     _env(monkeypatch, MEMGRES_ADMIN_TOKEN=root_tok, MEMGRES_ADMIN_ROLE="superadmin",
          MEMGRES_TOKEN=identity.new_token())
+    shown = _listed(build_server(load()))
+    assert sorted(shown) == sorted(UNBOUND_TOOLS)
+
+    # a MALFORMED credential is not enrollable, and falls back to the old answer
+    _env(monkeypatch, MEMGRES_ADMIN_TOKEN=root_tok, MEMGRES_ADMIN_ROLE="superadmin",
+         MEMGRES_TOKEN="not-a-token")
     shown = _listed(build_server(load()))
     assert "memory_recall" in shown and "memory_write" not in shown
 

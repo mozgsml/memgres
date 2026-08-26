@@ -256,6 +256,9 @@ Tools:
 - `memory_list_spaces` — your reachable namespaces (id, name, permission, alias);
 - `memory_create_space` / `memory_set_alias` / `memory_drop_alias` — make one,
   and give it a name of your own;
+- `memory_enroll` — claim an account with a one-time key, binding a token you
+  generated yourself. Shown ONLY to a client whose credential belongs to nobody
+  yet, and it is then the only tool shown (see below);
 - `memory_issue_token` — mint a token (rotate/delegate; secret returned once);
 - `memory_list_tokens` / `memory_revoke_token` — manage them;
 - `memory_admin_*` — the control plane (see below), where the caller has the
@@ -386,6 +389,61 @@ registered; `auto` registers them wherever there are identities to administer,
 which is every mode but `single`. Turning them off shortens an agent-facing tool
 list — it is a context economy, **not** a security boundary, since every tool
 authorizes when it is called.
+
+### Onboarding without a secret in flight — enrollment keys
+
+The best channel for a secret is no channel. In `managed` mode a person can
+generate their own token and bind it to the account you made for them:
+
+```bash
+# you, provisioning — no secret is created here
+memory_admin_create_user  → uid
+memory_admin_create_namespace(owner_user_id=uid) → nsid
+memory_admin_create_enrollment(user_id=uid, space_id=nsid)  → mge_… (single use)
+# or, on the box:  memgres-provision --name ivan --space ivan --enroll
+
+# them, once, on their own machine
+python3 -c "import secrets; print('mgk_' + secrets.token_urlsafe(32))"
+# → into their client's memgres configuration, then:
+memory_enroll(key="mge_…")
+```
+
+The server stores the token's **hash**, exactly as if it had minted it. Nobody
+else ever holds the credential — not you, not the transcript, not a mailbox, not
+a file on the server. It is the shape ssh keys, Tailscale pre-auth keys,
+`kubeadm join` and Vault's AppRole all arrived at: a one-time grant to bind, a
+durable credential created on the far side.
+
+Three things make it safe rather than merely convenient:
+
+- **The token is never an argument.** `memory_enroll` takes only the key; the
+  credential is read from the configuration the server is already running with.
+  An argument would put the secret straight back into the conversation.
+- **The key is single-use, and says so afterwards.** That refusal is the entire
+  theft-detection story: whoever holds a stolen key spends it, and its rightful
+  owner finds it already redeemed. A stolen *token* gives no such signal.
+  `memory_admin_list_enrollments` shows `state` and `used_token_id`, so the
+  answer to a spent key is to revoke the token it made.
+- **The ceiling is set at issue time.** Permission and namespace come from the
+  key; redeeming cannot ask for more than it grants.
+
+The key IS a credential while it lives — whoever redeems it first gets the
+account — so hand it over the way you would a meeting link. `expires_minutes`
+defaults to 30 and takes any value: there is no server-side cap, because a key
+for someone who is away this week is a legitimate need and the window is the
+issuer's judgement.
+
+**What an unbound client sees.** A well-formed token this deployment has never
+seen is not an error — it is somebody arriving. Its `tools/list` contains
+`memory_enroll` and `memory_server_info`, and nothing else, because nothing else
+would work. A **revoked** or **expired** token is well-formed and *known*, and is
+deliberately NOT offered the enrollment door: re-binding would make revocation
+undoable. After enrolling, the client may need to reconnect for its real tool
+list — the credential was valid from the first request, only the list is cached.
+
+Over REST the same exchange is `POST /enroll` with `{"key": "mge_…"}` and the
+token in the `Authorization` header — the route a browser enrollment page will
+call, and the one route that does not resolve its caller first.
 
 ### Delivering the secret without printing it
 

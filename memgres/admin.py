@@ -440,10 +440,57 @@ def deliver_secret(secret: str, token_id: str, sink_dir: str) -> dict:
     if sink_dir:
         path = identity.stash_secret(sink_dir, token_id, secret)
         return {"id": token_id, "delivered": "file", "path": path,
+                "exposed": False,
                 "note": "the secret was written to that file on the server and "
                         "deliberately NOT returned here — read it there"}
-    return {"token": secret, "id": token_id,
-            "note": "store this now — it is not recoverable"}
+    return {"token": secret, "id": token_id, "exposed": True,
+            "note": "store this now — it is not recoverable. This secret was "
+                    "returned in a reply: if that reply reached an LLM, treat "
+                    "the token as exposed and rotate it once delivered. Set "
+                    "MEMGRES_TOKEN_SINK to stop returning secrets at all."}
+
+
+def create_enrollment(conn, p: Principal, *, user_id: str,
+                      namespace_id: Optional[str] = None,
+                      permission: str = "write", label: str = "",
+                      expires_minutes: Optional[int] = None) -> dict:
+    """Mint a one-time key that lets `user_id` bind a token THEY generate.
+
+    Provisioning-tier, and gated exactly like `issue_token`, because it grants
+    the same thing by another route: whoever redeems it ends up holding a
+    credential for that account. What it does not do is put a secret anywhere —
+    the key is worthless after one use and after `expires_minutes`, and the
+    token itself is created on the far side and never travels.
+    """
+    require_manage_users(p)
+    _require_target_is_plain_user(conn, p, user_id, "issuing an enrollment key")
+    kw = {} if expires_minutes is None else {"expires_minutes": expires_minutes}
+    out = identity.create_enrollment(
+        conn, user_id, namespace_id=namespace_id, permission=permission,
+        label=label, created_by=p.user_id, **kw)
+    out["note"] = ("give this key to its owner over any channel you would use "
+                   "for a meeting link — it is single-use and short-lived. They "
+                   "generate their own token, put it in their client's config, "
+                   "and call memory_enroll with this key.")
+    return out
+
+
+def list_enrollments(conn, p: Principal, *,
+                     user_id: Optional[str] = None) -> List[dict]:
+    """Enrollment keys and what became of them — metadata only, never a key."""
+    require_manage_users(p)
+    if user_id is not None:
+        _require_target_is_plain_user(conn, p, user_id, "listing enrollment keys")
+    return identity.list_enrollments(conn, user_id=user_id)
+
+
+def revoke_enrollment(conn, p: Principal, *, enrollment_id: str) -> bool:
+    """Kill an unredeemed key. False if it was already spent, revoked or absent."""
+    require_manage_users(p)
+    _require_target_is_plain_user(conn, p,
+                                  identity.enrollment_owner(conn, enrollment_id),
+                                  "revoking an enrollment key")
+    return identity.revoke_enrollment(conn, enrollment_id)
 
 
 def revoke_token(conn, p: Principal, *, token_id: str) -> bool:

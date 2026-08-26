@@ -18,7 +18,7 @@ from pathlib import Path
 from .config import Config
 
 # The version this build migrates the database TO (the latest migration it carries).
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 # The compatibility FLOOR: the schema version of the most recent backward-
 # INCOMPATIBLE migration — one that changed the shape/semantics old code relied on

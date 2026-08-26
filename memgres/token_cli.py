@@ -143,6 +143,12 @@ def main(argv=None) -> None:  # pragma: no cover - thin entrypoint
     tk.add_argument("--expires-days", type=int, default=None)
     tk.add_argument("--no-token", action="store_true",
                     help="provision the user/namespace only, mint nothing")
+    tk.add_argument("--enroll", action="store_true",
+                    help="issue a one-time ENROLLMENT KEY instead of a token: "
+                         "the person generates their own token and binds it, so "
+                         "no secret is created here at all")
+    tk.add_argument("--enroll-minutes", type=int, default=None,
+                    metavar="N", help="how long the key lives (default 30)")
     tk.add_argument("--out", metavar="PATH",
                     help="write the secret here (0600) instead of stdout")
     args = p.parse_args(argv)
@@ -159,6 +165,22 @@ def main(argv=None) -> None:  # pragma: no cover - thin entrypoint
                 uid = _resolve_user(conn, args)
                 nsid = _namespace(conn, args, uid)
                 if args.no_token:
+                    return
+                if args.enroll:
+                    out = identity.create_enrollment(
+                        conn, uid, namespace_id=nsid,
+                        permission=args.permission, label=args.label,
+                        **({} if args.enroll_minutes is None
+                           else {"expires_minutes": args.enroll_minutes}))
+                    # The key is printed: unlike a token it is single-use and
+                    # dies within the hour, and it has to reach a human somehow.
+                    print(f"key       {out['id']}  expires {out['expires_at']:%Y-%m-%d %H:%M %Z}")
+                    print(out["key"])
+                    print("\nGive that key to its owner. They run:\n"
+                          "  python3 -c \"import secrets; print('mgk_' + "
+                          "secrets.token_urlsafe(32))\"\n"
+                          "put the result in their client's memgres config, and "
+                          "call memory_enroll with the key.")
                     return
                 expires_at = None
                 if args.expires_days:

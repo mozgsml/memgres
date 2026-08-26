@@ -347,3 +347,51 @@ def test_visibility_off_shows_everything_to_everyone():
         assert anonymous == srv.tools(root)
     finally:
         srv.stop()
+
+
+# ─── the unbound caller: a token that belongs to nobody yet ──────────────────
+#
+# Its own server on its own fresh schema, and every credential minted INSIDE the
+# test. The `managed` fixture above cannot be reused: another fixture in this
+# module calls `_fresh_db()` on the same database, so rows created at
+# fixture-time are gone by the time a test at the end of the file runs — which
+# is exactly how these three first "failed", as a wipe rather than a bug.
+@pytest.fixture(scope="module")
+def enrolling():
+    _fresh_db()
+    root = identity.new_token()
+    srv = Server(MEMGRES_KEY_MODE="managed", MEMGRES_ADMIN_TOKEN=root,
+                 MEMGRES_ADMIN_ROLE="superadmin")
+    yield srv
+    srv.stop()
+
+
+def _bound_token(permission="write", revoke=False):
+    """A credential this deployment knows about, made right now."""
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        uid = identity.create_user(conn, name="claimant")
+        secret, tid = identity.issue_token(conn, uid, permission=permission)
+        identity.create_namespace(conn, uid, f"ns{tid[:8]}")
+        if revoke:
+            identity.revoke_token(conn, tid)
+    return secret
+
+
+def test_an_unbound_credential_is_shown_only_the_way_in(enrolling):
+    """Someone who generated a token and has not claimed an account yet. Every
+    other tool would refuse them, so the list is the enrollment door and the
+    server description, and nothing else."""
+    from memgres.mcp_server import UNBOUND_TOOLS
+    assert enrolling.tools(identity.new_token()) == sorted(UNBOUND_TOOLS)
+
+
+def test_a_bound_credential_is_not_shown_the_enrollment_door(enrolling):
+    """Nothing left to claim — and an account that could enroll again would be
+    an account that can move itself into another user's namespace."""
+    assert "memory_enroll" not in enrolling.tools(_bound_token())
+
+
+def test_a_revoked_credential_is_not_offered_a_second_life(enrolling):
+    """The dangerous middle case: well-formed, known, and dead. If revocation
+    could be undone by enrolling, revoking would be advice rather than an act."""
+    assert "memory_enroll" not in enrolling.tools(_bound_token(revoke=True))

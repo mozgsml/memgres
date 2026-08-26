@@ -72,6 +72,12 @@ ValidAtArg = Annotated[Optional[str], Field(
                 "letter is valid_at 2021-…, and re-checking an old memory today "
                 "records today WITHOUT touching the body. Leave it unset for an "
                 "ordinary edit, which is accurate as of now.")]
+EnrollKeyArg = Annotated[str, Field(
+    description="The one-time enrollment key you were given (mge_ + 43 url-safe "
+                "chars). It is the ONLY thing this tool takes: the credential "
+                "being bound is read from this server's own configuration, "
+                "never passed as an argument, so it stays out of the "
+                "conversation.")]
 IfMovedArg = Annotated[Literal["error", "follow", "create"], Field(
     default="error",
     description="What to do when the address you used is one a memory MOVED AWAY "
@@ -129,6 +135,8 @@ TOOL_VISIBILITY = {
     "memory_write": ("can_write",),
     "memory_move": ("can_write",),
     "memory_forget": ("can_write",),
+    # the one tool an UNBOUND caller may use, and the only one it is shown
+    "memory_enroll": ("unbound",),
     # self-service identity — meaningless where there are no identities
     "memory_whoami": ("identity",),
     "memory_list_spaces": ("identity",),
@@ -146,6 +154,9 @@ TOOL_VISIBILITY = {
     "memory_admin_list_namespaces": ("identity", "can_manage_users"),
     "memory_admin_create_namespace": ("identity", "can_manage_users"),
     "memory_admin_issue_token": ("identity", "can_manage_users"),
+    "memory_admin_create_enrollment": ("identity", "can_manage_users"),
+    "memory_admin_list_enrollments": ("identity", "can_manage_users"),
+    "memory_admin_revoke_enrollment": ("identity", "can_manage_users"),
     "memory_admin_list_tokens": ("identity", "can_manage_users"),
     "memory_admin_revoke_token": ("identity", "can_manage_users"),
     "memory_admin_set_role": ("identity", "can_administer_deployment"),
@@ -160,14 +171,30 @@ TOOL_VISIBILITY = {
 }
 
 
-def visible_tools(names, caps: Optional[dict], identity_on: bool):
+# What a client whose credential belongs to nobody yet is shown. This is an
+# ALLOWLIST, inverting the rule above — and the inversion is the point. An
+# unbound caller cannot do anything else: every other tool refuses on call, so
+# listing them is not honest-but-useless, it is a wall of noise in front of the
+# single thing that will work. Forgetting to add a new tool here hides it from
+# unbound callers only, which is the harmless direction.
+UNBOUND_TOOLS = ("memory_enroll", "memory_server_info")
+
+
+def visible_tools(names, caps: Optional[dict], identity_on: bool, *,
+                  unbound: bool = False):
     """The subset of ``names`` worth showing to a caller with ``caps``.
 
     ``caps=None`` means the caller could not be identified (no token, or one
     that failed to resolve). Nothing beyond the unconditional tools is shown
     then — but the read surface stays, so a misconfigured client still sees a
     working server and gets a real authentication error when it calls.
+
+    ``unbound=True`` is the narrower case inside that one: a well-formed token
+    this deployment has simply never seen. It gets ``UNBOUND_TOOLS`` and nothing
+    else, because enrolling is the only thing it can do.
     """
+    if unbound:
+        return [n for n in names if n in UNBOUND_TOOLS]
     out = []
     for name in names:
         needs = TOOL_VISIBILITY.get(name)
@@ -178,6 +205,10 @@ def visible_tools(names, caps: Optional[dict], identity_on: bool):
         for need in needs:
             if need == "identity":
                 ok = identity_on
+            elif need == "unbound":
+                # only ever satisfied through the branch above; a caller who HAS
+                # an account has nothing to enroll
+                ok = False
             else:
                 ok = bool(caps and caps.get(need))
             if not ok:
@@ -659,6 +690,43 @@ def build_server(cfg: Optional[Config] = None):
             uid = _uid(conn, _token(ctx))
             return {"dropped": identity.drop_alias(conn, uid, alias)}
 
+    if cfg.key_mode == "managed":
+        @mcp.tool()
+        def memory_enroll(key: EnrollKeyArg, ctx: Context = None) -> dict:
+            """Claim an account with a one-time enrollment key.
+
+            For a client whose credential is not yet known to this server. You
+            generate the token yourself —
+
+                python3 -c "import secrets; print('mgk_' + secrets.token_urlsafe(32))"
+
+            — put it in this server's configuration the way any token is
+            configured, and then call this with the key an administrator gave
+            you. The account, its namespace and the permission ceiling are all
+            decided by the key; redeeming it cannot ask for more.
+
+            The token is NEVER an argument here, and must not be pasted into
+            this conversation: it is read from the configuration this server is
+            already running with. That is the entire point — the secret exists
+            only on your machine and as a hash in the database, and nothing that
+            is written down here can be replayed to impersonate you.
+
+            A key works once. If it says it was already redeemed, someone else
+            used it: tell whoever issued it, because the token it created is
+            theirs."""
+            secret = _token(ctx)
+            if not secret:
+                raise identity.AuthError(
+                    "this client sent no credential to bind — generate a token "
+                    "(mgk_ + 43 url-safe chars), configure this server with it, "
+                    "then call memory_enroll again")
+            with pool.connection() as conn, conn.transaction():
+                out = identity.redeem_enrollment(conn, key, secret)
+            out["note"] = ("bound — this client's configured token now belongs to "
+                           "that account. Reconnect (or restart the client) if the "
+                           "tools you can now use are not showing yet.")
+            return out
+
     @mcp.tool()
     def memory_issue_token(permission: str = "write", space: Optional[str] = None,
                            space_id: Optional[str] = None, label: str = "",
@@ -666,10 +734,15 @@ def build_server(cfg: Optional[Config] = None):
                            ctx: Context = None) -> dict:
         """Mint a new token for your account (rotate / delegate / time-box).
         `permission` is its ceiling (read|write|admin); `space`/`space_id` scope
-        it to one namespace (omit for all yours). The secret is returned ONCE —
-        unless this deployment sets a token sink, and then the reply carries only
-        the path of the file on the server it was written to, so the secret never
-        enters this conversation."""
+        it to one namespace (omit for all yours).
+
+        ⚠️ UNSAFE unless this deployment sets a token sink: without one the
+        secret comes back IN THIS REPLY, which puts it in the conversation
+        transcript — and a transcript is logged, summarized, and sent to a model
+        provider. Treat a token minted that way as already exposed: give it a
+        short `expires_days` and rotate it once its owner has it. With a sink
+        configured the reply carries only the path of the 0600 file on the
+        server and the secret never enters the conversation."""
         import datetime as dt
         exp = None
         if expires_days:
@@ -909,16 +982,74 @@ def build_server(cfg: Optional[Config] = None):
                                      expires_days: Optional[int] = None,
                                      ctx: Context = None) -> dict:
             """Mint a token for another user. `permission` is its ceiling,
-            `space_id` scopes it to one namespace (omit for all theirs). The
-            secret is returned ONCE — unless this deployment sets a token sink,
-            and then the reply carries only the path of the file on the server it
-            was written to, so the secret never enters this conversation. Issuing
-            for an admin-role account requires superadmin."""
+            `space_id` scopes it to one namespace (omit for all theirs). Issuing
+            for an admin-role account requires superadmin.
+
+            ⚠️ UNSAFE unless this deployment sets a token sink: without one the
+            secret comes back IN THIS REPLY, which puts another person's
+            credential into YOUR conversation transcript — logged, summarized,
+            sent to a model provider, and impossible to recall. Prefer a channel
+            that never carries the secret at all; use this only when you have
+            none, and then give it a short `expires_days` and rotate it once
+            delivered."""
             with pool.connection() as conn, conn.transaction():
                 return admin.issue_token(
                     conn, _principal(conn, _token(ctx)), user_id=user_id,
                     namespace_id=space_id, permission=permission, label=label,
                     expires_days=expires_days, sink_dir=cfg.token_sink)
+
+        @mcp.tool()
+        def memory_admin_create_enrollment(
+                user_id: str, permission: str = "write",
+                space_id: Optional[str] = None, label: str = "",
+                expires_minutes: Optional[int] = None,
+                ctx: Context = None) -> dict:
+            """Mint a one-time key that lets someone bind a token THEY generate
+            to this account — the way to onboard a person without a secret ever
+            passing through you.
+
+            They generate a token on their own machine, put it in their client's
+            configuration, and call `memory_enroll` with this key. The server
+            stores only its hash; nobody else, this conversation included, ever
+            holds their credential. `permission` and `space_id` fix what the
+            resulting token may do — redeeming cannot ask for more.
+
+            The KEY is still a credential while it lives (whoever redeems it
+            first gets the account), so hand it over the way you would a meeting
+            link and keep `expires_minutes` short — it defaults to 30, and takes
+            any value above zero when someone will not be at their desk today. A
+            key works once; `memory_admin_list_enrollments` shows whether it has
+            been used, which is how a stolen one is noticed."""
+            with pool.connection() as conn, conn.transaction():
+                out = admin.create_enrollment(
+                    conn, _principal(conn, _token(ctx)), user_id=user_id,
+                    namespace_id=space_id, permission=permission, label=label,
+                    expires_minutes=expires_minutes)
+            out["expires_at"] = out["expires_at"].isoformat()
+            return out
+
+        @mcp.tool()
+        def memory_admin_list_enrollments(user_id: Optional[str] = None,
+                                          ctx: Context = None) -> List[dict]:
+            """Enrollment keys and what became of them — `state` is pending,
+            redeemed, expired or revoked. Never the key itself. A key you expect
+            to be pending showing `redeemed` means somebody else redeemed it:
+            revoke the token it created (`used_token_id`) and issue another."""
+            with pool.connection() as conn:
+                out = admin.list_enrollments(conn, _principal(conn, _token(ctx)),
+                                             user_id=user_id)
+            return _iso(out, "created_at", "expires_at", "used_at", "revoked_at")
+
+        @mcp.tool()
+        def memory_admin_revoke_enrollment(enrollment_id: str,
+                                           ctx: Context = None) -> dict:
+            """Kill an unredeemed enrollment key. False means it was already
+            spent, already revoked, or never existed — and for a spent one the
+            thing to kill is the token it made, not the key."""
+            with pool.connection() as conn, conn.transaction():
+                return {"revoked": admin.revoke_enrollment(
+                    conn, _principal(conn, _token(ctx)),
+                    enrollment_id=enrollment_id)}
 
         @mcp.tool()
         def memory_admin_list_tokens(user_id: str,
@@ -950,6 +1081,10 @@ def build_server(cfg: Optional[Config] = None):
     _vis = _os.environ.get("MEMGRES_MCP_TOOL_VISIBILITY", "auto").strip().lower()
     if _vis not in ("0", "false", "off", "no"):
         _identity_on = cfg.key_mode != "single"
+        # A sentinel, not a caps dict: "identified as nobody yet" is a third
+        # answer, and encoding it as an empty dict would make it indistinguishable
+        # from "identified, allowed nothing".
+        _UNBOUND = object()
         _all_caps = {k: True for k in
                      ("can_write", "can_create_namespace", "can_manage_users",
                       "can_manage_own_tokens", "can_administer_deployment",
@@ -978,12 +1113,23 @@ def build_server(cfg: Optional[Config] = None):
                     p = identity.resolve(conn, cfg, _token(ctx),
                                          touch=False)
                 except identity.AuthError:
+                    # A credential that failed is not always a mistake: in a
+                    # managed deployment it is also how someone arrives who has
+                    # generated a token and not yet claimed an account. Only
+                    # that case gets the enrollment surface — a REVOKED or
+                    # EXPIRED token is well-formed and known, and must not be
+                    # offered a way to bind itself somewhere new.
+                    if identity.is_unbound(conn, cfg, _token(ctx)):
+                        return _UNBOUND
                     return None
                 return admin.capabilities(conn, p)
 
         def _keep(tools, ctx):
+            caps = _caps_for_caller(ctx)
+            unbound = caps is _UNBOUND
             allowed = set(visible_tools([t.name for t in tools],
-                                        _caps_for_caller(ctx), _identity_on))
+                                        None if unbound else caps, _identity_on,
+                                        unbound=unbound))
             return [t for t in tools if t.name in allowed]
 
         # Where the filter attaches differs by SDK generation, so both are
