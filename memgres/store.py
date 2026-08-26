@@ -1045,6 +1045,10 @@ class Store:
             "SELECT l.src_id::text, l.ord, l.dst_id::text FROM memory_link l "
             "JOIN memory src ON src.id = l.src_id "
             "WHERE l.dst_id = ANY(%s::uuid[]) AND src.namespace = %s "
+            # An expired referrer is invisible to every read and the sweeper is
+            # about to delete it. Rewriting it would spend a history row and a
+            # re-index on a body nobody can see and nothing will keep.
+            "  AND (src.expires_at IS NULL OR src.expires_at > now()) "
             "ORDER BY l.src_id",
             (list(by_id), ns))
         wanted: dict = {}
@@ -1062,19 +1066,36 @@ class Store:
             changes, moved = {}, []
             for ord_, (old, new) in wanted[src_id].items():
                 l = links.get(ord_)
-                # The edge and the text disagreeing should be impossible — edges
-                # are re-derived from the body on every write. If it happens,
-                # leave the link alone: a repair that guesses which one was meant
-                # is worse than one that skips.
-                if l is None or l.scheme is not None or l.raw_target != old:
-                    _log.warning("relink: edge %s#%s says %r, body does not — "
-                                 "left as written", src_id, ord_, old)
+                if l is None or l.scheme is not None:
+                    # `ord` is the link's index in this very body and edges are
+                    # re-derived from it on every write, so this should not
+                    # happen; if it does, guessing which link was meant is worse
+                    # than leaving it.
+                    _log.warning("relink: edge %s#%s has no link at that position "
+                                 "in the body — left as written", src_id, ord_)
                     continue
+                # Deliberately NOT conditional on the text still spelling `old`.
+                # Any corpus that moved a memory before this repair existed has
+                # bodies naming a path the target left long ago, while the edge
+                # stayed pinned by id — the normal state of an upgraded store, and
+                # invisible to a test suite whose every fixture starts empty.
+                # Skipping those would leave exactly the stale text that the next
+                # edit re-resolves onto whoever now holds that path.
                 changes[ord_] = new
-                moved.append(f"{old} → {new}")
+                moved.append(f"{l.raw_target} → {new}")
             new_body = rewrite_targets(body or "", changes)
             if new_body == (body or ""):
                 continue                      # nothing to write, so write nothing
+            if byte_len(new_body) > self.cfg.max_body_bytes:
+                # Repairing must not push a body past the ceiling: the owner could
+                # then no longer edit their own memory, because every write of it
+                # would be refused for size. The edge stays pinned by id, so the
+                # link still resolves — the text is what goes unrepaired.
+                _log.warning("relink: repairing %s would exceed MEMGRES_MAX_BODY_BYTES "
+                             "(%dB > %d) — text left as written; its edges still "
+                             "resolve by id", src_id, byte_len(new_body),
+                             self.cfg.max_body_bytes)
+                continue
             new_hash = content_hash(new_body)
             new_seq = seq + 1
             cur.execute(
@@ -1317,6 +1338,12 @@ class Store:
             d["tags"] = list(d["tags"]) if d["tags"] is not None else []
             d["space_id"] = str(d["space_id"])
             d["space"] = names.get(d["space_id"])
+            if not self.cfg.usage_counters:
+                # Null, not zero. Nothing is being counted here, and reporting
+                # "0 recalls, 0 reads" would read as a measurement — on a
+                # deployment with counting off (a read-only replica) it would
+                # present the entire corpus as dead weight.
+                d["recalled"] = d["gets"] = None
             shown_value = d.pop("shown")
             if not bodies:
                 d["preview"] = shown_value
@@ -1429,17 +1456,28 @@ class Store:
         full) or ``"recall"`` (came back as a search hit) — and, with `want`,
         return the totals including this one.
 
-        Best-effort by design, in its own transaction: statistics must never be
-        the reason a read fails, so a counter that cannot be written is logged and
-        the caller still gets their answer. For the same reason none of this
-        touches `memory` or the hash chain — a read must not rewrite a row that
-        holds a body, and `verify_history` must not become a function of how often
-        a memory was read (see migration 0019).
+        Best-effort: statistics must never be the reason a read fails, so a
+        counter that cannot be written is logged and the caller still gets their
+        answer. None of it touches `memory` or the hash chain — a read must not
+        rewrite a row that holds a body, and `verify_history` must not become a
+        function of how often a memory was read (see migration 0019, which also
+        explains why there is no foreign key).
+
+        Honest about the transaction: a read has already issued its SELECT by the
+        time this runs, so the `transaction()` below is a SAVEPOINT on the
+        caller's open transaction, not a top-level one. The counts therefore
+        commit when the CALLER commits, and are discarded if it rolls back —
+        acceptable for a statistic, and the reason this holds no lock on anything
+        but its own row.
 
         Rows appear on first use, so "never used" needs no storage.
         """
         if not self.cfg.usage_counters or not ids:
             return None
+        # `ON CONFLICT DO UPDATE` refuses to touch the same row twice in one
+        # statement, and it fails the WHOLE statement — every count in the call
+        # would be lost together over a duplicate that changes nothing.
+        ids = list(dict.fromkeys(ids))
         col, ts = _USAGE_COLUMNS[kind]
         try:
             with self._conn.transaction(), self._conn.cursor() as cur:
@@ -1617,6 +1655,11 @@ class Store:
             cur = self._conn.cursor()
             cur.execute("DELETE FROM memory WHERE id=%s AND namespace=%s", (id, ns))
             deleted = cur.rowcount > 0
+            if deleted:
+                # No cascade to do this for us — see migration 0019 for why the
+                # foreign key is absent. Same transaction as the delete, so the
+                # counts cannot outlive the memory they counted.
+                cur.execute("DELETE FROM memory_usage WHERE memory_id=%s", (id,))
         if deleted and self._vectors is not None:
             # drop this memory's chunk vectors (pgvector: FK-cascaded already;
             # qdrant: an out-of-band collection, so this is the real cleanup there)
@@ -1654,6 +1697,9 @@ class Store:
                 "   AND expires_at < now() LIMIT %s) "
                 "RETURNING id, namespace", (limit,))
             gone = [(str(r[0]), r[1]) for r in cur.fetchall()]
+            if gone:
+                cur.execute("DELETE FROM memory_usage WHERE memory_id = ANY(%s::uuid[])",
+                            ([m for m, _ns in gone],))
         if gone and self._vectors is not None:
             for mid, ns in gone:
                 self._vectors.delete_chunks(self._conn, mid, ns)

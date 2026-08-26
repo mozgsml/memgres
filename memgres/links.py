@@ -105,9 +105,27 @@ def _classify(target: str) -> Optional[str]:
 
 
 def parse_links(body: Optional[str]) -> List[Link]:
-    """Every link in `body`, in the order it appears."""
+    """Every link in `body`, in the order it appears.
+
+    Matched against the ORIGINAL text, with the blanked copy used only to decide
+    whether a match sits inside code. Reading the fields out of the blanked copy
+    instead was harmless while nothing wrote them back — and destructive the
+    moment something did: a label containing an inline `code` span came back as
+    that many spaces, and a rewrite then committed the loss as a well-formed diff.
+    A match may also STRADDLE a blanked region (backticks that swallow a `]]` and
+    the `[[` after it), which in the blanked copy looks like one enormous link;
+    requiring the span to be untouched by blanking rejects that as well.
+    """
+    body = body or ""
+    blanked = _blank_code(body)
     out: List[Link] = []
-    for m in _LINK.finditer(_blank_code(body or "")):
+    for m in _LINK.finditer(body):
+        # Is THIS `[[` inside code? Its own opening brackets are blanked if so.
+        # Deliberately not "is any part of the span blanked": a label may legally
+        # contain an inline `code` span, and rejecting the whole link for that
+        # would silently drop a real edge.
+        if blanked[m.start():m.start() + 2] != "[[":
+            continue
         inner = m.group(1).strip()
         target_part, _, label = inner.partition("|")
         target, _, anchor = target_part.partition("#")
@@ -150,12 +168,21 @@ def rewrite_targets(body: str, new_targets: Dict[int, str]) -> str:
     body that mentions the old path in prose or in a code span must not be touched
     at all. Substituting text would get both of those wrong.
 
-    Rewrites run back-to-front so each span is still valid when it is reached.
+    Assembled in one forward pass over the spans rather than by slicing the whole
+    body once per link: a memory at the default 256 KB ceiling can hold tens of
+    thousands of links, and rebuilding the string each time made a single rewrite
+    quadratic — seconds of CPU while holding row locks.
     """
     if not new_targets:
         return body
-    links = [l for l in parse_links(body) if l.ord in new_targets]
-    out = body
-    for l in sorted(links, key=lambda l: l.start, reverse=True):
-        out = out[:l.start] + render(new_targets[l.ord], l.anchor, l.label) + out[l.end:]
-    return out
+    links = sorted((l for l in parse_links(body) if l.ord in new_targets),
+                   key=lambda l: l.start)
+    if not links:
+        return body
+    parts, at = [], 0
+    for l in links:
+        parts.append(body[at:l.start])
+        parts.append(render(new_targets[l.ord], l.anchor, l.label))
+        at = l.end
+    parts.append(body[at:])
+    return "".join(parts)

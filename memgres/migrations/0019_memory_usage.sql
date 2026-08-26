@@ -20,8 +20,15 @@
 -- Rows are created lazily on first use, so a memory nobody has touched has no row
 -- at all — "never used" and "used zero times" are the same fact, and neither
 -- deserves storage.
+-- NO foreign key to `memory`, deliberately, and this one is counter-intuitive:
+-- a foreign key would make every counted read take a `FOR KEY SHARE` lock on the
+-- memory row, which conflicts with the `SELECT … FOR UPDATE` that begins every
+-- write — and it is held until the READER's transaction ends. Measured: a plain
+-- `get()` blocked a writer for the full duration. Statistics must not be able to
+-- block the data they describe, so the counts are cleaned up explicitly by
+-- `forget` and `purge_expired` instead of by a cascade.
 CREATE TABLE IF NOT EXISTS memory_usage (
-    memory_id      uuid PRIMARY KEY REFERENCES memory(id) ON DELETE CASCADE,
+    memory_id      uuid PRIMARY KEY,
     recall_count   bigint      NOT NULL DEFAULT 0,   -- times it came back as a hit
     get_count      bigint      NOT NULL DEFAULT 0,   -- times it was fetched in full
     last_recall_at timestamptz,

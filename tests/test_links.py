@@ -53,6 +53,11 @@ pytestmark = pytest.mark.skipif(not _reachable(), reason="no test Postgres")
 
 def _clean_env(monkeypatch):
     with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        # A test that fails mid-way leaves its connection open, and DROP SCHEMA
+        # then blocks behind it — the next run HANGS instead of reporting the
+        # failure. Evict other backends first so a broken test fails loudly.
+        cur.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND pid <> pg_backend_pid()")
         cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
@@ -605,3 +610,129 @@ def test_the_backfill_persists_after_the_server_starts_it(store):
         assert cur.fetchone()[0] == 1                  # the edge is really there
         cur.execute("SELECT links_built FROM memgres_meta")
         assert cur.fetchone()[0] is True               # and it will not run again
+
+
+# ─── what a rewrite must never do to the text around it ──────────────────────
+def test_a_rewrite_to_the_same_target_changes_nothing_at_all(store):
+    """The oracle: point every link at the target it already has, and the body
+    must come back byte-identical. Anything else is text destroyed by a repair —
+    the worst outcome available in a memory store, and it commits as a
+    well-formed diff that `verify_history` happily accepts."""
+    from memgres.links import parse_links, rewrite_targets
+    shapes = [
+        "See [[ops.a|the `runbook` doc]] for details.",
+        "[[ops.a`]] [[ops.b`]]",
+        "[[ops.a|x` and more `y]] then [[ops.b]]",
+        "plain [[ops.a]] and `[[ops.a]]` quoted",
+        "```\n[[ops.a]]\n```\nthen [[ops.b#step|см. `код`]]",
+        "[[ops.a#шаг|подпись]] · [[ops.b]] · [[idea:some-slug]]",
+        "[[ops.a]][[ops.b]] adjacent, and [[[[ops.c]]]] nested",
+        "trailing [[ops.a]]",
+        "[[ops.a]] leading",
+    ]
+    for body in shapes:
+        same = {l.ord: l.raw_target for l in parse_links(body)}
+        assert rewrite_targets(body, same) == body, f"mangled: {body!r}"
+
+
+def test_a_label_containing_code_survives_the_move(store):
+    """End to end, because the parser and the rewriter agreeing in isolation is
+    not the claim — the claim is that a move does not eat the author's text."""
+    target = store.write(body="the runbook", path="ops.a")
+    src = store.write(body="See [[ops.a|the `runbook` doc]] for details.",
+                      path="notes.a")
+    store.move(None, target.id, "ops.moved")
+    assert store.get(None, src.id).body == \
+        "See [[ops.moved|the `runbook` doc]] for details."
+
+
+def test_a_link_broken_across_a_code_span_is_not_a_link(store):
+    """Backticks that swallow a `]]` and the `[[` after it look, in the blanked
+    copy, like one enormous link spanning both. Treating it as one would delete
+    everything between them."""
+    target = store.write(body="the runbook", path="ops.a")
+    store.write(body="the other", path="ops.b")
+    src = store.write(body="[[ops.a`]] [[ops.b`]]", path="notes.a")
+    store.move(None, target.id, "ops.moved")
+    assert store.get(None, src.id).body == "[[ops.a`]] [[ops.b`]]"
+
+
+# ─── the corpus that lived through the old behaviour ─────────────────────────
+def test_a_body_left_stale_by_the_OLD_code_is_repaired_by_the_next_move(store):
+    """Every store upgraded to this repair carries bodies naming a path their
+    target left long ago — moves made before the repair existed, where the edge
+    stayed pinned by id and only the text went stale. Refusing to touch a link
+    whose text disagrees with the edge would leave exactly those unrepaired, and
+    they are the ones a later occupant captures.
+
+    No fixture can reach this state by writing normally, which is the point."""
+    target = store.write(body="the runbook", path="ops.deploy")
+    src = store.write(body="follow [[ops.deploy]] before shipping", path="notes.a")
+    store.move(None, target.id, "ops.release")
+
+    # Put the body back the way the old code left it: stale text, edge intact.
+    with store._conn.cursor() as cur:
+        cur.execute("UPDATE memory SET body='follow [[ops.deploy]] before shipping' "
+                    "WHERE id=%s", (src.id,))
+    store._conn.commit()
+
+    store.move(None, target.id, "ops.shipping")
+
+    assert store.get(None, src.id).body == "follow [[ops.shipping]] before shipping"
+    squatter = store.write(body="unrelated", path="ops.deploy", if_moved="create")
+    store.write(id=src.id, body=store.get(None, src.id).body + "\ntypo fixed")
+    [edge] = store.links(None, src.id)["out"]
+    assert edge["id"] == target.id and edge["id"] != squatter.id
+
+
+# ─── a repair must not make a memory uneditable ──────────────────────────────
+def test_a_repair_that_would_burst_the_body_ceiling_is_skipped(monkeypatch):
+    """Growth is (number of links × how much longer the new path is), and both
+    are ordinary. Pushing a body past the ceiling would leave its owner unable to
+    edit their own memory — every write of it refused for size. The edge is
+    pinned by id, so skipping costs the text, not the link."""
+    _clean_env(monkeypatch)
+    monkeypatch.setenv("MEMGRES_MAX_BODY_BYTES", "400")
+    monkeypatch.setenv("MEMGRES_MAX_WRITE_BYTES", "400")
+    conn = psycopg.connect(DSN)
+    cfg = load()
+    migrate(conn, cfg)
+    s = Store(cfg, conn=conn)
+
+    target = s.write(body="t", path="ops.a")
+    body = " ".join("[[ops.a]]" for _ in range(30))          # 299 B
+    src = s.write(body=body, path="notes.a")
+
+    s.move(None, target.id, "ops.a_much_longer_name")        # would be ~750 B
+
+    kept = s.get(None, src.id)
+    assert kept.body == body                                  # text untouched
+    assert [e["id"] for e in s.links(None, src.id)["out"]] == [target.id] * 30
+    s.write(id=src.id, body=body + " ok")                     # still editable
+    conn.close()
+
+
+def test_an_expired_referrer_is_left_alone(monkeypatch):
+    """It is invisible to every read and the sweeper is about to delete it.
+    Rewriting it spends a history row and a re-index on a body nobody can see."""
+    _clean_env(monkeypatch)
+    monkeypatch.setenv("MEMGRES_RETENTION_DAYS", "7")
+    conn = psycopg.connect(DSN)
+    cfg = load()
+    migrate(conn, cfg)
+    s = Store(cfg, conn=conn)
+
+    target = s.write(body="the runbook", path="ops.a")
+    src = s.write(body="see [[ops.a]]", path="notes.a")
+    with conn.cursor() as cur:
+        cur.execute("UPDATE memory SET expires_at = now() - interval '1 day' "
+                    "WHERE id=%s", (src.id,))
+    conn.commit()
+
+    s.move(None, target.id, "ops.moved")
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT body, seq FROM memory WHERE id=%s", (src.id,))
+        body, seq = cur.fetchone()
+    assert body == "see [[ops.a]]" and seq == 1
+    conn.close()

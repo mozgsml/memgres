@@ -18,7 +18,7 @@ from pathlib import Path
 from .config import Config
 
 # The version this build migrates the database TO (the latest migration it carries).
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 # The compatibility FLOOR: the schema version of the most recent backward-
 # INCOMPATIBLE migration — one that changed the shape/semantics old code relied on
@@ -71,6 +71,9 @@ SCHEMA_VERSION = 20
 #   v20 (0019): added the memory_usage table → additive, floor stays 16. An older
 #     client simply does not count; the statistics have a gap, and nothing an old
 #     reader relies on changed shape.
+#   v21 (0020): dropped 0019's foreign key from databases that already ran it →
+#     additive, floor stays 16. Nothing reads the constraint; removing it only
+#     stops a counted read from locking the memory row it counts.
 SCHEMA_BREAKING_VERSION = 16
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are

@@ -44,6 +44,11 @@ pytestmark = pytest.mark.skipif(not _reachable(), reason="no test Postgres")
 
 def _env(monkeypatch, **extra):
     with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        # A test that fails mid-way leaves its connection open, and DROP SCHEMA
+        # then blocks behind it — the next run HANGS instead of reporting the
+        # failure. Evict other backends first so a broken test fails loudly.
+        cur.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND pid <> pg_backend_pid()")
         cur.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
@@ -264,3 +269,60 @@ def test_the_timestamp_is_the_moment_of_the_read(store):
     first = store.get(None, m.id).usage["last_get_at"]
     second = store.get(None, m.id).usage["last_get_at"]
     assert second > first
+
+
+# ─── statistics must not be able to block the data they describe ─────────────
+def test_a_read_does_not_block_a_write_of_the_same_memory(store, monkeypatch):
+    """A foreign key from `memory_usage` to `memory` would make every counted
+    read take `FOR KEY SHARE` on the memory row — held until the READER's
+    transaction ends — and that conflicts with the `SELECT … FOR UPDATE` every
+    write begins with. Measured before the key was removed: a plain `get()` held
+    a writer for the full timeout. There is no cascade to lose, because `forget`
+    and `purge_expired` delete the counts themselves."""
+    import threading
+    m = store.write(body="the runbook", path="ops.deploy")
+    store._conn.commit()
+
+    store.get(None, m.id)                      # counts, and leaves the tx open
+    assert store._conn.info.transaction_status != 0    # genuinely mid-transaction
+
+    done = threading.Event()
+    def writer():
+        w = psycopg.connect(DSN)
+        try:
+            with w.cursor() as cur:
+                cur.execute("SET lock_timeout = '3s'")
+                cur.execute("SELECT id FROM memory WHERE id=%s FOR UPDATE", (m.id,))
+            w.commit()
+            done.set()
+        finally:
+            w.close()
+    t = threading.Thread(target=writer); t.start(); t.join(5)
+    assert done.is_set(), "a pure read blocked a write of the same memory"
+    store._conn.rollback()
+
+
+def test_one_duplicate_id_does_not_lose_the_whole_batch(store):
+    """`ON CONFLICT DO UPDATE` refuses to touch a row twice in one statement and
+    fails the ENTIRE statement — so a duplicate that changes nothing would take
+    every other count in the call down with it."""
+    a = store.write(body="one", path="a.one")
+    b = store.write(body="two", path="a.two")
+    store._count_usage("recall", [a.id, b.id, a.id])
+    assert _row(store, a.id)["recalled"] == 1
+    assert _row(store, b.id)["recalled"] == 1
+
+
+def test_with_counting_off_browsing_reports_nothing_not_zero(monkeypatch):
+    """Zero is a measurement. On a deployment that counts nothing, reporting it
+    presents the whole corpus as dead weight — and `memory_list` tells operators
+    that exact pair is how dead weight is found."""
+    _env(monkeypatch, MEMGRES_USAGE_COUNTERS="false")
+    conn = psycopg.connect(DSN)
+    cfg = load()
+    migrate(conn, cfg)
+    s = Store(cfg, conn=conn)
+    s.write(body="apple pie", path="food.a")
+    [row] = s.list(None, path_prefix="food")
+    assert row["recalled"] is None and row["gets"] is None
+    conn.close()
