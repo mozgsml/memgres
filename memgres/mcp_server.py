@@ -666,7 +666,10 @@ def build_server(cfg: Optional[Config] = None):
                            ctx: Context = None) -> dict:
         """Mint a new token for your account (rotate / delegate / time-box).
         `permission` is its ceiling (read|write|admin); `space`/`space_id` scope
-        it to one namespace (omit for all yours). The secret is returned ONCE."""
+        it to one namespace (omit for all yours). The secret is returned ONCE —
+        unless this deployment sets a token sink, and then the reply carries only
+        the path of the file on the server it was written to, so the secret never
+        enters this conversation."""
         import datetime as dt
         exp = None
         if expires_days:
@@ -702,8 +705,9 @@ def build_server(cfg: Optional[Config] = None):
             secret, tid = identity.issue_token(
                 conn, uid, namespace_id=nsid, permission=permission,
                 label=label, expires_at=exp)
-        return {"token": secret, "id": tid, "permission": permission,
-                "namespace_id": nsid, "note": "store this now — it is not recoverable"}
+        out = admin.deliver_secret(secret, tid, cfg.token_sink)
+        out.update({"permission": permission, "namespace_id": nsid})
+        return out
 
     @mcp.tool()
     def memory_list_tokens(ctx: Context = None) -> List[dict]:
@@ -906,13 +910,15 @@ def build_server(cfg: Optional[Config] = None):
                                      ctx: Context = None) -> dict:
             """Mint a token for another user. `permission` is its ceiling,
             `space_id` scopes it to one namespace (omit for all theirs). The
-            secret is returned ONCE. Issuing for an admin-role account requires
-            superadmin."""
+            secret is returned ONCE — unless this deployment sets a token sink,
+            and then the reply carries only the path of the file on the server it
+            was written to, so the secret never enters this conversation. Issuing
+            for an admin-role account requires superadmin."""
             with pool.connection() as conn, conn.transaction():
                 return admin.issue_token(
                     conn, _principal(conn, _token(ctx)), user_id=user_id,
                     namespace_id=space_id, permission=permission, label=label,
-                    expires_days=expires_days)
+                    expires_days=expires_days, sink_dir=cfg.token_sink)
 
         @mcp.tool()
         def memory_admin_list_tokens(user_id: str,

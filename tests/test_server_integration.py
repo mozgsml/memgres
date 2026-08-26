@@ -166,7 +166,12 @@ def test_list_memories_route(client):
 def test_info_route(client):
     info = client.get("/info").json()
     assert set(info) == {"version", "schema_version", "limits", "embed",
-                         "recall_modes", "vector_backend", "key_mode", "fts_language"}
+                         "retention", "recall_modes", "vector_backend",
+                         "key_mode", "fts_language"}
+    # the fixture keeps everything, and the route has to say so rather than
+    # leaving a client to infer it from a missing field
+    assert info["retention"]["expires"] is False
+    assert info["retention"]["days"] is None
     assert isinstance(info["version"], str) and info["version"]
     assert info["recall_modes"] == ["lexical"]     # embed provider none in fixture
     assert info["key_mode"] == "single"

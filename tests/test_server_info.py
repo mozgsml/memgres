@@ -34,7 +34,8 @@ def test_top_level_keys_and_limits(monkeypatch):
     monkeypatch.setenv("MEMGRES_MAX_TITLE_BYTES", "128")
     info = server_info(load())
     assert set(info) == {"version", "schema_version", "limits", "embed",
-                         "recall_modes", "vector_backend", "key_mode", "fts_language"}
+                         "retention", "recall_modes", "vector_backend",
+                         "key_mode", "fts_language"}
     monkeypatch.setenv("MEMGRES_LIST_BODIES_MAX_BYTES", "4096")
     info = server_info(load())
     assert info["limits"] == {"max_body_bytes": 9000, "max_write_bytes": 800,
@@ -83,6 +84,49 @@ def test_dim_falls_back_to_config_when_no_live_embedder(monkeypatch):
     monkeypatch.setenv("MEMGRES_EMBED_DIM", "512")
     info = server_info(load())          # no embed_dim passed
     assert info["embed"]["dim"] == 512
+
+
+# ─── retention: how long a memory survives, said out loud ────────────────────
+
+def test_unlimited_retention_says_so_rather_than_staying_silent(monkeypatch):
+    """The default keeps everything, and that is exactly the case a client
+    guesses wrong about: nothing in any other reply hints that an expiry could
+    exist at all, so "no expiry" has to be stated, not inferred from a null."""
+    _clear(monkeypatch)
+    info = server_info(load())
+    assert info["retention"]["days"] is None
+    assert info["retention"]["expires"] is False
+    assert "indefinitely" in info["retention"]["policy"]
+
+
+def test_a_retention_window_is_reported_with_what_renews_it(monkeypatch):
+    _clear(monkeypatch)
+    monkeypatch.setenv("MEMGRES_RETENTION_DAYS", "30")
+    info = server_info(load())
+    assert info["retention"]["days"] == 30
+    assert info["retention"]["expires"] is True
+    assert info["retention"]["renew_on_read"] is True
+    assert "30 days" in info["retention"]["policy"]
+    assert "read" in info["retention"]["policy"]
+
+
+def test_renew_on_read_off_changes_the_policy_sentence(monkeypatch):
+    _clear(monkeypatch)
+    monkeypatch.setenv("MEMGRES_RETENTION_DAYS", "7")
+    monkeypatch.setenv("MEMGRES_RENEW_ON_READ", "false")
+    info = server_info(load())
+    assert info["retention"]["renew_on_read"] is False
+    assert "only a write" in info["retention"]["policy"]
+
+
+def test_renew_on_read_is_not_advertised_when_nothing_expires(monkeypatch):
+    """`MEMGRES_RENEW_ON_READ` defaults to true and is read by the store only
+    when a window exists. Reporting it as live under unlimited retention would
+    describe a clock that isn't running."""
+    _clear(monkeypatch)
+    monkeypatch.setenv("MEMGRES_RENEW_ON_READ", "true")
+    info = server_info(load())          # retention_days defaults to 0
+    assert info["retention"]["renew_on_read"] is False
 
 
 def test_no_secrets_leak(monkeypatch):

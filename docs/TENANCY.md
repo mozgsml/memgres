@@ -387,6 +387,42 @@ which is every mode but `single`. Turning them off shortens an agent-facing tool
 list — it is a context economy, **not** a security boundary, since every tool
 authorizes when it is called.
 
+### Delivering the secret without printing it
+
+Provisioning is increasingly done **by an agent**, over MCP — and a minted secret
+in a tool result is a secret in a transcript: logged, summarized, replayed into a
+model's context, shipped to a provider. Rotating it afterwards is the only cure,
+and only if you notice.
+
+Set `MEMGRES_TOKEN_SINK` to an absolute directory and every door stops returning
+secrets. `identity.stash_secret` writes `<dir>/<token-id>.token` (`0600`, in a
+`0700` directory) and the reply carries the path instead:
+
+```json
+{"id": "…", "delivered": "file", "path": "/var/lib/memgres/tokens/….token",
+ "note": "the secret was written to that file on the server and deliberately NOT returned here — read it there"}
+```
+
+The agent can still do the whole job — create the user, create the namespace,
+mint the token, report the ids — and never holds the credential. You read the
+file over your own SSH session and hand it to the person it belongs to.
+
+For provisioning done by a human on the box there is a CLI, which like
+`memgres-grant-superadmin` talks straight to the database (the gate is host/DB
+access, so there is no admin token to hold and nothing to leak in transit):
+
+```bash
+# a whole new person: user + their own namespace + a token, in one command
+memgres-provision --name ivan --full-name "Иван Петров" --space ivan --out ~/ivan.token
+
+# another token for someone who exists (rotation, a second device)
+memgres-provision --user <uuid> --label laptop --expires-days 90
+```
+
+It prints the user id, the namespace id and the token id — everything except the
+secret, which goes to `--out`, or to `MEMGRES_TOKEN_SINK` if that is set, and to
+stdout only as a last resort (with a warning naming your shell history).
+
 ### Who may act on whom
 
 **Authority is the role AND the token, never just the role.** A deployment-wide
@@ -432,3 +468,4 @@ registrations.
 | `MEMGRES_ADMIN_TOKEN_FILE` | read-or-create path for the bootstrap token (mutually exclusive with the above) |
 | `MEMGRES_ADMIN_ROLE` | role the bootstrap admin is seeded with: `user_manager` (default) \| `superadmin` |
 | `MEMGRES_TOKEN` | a default token used when a call passes none (single-tenant endpoints) |
+| `MEMGRES_TOKEN_SINK` | absolute directory a minted secret is written to (`0600`) instead of being returned |

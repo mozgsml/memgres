@@ -42,6 +42,7 @@ memgres-worker = "memgres.worker:main"
 memgres-reembed = "memgres.reembed:main"
 memgres-relink = "memgres.relink:main"
 memgres-grant-superadmin = "memgres.admin_cli:main"
+memgres-provision = "memgres.token_cli:main"
 memgres-healthcheck = "memgres.healthcheck:main"
 
 [build-system]

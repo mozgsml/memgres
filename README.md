@@ -178,6 +178,7 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_KEY_MODE` | `single` | `single` (no auth, one space) · `open` (bring-your-own token, self-registers) · `managed` (admin-provisioned). See [docs/TENANCY.md](docs/TENANCY.md) |
 | `MEMGRES_ADMIN_TOKEN` | — | global admin bearer for provisioning (managed mode) |
 | `MEMGRES_TOKEN` | — | default token used when a call passes none (single-tenant endpoints) |
+| `MEMGRES_TOKEN_SINK` | — | absolute directory a minted secret is **written to** (`<token-id>.token`, `0600`) instead of being returned. Set it when provisioning is done by an agent — a secret in a tool result is a secret in a transcript. See [docs/TENANCY.md](docs/TENANCY.md) |
 | `MEMGRES_TREE` | `true` | `ltree` path column + GiST index (fast subtree select) |
 | `MEMGRES_REQUIRE_TITLE` | `true` | `true` = a write that stores content must supply `title`. Captions are what name a memory in results and what title-weighted ranking weighs; `move`/`retag` are exempt (they store no content) |
 | `MEMGRES_REQUIRE_PARENT` | `false` | `true` = a node's parent path must already exist |

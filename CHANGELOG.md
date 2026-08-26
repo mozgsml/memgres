@@ -5,6 +5,33 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.9.0] — 2026-08-26
+
+### Added
+- **`server_info` reports retention.** A client had no way to learn whether what
+  it stores expires — and "kept indefinitely", the default, is the case it
+  guesses wrong about most often, because nothing in any other reply hints that
+  an expiry could exist at all. The new `retention` block says it in three
+  forms: `days` (`null` = nothing expires), `expires`, `renew_on_read`, and a
+  `policy` sentence a human can quote. `renew_on_read` is reported false when
+  nothing expires — describing a clock that isn't running is worse than silence.
+- **`MEMGRES_TOKEN_SINK` — mint a token without the secret entering the reply.**
+  Provisioning is increasingly done by an agent over MCP, and a secret in a tool
+  result is a secret in a transcript: logged, summarized, replayed into a model's
+  context. Point the setting at an absolute directory and every door (MCP admin,
+  MCP self-service, REST) writes the secret to `<dir>/<token-id>.token` (`0600`,
+  directory `0700`) and returns `{"id", "delivered": "file", "path"}` instead.
+  Unset, behaviour is unchanged — the reply is the only channel a deployment
+  without a sink has.
+- **`memgres-provision`** — one command that creates a user, gives it a
+  namespace and mints its token, printing every id and no secret (`--out PATH`,
+  else the sink, else stdout with a warning). Like `memgres-grant-superadmin` it
+  talks straight to the database, so the gate is host/DB access rather than a
+  network token.
+
+### Fixed
+- `.env.example` still documented `MEMGRES_MCP_TOKEN_ARG`, removed in 0.8.0.
+
 ## [0.8.0] — 2026-08-26
 
 ### Breaking

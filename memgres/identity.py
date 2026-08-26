@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import re
 import secrets
 from dataclasses import dataclass
@@ -1062,6 +1063,28 @@ def issue_token(conn, user_id: str, *, namespace_id: Optional[str] = None,
             "label, expires_at) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
             (token_hash(secret), user_id, namespace_id, permission, label, expires_at))
         return secret, str(cur.fetchone()[0])
+
+
+def stash_secret(sink_dir: str, token_id: str, secret: str) -> str:
+    """Write a freshly minted secret to ``<sink_dir>/<token_id>.token`` (0600)
+    and return the path.
+
+    The out-of-band delivery channel for a deployment whose callers are agents.
+    Returning the secret in the reply is fine for a program; for an LLM it means
+    the secret is now in a transcript that gets logged, summarized and shipped
+    to a model provider. Handing back a path instead keeps the operator's own
+    shell as the only place the secret is ever rendered.
+
+    The directory is created 0700 if missing, and the file is opened with
+    ``O_CREAT`` at 0600 so the secret is never briefly world-readable.
+    """
+    os.makedirs(sink_dir, mode=0o700, exist_ok=True)
+    path = os.path.join(sink_dir, f"{token_id}.token")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(secret + "\n")
+    os.chmod(path, 0o600)               # tighten even if the file pre-existed
+    return path
 
 
 def register_token(conn, user_id: str, secret: str, *,

@@ -70,6 +70,12 @@ class Config:
                                  # path only. Mutually exclusive with admin_token.
     admin_role: str              # role the bootstrap admin is seeded with:
                                  # user_manager (default) | superadmin
+    token_sink: str              # directory a freshly minted token secret is
+                                 # WRITTEN to (0600) instead of being returned in
+                                 # the reply. Set it when the caller is an agent:
+                                 # a secret in a tool result is a secret in a chat
+                                 # transcript, and every transcript is copied,
+                                 # summarized and stored. Empty = return it.
     # organization
     tree_enabled: bool           # ltree path column + GiST index for fast subtree selection
     require_title: bool          # True = a write that stores CONTENT must caption it
@@ -182,6 +188,11 @@ class Config:
             raise ValueError(
                 "MEMGRES_ADMIN_ROLE must be user_manager or superadmin "
                 f"(got {self.admin_role!r})")
+        if self.token_sink and not os.path.isabs(self.token_sink):
+            # A relative sink resolves against each process's CWD, so the server
+            # and the CLI would write the same operator's secrets to different
+            # directories — and neither would say so.
+            raise ValueError("MEMGRES_TOKEN_SINK must be an absolute path")
         if self.admin_token and self.admin_token_file:
             raise ValueError(
                 "set only one of MEMGRES_ADMIN_TOKEN / MEMGRES_ADMIN_TOKEN_FILE")
@@ -208,6 +219,7 @@ def load() -> Config:
         admin_token=_str("MEMGRES_ADMIN_TOKEN", ""),
         admin_token_file=_str("MEMGRES_ADMIN_TOKEN_FILE", ""),
         admin_role=_str("MEMGRES_ADMIN_ROLE", "user_manager"),
+        token_sink=_str("MEMGRES_TOKEN_SINK", ""),
         tree_enabled=_bool("MEMGRES_TREE", True),
         require_title=_bool("MEMGRES_REQUIRE_TITLE", True),
         require_parent=_bool("MEMGRES_REQUIRE_PARENT", False),

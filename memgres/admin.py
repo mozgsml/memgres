@@ -409,11 +409,17 @@ def list_spaces(conn, p: Principal) -> List[dict]:
 
 def issue_token(conn, p: Principal, *, user_id: str,
                 namespace_id: Optional[str] = None, permission: str = "write",
-                label: str = "", expires_days: Optional[int] = None) -> dict:
+                label: str = "", expires_days: Optional[int] = None,
+                sink_dir: str = "") -> dict:
     """Mint a token for `user_id`. The secret is returned once and never again.
 
     `expires_days` rather than a timestamp: both doors were converting the same
     way, so the conversion belongs here.
+
+    `sink_dir` (the deployment's `MEMGRES_TOKEN_SINK`) diverts the secret to a
+    0600 file on the server and returns its path instead — see
+    `identity.stash_secret`. The caller then never holds the secret at all,
+    which is the point when the caller is an agent.
     """
     require_manage_users(p)
     _require_target_is_plain_user(conn, p, user_id, "issuing a token")
@@ -423,7 +429,20 @@ def issue_token(conn, p: Principal, *, user_id: str,
     secret, tid = identity.issue_token(conn, user_id, namespace_id=namespace_id,
                                        permission=permission, label=label,
                                        expires_at=expires_at)
-    return {"token": secret, "id": tid,
+    return deliver_secret(secret, tid, sink_dir)
+
+
+def deliver_secret(secret: str, token_id: str, sink_dir: str) -> dict:
+    """The reply for a freshly minted token: the secret itself, or — when the
+    deployment set a sink — only where it was put. One function so both minting
+    doors (this module and the MCP self-service tool) cannot disagree about
+    whether a secret is allowed into a response body."""
+    if sink_dir:
+        path = identity.stash_secret(sink_dir, token_id, secret)
+        return {"id": token_id, "delivered": "file", "path": path,
+                "note": "the secret was written to that file on the server and "
+                        "deliberately NOT returned here — read it there"}
+    return {"token": secret, "id": token_id,
             "note": "store this now — it is not recoverable"}
 
 

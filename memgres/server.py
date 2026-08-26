@@ -537,7 +537,7 @@ def create_app(cfg: Optional[Config] = None):
             return _guard(lambda: admin.issue_token(
                 conn, p, user_id=req.user_id, namespace_id=req.namespace_id,
                 permission=req.permission, label=req.label,
-                expires_days=req.expires_days))
+                expires_days=req.expires_days, sink_dir=cfg.token_sink))
 
     @app.post("/admin/tokens/{token_id}/revoke")
     def admin_revoke_token(token_id: str, p=Depends(principal)):
