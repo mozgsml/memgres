@@ -47,8 +47,19 @@ Spaces = Optional[Union[str, List[str]]]
 
 # The MCP `initialize` response carries a server-side `instructions` string; a
 # client that honors it (e.g. Claude Code) loads it ONCE at connect, so it guides
-# the model without inflating every tool response. Kept small on purpose.
-MCP_INSTRUCTION_MAX_BYTES = 2048
+# the model without inflating every tool response.
+#
+# A GUARDRAIL, not a target. The real cost of a long instruction is not the tokens
+# — it is loaded once, and 4 KB is well under a thousand of them — but that it sits
+# in the system prompt and is re-read every turn: a rulebook is followed less
+# reliably the more it says. Keep the always-true rules inline and point at a
+# memory for anything situational; the store the agent is being told about is
+# itself the place for depth.
+#
+# Counted in BYTES, which matters more than it looks: non-Latin text costs two
+# bytes per character, so the same rulebook in Russian fits half as much. 2048 was
+# too tight for a bilingual deployment to say what it had to.
+MCP_INSTRUCTION_MAX_BYTES = 4096
 
 
 # ─── what each tool needs before it is worth showing ─────────────────────────

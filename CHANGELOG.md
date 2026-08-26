@@ -5,6 +5,17 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.7.1] — 2026-08-26
+
+### Changed
+- **The MCP instruction ceiling is 4096 bytes** (was 2048). It is a guardrail, not
+  a target: the cost of a long instruction is not tokens — it loads once — but that
+  it sits in the system prompt and is re-read every turn, and a rulebook is followed
+  less reliably the more it says. The extra room is for deployments that could not
+  fit what they had to say, particularly non-Latin ones: the cap counts BYTES, so
+  the same rulebook in Russian fit half as much. Keep always-true rules inline and
+  point at a memory for anything situational.
+
 ## [0.7.0] — 2026-08-25
 
 Search, tags and retention — three places where memgres answered with silence

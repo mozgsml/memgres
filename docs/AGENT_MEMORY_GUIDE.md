@@ -26,11 +26,17 @@ a client that honors it (e.g. Claude Code) loads it **once at connect**, so the
 model follows it without you re-stating it every turn. Set it via the
 `MEMGRES_INSTRUCTION` environment variable on the server/MCP process.
 
-**It is capped at 2048 bytes** (truncated on a UTF-8 boundary). That is deliberately
-small — it is the always-apply rulebook, not the manual. Keep the full guidance in a
-doc like this one and distill the essentials into the 2 KB. A ready example (English,
-~1.5 KB — adjust to your org and language; note non-ASCII costs 2 bytes/char against
-the cap):
+**It is capped at 4096 bytes** (truncated on a UTF-8 boundary), and that ceiling is a
+guardrail rather than a target. It is the always-apply rulebook, not the manual: it
+sits in the system prompt and is re-read every turn, so a long one is followed less
+reliably than a short one. Keep the always-true rules inline — what must never be
+stored, what must accompany every write — and point at a memory (`[[path]]`) for
+anything situational, such as how to resolve a conflict. The store you are telling
+the agent about is the right place for depth.
+
+Note the cap is in BYTES: non-Latin text costs two bytes per character, so the same
+rulebook in Russian fits half as much. A ready example (English, ~1.5 KB — adjust to
+your org and language):
 
 ```
 memgres is your durable cross-session memory. Prefer it over chat history.
