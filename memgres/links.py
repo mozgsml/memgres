@@ -52,10 +52,19 @@ from typing import Dict, List, Optional
 # edges so they are visible, never resolved — we do not own the address space.
 KNOWN_SCHEMES = ("idea", "file")
 
-# An ltree path: labels of [A-Za-z0-9_] joined by dots. Deliberately strict —
+# An ltree path: labels of [A-Za-z0-9_-] joined by dots. Deliberately strict —
 # this is what tells a path apart from a slug belonging to another store, and
 # from prose that happens to sit in double brackets.
-_PATH = re.compile(r"^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$")
+#
+# The hyphen is there because PATHS MAY CONTAIN ONE. Postgres has allowed `-` in
+# ltree labels since 13 (the minimum this project supports), `write` accepts such
+# a path without complaint, and real corpora are full of them —
+# `infra.servers.video-production`. While this pattern rejected the hyphen the
+# two halves of the product disagreed about what a path is: the link was stored
+# as prose, `_classify` returned "ignore", and the edge did not even become a
+# DANGLING one. It vanished, and `memory_links` answered "nothing points here",
+# which reads as a fact about the corpus rather than as a parser that quit.
+_PATH = re.compile(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$")
 
 _LINK = re.compile(r"\[\[([^\[\]\n]+)\]\]")
 _FENCE = re.compile(r"```.*?```|~~~.*?~~~", re.S)
@@ -82,8 +91,58 @@ class Link:
     end: int = 0
 
 
+def _blank_indented(original: str, text: str) -> str:
+    """Blank markdown's OTHER code block: a run of lines indented by four spaces
+    (or a tab), opened by a blank line.
+
+    Fences are not the only way to show code, and the indented form is what a
+    hand-written example tends to use. A frp config pasted that way put
+    ``[[proxies]]`` — a TOML array-of-tables header, and a perfectly well-formed
+    path — into the link graph as a dangling edge to a memory nobody will ever
+    write. The parser must ignore code wherever markdown says code is.
+
+    A blank line inside the block does not end it; the first non-blank line back
+    at the margin does. Opening on a blank line is what keeps an ordinary list
+    item or a wrapped line — indented, but not preceded by a blank — from being
+    read as code.
+
+    🔴 Which lines are code is decided from `original`, and the blanking applied
+    to `text` — the copy where spans and fences are already spaces. Deciding from
+    the blanked copy instead made every line that STARTED with an inline code
+    span look indented: "`[[a]]` but [[b]] counts" became four-plus leading
+    spaces, the whole line was swallowed as a block, and a real link next to a
+    code span disappeared. Both strings are length-preserving, so their lines
+    correspond one to one.
+    """
+    def blank(line: str) -> str:
+        return "".join(" " if c != "\n" else "\n" for c in line)
+
+    src = original.splitlines(keepends=True)
+    dst = text.splitlines(keepends=True)
+    out, in_block, prev_blank = [], False, True
+    for i, line in enumerate(src):
+        stripped = line.strip("\n")
+        is_blank = not stripped.strip()
+        indented = stripped.startswith("    ") or stripped.startswith("\t")
+        current = dst[i] if i < len(dst) else line
+        if in_block:
+            if is_blank or indented:
+                out.append(current if is_blank else blank(current))
+            else:
+                in_block = False
+                out.append(current)
+        elif indented and prev_blank:
+            in_block = True
+            out.append(blank(current))
+        else:
+            out.append(current)
+        prev_blank = is_blank
+    return "".join(out)
+
+
 def _blank_code(body: str) -> str:
-    """Replace code spans and fenced blocks with spaces of the same length.
+    """Replace code spans and code blocks — fenced AND indented — with spaces of
+    the same length.
 
     Same length, not removal, so every offset in the returned text still lines up
     with the original — the parser does not need that today, but an anchor
@@ -92,7 +151,7 @@ def _blank_code(body: str) -> str:
     """
     def blank(m: re.Match) -> str:
         return "".join(" " if c != "\n" else "\n" for c in m.group(0))
-    return _CODE_SPAN.sub(blank, _FENCE.sub(blank, body))
+    return _blank_indented(body, _CODE_SPAN.sub(blank, _FENCE.sub(blank, body)))
 
 
 def _classify(target: str) -> Optional[str]:

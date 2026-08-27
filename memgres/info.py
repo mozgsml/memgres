@@ -65,6 +65,14 @@ def server_info(cfg: Config, embed_dim: Optional[int] = None) -> dict:
             "renew_on_read": bool(days > 0 and cfg.renew_on_read),
             "policy": _retention_policy(days, cfg.renew_on_read),
         },
+        # What a write MUST carry here. Announced rather than discovered from a
+        # refusal: a client that learns the rule by being rejected has already
+        # composed the memory, and a rule nobody can see before writing is a rule
+        # that gets satisfied with junk on the second attempt.
+        "write_requirements": {
+            "title": cfg.require_title,
+            "fields": list(cfg.required_fields),
+        },
         "recall_modes": ["lexical"] if lexical_only
         else ["lexical", "semantic", "hybrid", "auto"],
         "vector_backend": cfg.vector_backend,

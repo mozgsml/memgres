@@ -5,6 +5,50 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.12.0] — 2026-08-27
+
+Two failures found while using memgres to document real infrastructure, both of
+the same family: the tool knew something had gone wrong and said nothing.
+
+### Fixed — the link parser was wrong in both directions
+- **A path with a hyphen was not recognised as a link.** `_PATH` accepted only
+  `[A-Za-z0-9_]`, while `write` stores hyphenated paths without complaint —
+  Postgres has allowed `-` in ltree labels since 13. So the two halves of the
+  product disagreed about what a path is, and `[[infra.servers.video-production]]`
+  was classified as prose. Not kept as a DANGLING edge — dropped. `memory_links`
+  then answered "nothing points here", which reads as a fact about the corpus
+  rather than as a parser that quit. On one real corpus of 46 memories the fix
+  turns 123 edges into 174, all resolving: the whole machine registry links by
+  hyphenated path.
+- **Code indented by four spaces was parsed as prose.** Fences and backticks
+  were blanked, markdown's other code block was not, so a TOML example pasted
+  with an indent put `[[proxies]]` — a well-formed path — into the graph as an
+  edge to a memory nobody will ever write.
+- Migration `0023` clears `links_built` so the existing one-time backfill
+  re-derives every memory's edges under the fixed parser. It rewrites a derived
+  index from stored text: bodies, history and the hash chain are untouched.
+
+### Added — a write now confirms what it recorded, and can be made to require it
+- **`source` and `valid_at` come back in the answer to a write.** They were
+  stored and never echoed, so a required field's absence was invisible: four
+  edits in a row went out with an empty `source` and every reply looked healthy.
+  On a WRITE only — provenance belongs to the revision, not to the memory, and a
+  read has no business claiming one (that is `history`/`blame`).
+- **`MEMGRES_REQUIRED_FIELDS`** — a deployment declares which fields a
+  content-storing write must carry (`source`, `reason`, `title`). Refusal names
+  the field AND what it is for, or the requirement degenerates into filling the
+  box. Moves and retags are exempt, as they already are for the title: they
+  store no content, and making a memory harder to re-file than to write is the
+  surest way to get junk in the field.
+- **`server_info.write_requirements`** announces the rule, because a rule a
+  client can only learn from a refusal is one it satisfies badly on the retry.
+
+### Added — how often a memory is rewritten
+- **`edits`** joins the usage counters, in `get` and in `list`. How often
+  something is read says it is useful; how often it is rewritten says it is
+  alive, and ranking "what is hot" wants both. Free: `seq` counts revisions
+  already, and the first one is the creation.
+
 ## [0.11.0] — 2026-08-26
 
 Two adversarial reviews of the 0.9.0/0.10.0 waves — one on authorization, one on

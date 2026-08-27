@@ -166,7 +166,8 @@ def test_list_memories_route(client):
 def test_info_route(client):
     info = client.get("/info").json()
     assert set(info) == {"version", "schema_version", "limits", "embed",
-                         "retention", "recall_modes", "vector_backend",
+                         "retention", "write_requirements",
+                         "recall_modes", "vector_backend",
                          "key_mode", "fts_language"}
     # the fixture keeps everything, and the route has to say so rather than
     # leaving a client to infer it from a missing field

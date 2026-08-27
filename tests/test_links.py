@@ -147,7 +147,49 @@ def test_urls_and_prose_are_left_alone():
     assert parse_links("[[https://example.com/x]]") == []
     assert parse_links("[[mailto:someone@example.com]]") == []
     assert parse_links("[[some thing with spaces]]") == []
-    assert parse_links("[[has-hyphens]]") == []      # not an ltree label
+
+
+def test_a_hyphen_belongs_to_a_path():
+    """This assertion used to say the opposite, on the belief that a hyphen is
+    not an ltree label. It is: Postgres has allowed one since 13, `write` stores
+    such paths without complaint, and a real corpus is full of them. While the
+    parser disagreed, every `[[infra.servers.video-production]]` was silently
+    dropped — not kept as dangling, dropped — so `memory_links` reported an empty
+    graph and it read like a fact about the corpus."""
+    links = parse_links("see [[infra.servers.video-production]] and [[ops.frp.tunnel]]")
+    assert [l.raw_target for l in links] == ["infra.servers.video-production",
+                                             "ops.frp.tunnel"]
+    assert all(l.scheme is None for l in links)
+
+
+def test_code_indented_by_four_spaces_is_still_code():
+    """Fences are not the only way to show code. A frp config pasted with an
+    indent put `[[proxies]]` — a TOML array-of-tables header that happens to be a
+    well-formed path — into the graph as an edge to a memory nobody will write."""
+    body = ("Add a section:\n"
+            "\n"
+            "    [[proxies]]\n"
+            "    name = \"memgres\"\n"
+            "\n"
+            "then restart, see [[ops.frp.tunnel]].\n")
+    assert [l.raw_target for l in parse_links(body)] == ["ops.frp.tunnel"]
+
+
+def test_a_blank_line_inside_the_block_does_not_end_it():
+    body = ("Example:\n\n"
+            "    [[first]]\n"
+            "\n"
+            "    [[second]]\n"
+            "\n"
+            "back at the margin: [[real.one]]\n")
+    assert [l.raw_target for l in parse_links(body)] == ["real.one"]
+
+
+def test_an_indented_list_item_is_not_code():
+    """Two spaces is a list, not a block — and the link in it is a real one.
+    Blanking by indentation alone would have eaten it."""
+    body = "Пункты:\n  - см. [[ops.memory.onboarding]]\n"
+    assert [l.raw_target for l in parse_links(body)] == ["ops.memory.onboarding"]
 
 
 def test_known_schemes_point_at_other_stores():

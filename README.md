@@ -180,6 +180,7 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_TOKEN` | — | default token used when a call passes none (single-tenant endpoints) |
 | `MEMGRES_TOKEN_SINK` | — | absolute directory a minted secret is **written to** (`<token-id>.token`, `0600`) instead of being returned. Set it when provisioning is done by an agent — a secret in a tool result is a secret in a transcript. See [docs/TENANCY.md](docs/TENANCY.md) |
 | `MEMGRES_TREE` | `true` | `ltree` path column + GiST index (fast subtree select) |
+| `MEMGRES_REQUIRED_FIELDS` | — | comma-separated fields a content-storing write must carry (`source`, `reason`), refused by name when absent. A policy about a corpus, not a property of the software: a scratch database wants none, a corporate one wants `source`. `move`/`retag` are exempt. Announced in `server_info.write_requirements` |
 | `MEMGRES_REQUIRE_TITLE` | `true` | `true` = a write that stores content must supply `title`. Captions are what name a memory in results and what title-weighted ranking weighs; `move`/`retag` are exempt (they store no content) |
 | `MEMGRES_REQUIRE_PARENT` | `false` | `true` = a node's parent path must already exist |
 | `MEMGRES_HISTORY` | `true` | keep the hash-chained diff history (deleted with the record) |

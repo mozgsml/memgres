@@ -95,6 +95,15 @@ def _as_date(value: object):
         f"the content was last known to be accurate")
 
 
+class MissingField(ValueError):
+    """A write left out a field this deployment declares mandatory.
+
+    Separate from `MissingTitle` on purpose: the title is required by a setting
+    of its own and has been since long before this, and folding it in would
+    change the exception a client already catches.
+    """
+
+
 class MissingTitle(ValueError):
     """A write stored content without a caption, and the deployment requires one
     (``MEMGRES_REQUIRE_TITLE``, default on).
@@ -238,6 +247,15 @@ class Memory:
     # how much this memory is used — set only by `get`, and only when the
     # deployment counts (see `_count_usage`). A write does not have it.
     usage: Optional[dict] = None
+    # Provenance of the REVISION this call just wrote — never of the memory,
+    # which has no single source: `source`/`reason`/`valid_at` live on the
+    # history row because different edits speak to different origins and dates.
+    # So these are set by `write` and stay None on a read, where the question
+    # belongs to `history`/`blame`. Echoed back because a required field that the
+    # answer does not confirm is a field whose absence nobody notices: four edits
+    # in a row went out with an empty `source` and every reply looked fine.
+    source: Optional[str] = None
+    valid_at: object = None
 
     def to_dict(self, *, stringify_dates: bool = False) -> dict:
         """Serialize for an API layer. ``stringify_dates`` str()-coerces the
@@ -247,6 +265,7 @@ class Memory:
             return (str(v) if v is not None else None) if stringify_dates else v
         return {"id": self.id, "content_hash": self.content_hash, "body": self.body,
                 "title": self.title, "tags": self.tags, "path": self.path,
+                "source": self.source, "valid_at": d(self.valid_at),
                 "seq": self.seq, "created_at": d(self.created_at),
                 "updated_at": d(self.updated_at), "expires_at": d(self.expires_at),
                 "created": self.created, "moved_from": self.moved_from,
@@ -595,6 +614,12 @@ class Store:
                                          need="write", for_write=True)
             self._check_provenance_size(source, reason)
             self._check_title_size(title)
+            # Content-storing is what the title rule already means by it: a body,
+            # a diff or a substring edit. A create always stores content.
+            self._require_fields(
+                stores_content=(id is None and at is None) or body is not None
+                               or diff is not None or replace is not None,
+                source=source, reason=reason, title=title)
             # One spelling per tag, decided here rather than in `_create` and
             # `_update` separately — two normalisation sites is how a tag ends up
             # stored one way and filtered another.
@@ -615,6 +640,8 @@ class Store:
             # Checked on the STORED body, not the request: a substring edit or a
             # diff can introduce the stray tag just as a whole body can.
             m.warnings = write_warnings(m.body)
+            # The revision's own provenance, straight back to whoever wrote it.
+            m.source, m.valid_at = source, valid_at
             return m
 
     def _check_path_free(self, ns: str, path: Optional[str],
@@ -698,6 +725,36 @@ class Store:
             f"this memory{where} has no title — give `title` a short caption "
             f"(it is what names the memory in results and what title search "
             f"matches). Its first line is: {first!r}")
+
+    # What each declarable field is FOR — the refusal has to say this, or the
+    # requirement degenerates into filling the box: "from the email", "the user
+    # said", and a corpus of assertions nobody can check.
+    _FIELD_HELP = {
+        "source": ("where this knowledge came from, as an ADDRESS someone else "
+                   "can follow back to the original: host + absolute path + "
+                   "date; mailbox, sender -> recipient, date, subject; full URL "
+                   "+ date read. 'from the email' or 'the user said' is not one"),
+        "reason": ("why this write happened — what changed and why, in one line"),
+        "title": ("a short caption; it names the memory in results"),
+    }
+
+    def _require_fields(self, *, stores_content: bool, **values) -> None:
+        """Enforce `MEMGRES_REQUIRED_FIELDS` on a write that stores CONTENT.
+
+        Metadata-only edits are exempt, exactly as they are for the title: a move
+        or a retag asserts nothing new, and demanding provenance for one would
+        make re-filing a memory harder than writing one — friction unrelated to
+        the point, and the surest way to get a required field filled with junk.
+        """
+        if not stores_content:
+            return
+        for field in self.cfg.required_fields:
+            if (values.get(field) or "").strip():
+                continue
+            help_text = self._FIELD_HELP.get(field, "required by this deployment")
+            raise MissingField(
+                f"this deployment requires `{field}` on every write that stores "
+                f"content — {help_text}")
 
     def _check_title_size(self, title: Optional[str]):
         if title is not None and byte_len(title) > self.cfg.max_title_bytes:
@@ -1323,13 +1380,13 @@ class Store:
             "created_at, updated_at, namespace, "
             # Browsing is where usage becomes actionable: it is how you find the
             # subtree nobody reads. No row yet means never used, which is zero.
-            "COALESCE(u.recall_count, 0), COALESCE(u.get_count, 0) "
+            "COALESCE(u.recall_count, 0), COALESCE(u.get_count, 0), seq "
             "FROM memory LEFT JOIN memory_usage u ON u.memory_id = memory.id "
             f"WHERE {where} ORDER BY namespace, path, id "
             "LIMIT %s OFFSET %s",
             head + params + [limit, offset])
         cols = ["id", "path", "tags", "title", "shown", "created_at",
-                "updated_at", "space_id", "recalled", "gets"]
+                "updated_at", "space_id", "recalled", "gets", "seq"]
         budget = self.cfg.list_bodies_max_bytes
         rows, wanted = [], []
         for r in cur.fetchall():
@@ -1338,6 +1395,9 @@ class Store:
             d["tags"] = list(d["tags"]) if d["tags"] is not None else []
             d["space_id"] = str(d["space_id"])
             d["space"] = names.get(d["space_id"])
+            # Revisions after the creation. Comes off the row itself, so unlike
+            # the read counters it is exact and costs nothing.
+            d["edits"] = max(0, int(d.pop("seq")) - 1)
             if not self.cfg.usage_counters:
                 # Null, not zero. Nothing is being counted here, and reporting
                 # "0 recalls, 0 reads" would read as a measurement — on a
@@ -1543,6 +1603,13 @@ class Store:
         # the store working rather than the memory being used.
         if _count:
             m.usage = self._count_usage("get", [m.id], want=True)
+            if m.usage is not None:
+                # How often this memory has been REWRITTEN, which is a different
+                # question from how often it is read: a much-edited memory is a
+                # live one, a much-read one is a useful one, and ranking "what is
+                # hot" wants both. Free — `seq` counts the revisions already, and
+                # the first one is the creation, so edits are one fewer.
+                m.usage["edits"] = max(0, int(m.seq) - 1)
         return _slice_lines(m, lines) if lines else m
 
     def history(self, token: Optional[str], id: Optional[str] = None, *,

@@ -1,0 +1,16 @@
+-- Re-derive the link graph, because the PARSER changed, not the schema.
+--
+-- Until now `_PATH` rejected the hyphen, so every `[[infra.servers.video-production]]`
+-- was classified as prose and dropped — not stored as a dangling edge, dropped —
+-- while `[[proxies]]` from a TOML example indented as code was stored as a real
+-- one. Both halves are fixed in `links.py`; neither fix reaches a body that is
+-- already written, since edges are derived on write.
+--
+-- Clearing the flag makes the existing one-time backfill (`relink.rebuild`, run
+-- at startup by `maybe_backfill`) do the pass again over every body. It rewrites
+-- only the edge table: bodies, history and the hash chain are untouched, so this
+-- is repeatable and costs nothing but a scan.
+--
+-- Additive by nature — an older client reading this database is no worse off
+-- than it was, so the compatibility floor does not move.
+UPDATE memgres_meta SET links_built = false;

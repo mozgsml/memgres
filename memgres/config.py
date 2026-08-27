@@ -79,6 +79,8 @@ class Config:
     # organization
     tree_enabled: bool           # ltree path column + GiST index for fast subtree selection
     require_title: bool          # True = a write that stores CONTENT must caption it
+    required_fields: tuple       # extra fields a content-storing write must carry
+                                 # (MEMGRES_REQUIRED_FIELDS=source), refused when absent
     require_parent: bool         # False = sparse paths (create food.apple with no food row);
                                  # True = a node's parent path must already exist as a memory
     # history
@@ -222,6 +224,10 @@ def load() -> Config:
         token_sink=_str("MEMGRES_TOKEN_SINK", ""),
         tree_enabled=_bool("MEMGRES_TREE", True),
         require_title=_bool("MEMGRES_REQUIRE_TITLE", True),
+        required_fields=tuple(
+            f for f in (x.strip().lower()
+                        for x in _str("MEMGRES_REQUIRED_FIELDS", "").split(","))
+            if f),
         require_parent=_bool("MEMGRES_REQUIRE_PARENT", False),
         history_enabled=_bool("MEMGRES_HISTORY", True),
         fts_language=_str("MEMGRES_FTS_LANGUAGE", "simple"),

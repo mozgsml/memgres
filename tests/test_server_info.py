@@ -34,7 +34,8 @@ def test_top_level_keys_and_limits(monkeypatch):
     monkeypatch.setenv("MEMGRES_MAX_TITLE_BYTES", "128")
     info = server_info(load())
     assert set(info) == {"version", "schema_version", "limits", "embed",
-                         "retention", "recall_modes", "vector_backend",
+                         "retention", "write_requirements",
+                         "recall_modes", "vector_backend",
                          "key_mode", "fts_language"}
     monkeypatch.setenv("MEMGRES_LIST_BODIES_MAX_BYTES", "4096")
     info = server_info(load())
@@ -127,6 +128,24 @@ def test_renew_on_read_is_not_advertised_when_nothing_expires(monkeypatch):
     monkeypatch.setenv("MEMGRES_RENEW_ON_READ", "true")
     info = server_info(load())          # retention_days defaults to 0
     assert info["retention"]["renew_on_read"] is False
+
+
+def test_what_a_write_must_carry_is_announced(monkeypatch):
+    """A rule a client can only learn from a refusal is a rule it satisfies with
+    junk on the second attempt: it has already composed the memory by then."""
+    _clear(monkeypatch)
+    monkeypatch.setenv("MEMGRES_REQUIRED_FIELDS", "source")
+    info = server_info(load())
+    assert info["write_requirements"]["fields"] == ["source"]
+    # `_clear` turns captions off for this file, so the flag reports the
+    # deployment as configured — which is exactly the point of announcing it.
+    assert info["write_requirements"]["title"] is False
+
+
+def test_a_deployment_requiring_nothing_extra_says_so(monkeypatch):
+    _clear(monkeypatch)
+    info = server_info(load())
+    assert info["write_requirements"]["fields"] == []
 
 
 def test_no_secrets_leak(monkeypatch):

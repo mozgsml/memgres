@@ -18,7 +18,7 @@ from pathlib import Path
 from .config import Config
 
 # The version this build migrates the database TO (the latest migration it carries).
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 # The compatibility FLOOR: the schema version of the most recent backward-
 # INCOMPATIBLE migration — one that changed the shape/semantics old code relied on
@@ -74,6 +74,10 @@ SCHEMA_VERSION = 23
 #   v21 (0020): dropped 0019's foreign key from databases that already ran it →
 #     additive, floor stays 16. Nothing reads the constraint; removing it only
 #     stops a counted read from locking the memory row it counts.
+#   v24 (0023): cleared links_built so the link backfill runs again after the
+#     link PARSER was fixed (hyphens in paths were dropped, indented code was
+#     parsed) → additive, floor stays 16. It rebuilds a derived index from text
+#     that is already stored; an older client neither writes nor reads differently.
 SCHEMA_BREAKING_VERSION = 16
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are

@@ -66,7 +66,7 @@ def test_lists_subtree_ordered_by_path(store):
     # the ops row is NOT in the decisions subtree
     assert all(r["path"].startswith("decisions") for r in rows)
     # shape of each row
-    assert set(rows[0]) == {"id", "path", "tags", "title", "preview",
+    assert set(rows[0]) == {"id", "path", "tags", "title", "preview", "edits",
                             "created_at", "updated_at", "space_id", "space",
                             "recalled", "gets"}
 
