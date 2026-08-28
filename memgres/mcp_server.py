@@ -32,8 +32,10 @@ from typing_extensions import Annotated
 
 try:  # mcp SDK >= 2.0 renamed the module fastmcp -> mcpserver
     from mcp.server.mcpserver import Context
+    from mcp.server.mcpserver.exceptions import ToolError
 except ImportError:  # mcp SDK 1.x
     from mcp.server.fastmcp import Context
+    from mcp.server.fastmcp.exceptions import ToolError
 
 from . import admin, identity
 from .config import Config, load
@@ -269,6 +271,40 @@ def _mcp(name: str, instructions: Optional[str] = None):
     return server
 
 
+# Refusals whose text is written FOR the caller and safe to show them: what is
+# missing, which namespace to name, why the diff did not apply, what they may
+# not do. Everything else — a psycopg error, a bug — stays masked, because those
+# messages carry schema and internals rather than instructions.
+_SPEAKABLE = (ValueError, PermissionError, LookupError)
+
+
+def _speaking(fn):
+    """Re-raise a domain refusal as the SDK's own error type, which is the only
+    kind whose message reaches the client.
+
+    Everything else the SDK catches becomes `Error executing tool <name>` with no
+    detail — and that is what the caller sees. The refusals here are written to
+    be read: "this deployment requires `source` … as an ADDRESS", "you can reach
+    2 namespaces, name the one you mean". Masking them turns a fixable mistake
+    into a mystery, and an agent that cannot see the reason repeats the same call
+    — which is exactly what happened: five identical edits in a row, then the
+    same on reads, against a server that was explaining itself into the void.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ToolError:
+            raise
+        except _SPEAKABLE as e:
+            # `from e` keeps the original in the server log, where the traceback
+            # belongs; the client gets the sentence, not the stack.
+            raise ToolError(str(e)) from e
+    return wrapper
+
+
 def _mem(m) -> dict:
     return m.to_dict(stringify_dates=True)      # MCP layer needs plain strings
 
@@ -291,6 +327,12 @@ def build_server(cfg: Optional[Config] = None):
     from .embed_worker import wire_server
     _worker, cfg, backend = wire_server(cfg, embedder)
     mcp = _mcp("memgres", instructions=_instruction_text())
+
+    def tool(*d_args, **d_kwargs):
+        """`mcp.tool()`, but the refusal text survives the trip to the client."""
+        def deco(fn):
+            return mcp.tool(*d_args, **d_kwargs)(_speaking(fn))
+        return deco
 
     import os as _os
 
@@ -389,7 +431,7 @@ def build_server(cfg: Optional[Config] = None):
         """
         return identity.resolve(conn, cfg, token)
 
-    @mcp.tool()
+    @tool()
     def memory_write(body: Optional[str] = None, id: Optional[str] = None,
                      at: Optional[str] = None,
                      if_moved: IfMovedArg = "error",
@@ -445,7 +487,7 @@ def build_server(cfg: Optional[Config] = None):
                 reason=reason, valid_at=valid_at, space=space,
                 space_id=space_id))
 
-    @mcp.tool()
+    @tool()
     def memory_get(id: Optional[str] = None, at: Optional[str] = None,
                    if_moved: Literal["follow", "error"] = "follow",
                    lines: Optional[str] = None,
@@ -471,7 +513,7 @@ def build_server(cfg: Optional[Config] = None):
                                          if_moved=if_moved, lines=lines,
                                          space=space, space_id=space_id))
 
-    @mcp.tool()
+    @tool()
     def memory_recall(query: str, k: int = 10,
                       mode: Literal["lexical", "semantic", "hybrid", "auto"] = "auto",
                       match: Optional[Literal["any", "all"]] = None,
@@ -515,7 +557,7 @@ def build_server(cfg: Optional[Config] = None):
                         snippet=snippet, full_body=full_body, bodies=bodies,
                         match_tags=match_tags, space=space, space_id=space_id)]
 
-    @mcp.tool()
+    @tool()
     def memory_list(path_prefix: Optional[str] = None,
                     tags: Optional[List[str]] = None, limit: int = 50,
                     offset: int = 0, bodies: bool = False,
@@ -543,7 +585,7 @@ def build_server(cfg: Optional[Config] = None):
                 limit=limit, offset=offset, bodies=bodies,
                 match_tags=match_tags, space=space, space_id=space_id)
 
-    @mcp.tool()
+    @tool()
     def memory_tags(prefix: Optional[str] = None, k: int = 50,
                     space: Spaces = None, space_id: Spaces = None,
                     ctx: Context = None) -> List[dict]:
@@ -558,7 +600,7 @@ def build_server(cfg: Optional[Config] = None):
             return _store(conn).tags(_token(ctx), prefix=prefix, k=k,
                                      space=space, space_id=space_id)
 
-    @mcp.tool()
+    @tool()
     def memory_links(id: Optional[str] = None, at: Optional[str] = None,
                      direction: Literal["in", "out", "both"] = "both",
                      space: Optional[str] = None, space_id: Optional[str] = None,
@@ -579,7 +621,7 @@ def build_server(cfg: Optional[Config] = None):
                                       at=at or None, direction=direction,
                                       space=space, space_id=space_id)
 
-    @mcp.tool()
+    @tool()
     def memory_server_info(ctx: Context = None) -> dict:
         """The server's version + schema_version and its effective limits and
         capabilities (write ceilings, embed provider/model/dim, available recall
@@ -589,7 +631,7 @@ def build_server(cfg: Optional[Config] = None):
         dim = embedder.dim if embedder is not None else None
         return server_info(cfg, embed_dim=dim)
 
-    @mcp.tool()
+    @tool()
     def memory_blame(id: Optional[str] = None, at: Optional[str] = None,
                      grouped: bool = True, lines: Optional[str] = None,
                      space: Optional[str] = None, space_id: Optional[str] = None,
@@ -609,7 +651,7 @@ def build_server(cfg: Optional[Config] = None):
             return s.annotate(tok, id, lines=want, at=at, space=space,
                               space_id=space_id)
 
-    @mcp.tool()
+    @tool()
     def memory_history(id: Optional[str] = None, at: Optional[str] = None,
                        space: Optional[str] = None,
                        space_id: Optional[str] = None,
@@ -622,7 +664,7 @@ def build_server(cfg: Optional[Config] = None):
             return _store(conn).history(_token(ctx), id, at=at,
                                         space=space, space_id=space_id)
 
-    @mcp.tool()
+    @tool()
     def memory_move(new_path: str, id: Optional[str] = None,
                     at: Optional[str] = None,
                     if_moved: Literal["error", "follow"] = "error",
@@ -638,7 +680,7 @@ def build_server(cfg: Optional[Config] = None):
                                           reason=reason, space=space,
                                           space_id=space_id))
 
-    @mcp.tool()
+    @tool()
     def memory_forget(id: Optional[str] = None, at: Optional[str] = None,
                       space: Optional[str] = None,
                       space_id: Optional[str] = None,
@@ -652,7 +694,7 @@ def build_server(cfg: Optional[Config] = None):
                 _token(ctx), id, at=at, space=space, space_id=space_id)}
 
     # ─── identity: spaces & tokens (open/managed modes) ─────────────────────
-    @mcp.tool()
+    @tool()
     def memory_list_spaces(ctx: Context = None) -> List[dict]:
         """List the namespaces you can reach — your own plus any shared with you —
         with each one's id, name, description, permission, and your `alias` for it
@@ -661,7 +703,7 @@ def build_server(cfg: Optional[Config] = None):
         with pool.connection() as conn, conn.transaction():
             return identity.list_spaces(conn, _uid(conn, _token(ctx)))
 
-    @mcp.tool()
+    @tool()
     def memory_create_space(name: str, description: str = "",
                             instruction: str = "",
                             ctx: Context = None) -> dict:
@@ -675,7 +717,7 @@ def build_server(cfg: Optional[Config] = None):
                 description=description, instruction=instruction)
         return {"id": nsid, "name": name}
 
-    @mcp.tool()
+    @tool()
     def memory_set_alias(alias: str, space_id: str,
                          ctx: Context = None) -> dict:
         """Give a namespace a name of your own, for when a bare name is ambiguous
@@ -688,7 +730,7 @@ def build_server(cfg: Optional[Config] = None):
             identity.create_alias(conn, uid, alias, space_id)
         return {"alias": alias, "space_id": space_id}
 
-    @mcp.tool()
+    @tool()
     def memory_drop_alias(alias: str,
                           ctx: Context = None) -> dict:
         """Remove one of your namespace aliases. The namespace itself is
@@ -698,7 +740,7 @@ def build_server(cfg: Optional[Config] = None):
             return {"dropped": identity.drop_alias(conn, uid, alias)}
 
     if cfg.key_mode == "managed":
-        @mcp.tool()
+        @tool()
         def memory_enroll(key: EnrollKeyArg, ctx: Context = None) -> dict:
             """Claim an account with a one-time enrollment key.
 
@@ -734,7 +776,7 @@ def build_server(cfg: Optional[Config] = None):
                            "tools you can now use are not showing yet.")
             return out
 
-    @mcp.tool()
+    @tool()
     def memory_issue_token(permission: str = "write", space: Optional[str] = None,
                            space_id: Optional[str] = None, label: str = "",
                            expires_days: Optional[int] = None,
@@ -789,7 +831,7 @@ def build_server(cfg: Optional[Config] = None):
         out.update({"permission": permission, "namespace_id": nsid})
         return out
 
-    @mcp.tool()
+    @tool()
     def memory_request_access(space_id: str, permission: str = "read",
                               ctx: Context = None) -> dict:
         """Ask the owner of a namespace to let you in.
@@ -804,14 +846,14 @@ def build_server(cfg: Optional[Config] = None):
                                         namespace_id=space_id,
                                         permission=permission)
 
-    @mcp.tool()
+    @tool()
     def memory_list_tokens(ctx: Context = None) -> List[dict]:
         """List your tokens (metadata only — never the secret)."""
         with pool.connection() as conn, conn.transaction():
             out = identity.list_tokens(conn, _admin_uid(conn, _token(ctx)))
         return _iso(out, *_TOKEN_TIMES)
 
-    @mcp.tool()
+    @tool()
     def memory_revoke_token(token_id: str,
                             ctx: Context = None) -> dict:
         """Revoke one of your tokens by id (kills it immediately)."""
@@ -822,7 +864,7 @@ def build_server(cfg: Optional[Config] = None):
                 raise identity.AuthError("not your token")
             return {"revoked": identity.revoke_token(conn, token_id)}
 
-    @mcp.tool()
+    @tool()
     def memory_whoami(ctx: Context = None) -> dict:
         """Who you are and what you may do: user id, service role, this
         credential's permission ceiling and namespace scope, plus the
@@ -834,7 +876,7 @@ def build_server(cfg: Optional[Config] = None):
     # ─── control plane: provisioning (authorized in `admin`, not here) ───────
     if admin_surface:
 
-        @mcp.tool()
+        @tool()
         def memory_admin_list_users(role: Optional[str] = None, limit: int = 50,
                                     offset: int = 0,
                                     ctx: Context = None) -> List[dict]:
@@ -846,7 +888,7 @@ def build_server(cfg: Optional[Config] = None):
                                        role=role, limit=limit, offset=offset)
             return _iso(out, "created_at")
 
-        @mcp.tool()
+        @tool()
         def memory_admin_create_user(name: str = "", description: str = "",
                                      role: str = "user",
                                      can_create_namespace: bool = False,
@@ -872,7 +914,7 @@ def build_server(cfg: Optional[Config] = None):
                                         department=department, position=position)
             return {"id": uid}
 
-        @mcp.tool()
+        @tool()
         def memory_admin_edit_user(user_id: str,
                                    name: Optional[str] = None,
                                    description: Optional[str] = None,
@@ -891,7 +933,7 @@ def build_server(cfg: Optional[Config] = None):
                     conn, _principal(conn, _token(ctx)), user_id=user_id,
                     **{k: v for k, v in fields.items() if v is not None})
 
-        @mcp.tool()
+        @tool()
         def memory_admin_set_can_create_namespace(user_id: str, allowed: bool,
                                                   ctx: Context = None) -> dict:
             """Grant or withdraw a user's right to create namespaces. Without it
@@ -902,7 +944,7 @@ def build_server(cfg: Optional[Config] = None):
                     conn, _principal(conn, _token(ctx)),
                     user_id=user_id, allowed=allowed)
 
-        @mcp.tool()
+        @tool()
         def memory_admin_set_role(user_id: str, role: str,
                                   ctx: Context = None) -> dict:
             """Set a user's service role (user | user_manager | superadmin).
@@ -912,7 +954,7 @@ def build_server(cfg: Optional[Config] = None):
                 return admin.set_role(conn, _principal(conn, _token(ctx)),
                                       user_id=user_id, role=role)
 
-        @mcp.tool()
+        @tool()
         def memory_admin_list_namespaces(owner_user_id: Optional[str] = None,
                                          limit: int = 50, offset: int = 0,
                                          ctx: Context = None) -> List[dict]:
@@ -925,7 +967,7 @@ def build_server(cfg: Optional[Config] = None):
                     owner_user_id=owner_user_id, limit=limit, offset=offset)
             return _iso(out, "created_at")
 
-        @mcp.tool()
+        @tool()
         def memory_admin_create_namespace(name: str, owner_user_id: str,
                                           description: str = "",
                                           instruction: str = "",
@@ -940,7 +982,7 @@ def build_server(cfg: Optional[Config] = None):
                     description=description, instruction=instruction)
             return {"id": nsid}
 
-        @mcp.tool()
+        @tool()
         def memory_admin_edit_namespace(space_id: str,
                                         description: Optional[str] = None,
                                         instruction: Optional[str] = None,
@@ -959,7 +1001,7 @@ def build_server(cfg: Optional[Config] = None):
                     namespace_id=space_id, description=description,
                     instruction=instruction, name=name)
 
-        @mcp.tool()
+        @tool()
         def memory_admin_count_orphans(ctx: Context = None) -> dict:
             """How many memories are stranded in the pre-identity namespace.
             `single` mode stores everything under one nameless namespace; after a
@@ -969,7 +1011,7 @@ def build_server(cfg: Optional[Config] = None):
             with pool.connection() as conn:
                 return admin.count_orphans(conn, _principal(conn, _token(ctx)))
 
-        @mcp.tool()
+        @tool()
         def memory_admin_adopt_orphans(space_id: str,
                                        ctx: Context = None) -> dict:
             """Move every stranded `single`-mode memory into a real namespace.
@@ -981,7 +1023,7 @@ def build_server(cfg: Optional[Config] = None):
                     conn, _principal(conn, _token(ctx)),
                     namespace_id=space_id, vectors=backend)
 
-        @mcp.tool()
+        @tool()
         def memory_admin_add_member(space_id: str, user_id: str,
                                     permission: str = "read",
                                     ctx: Context = None) -> dict:
@@ -994,7 +1036,7 @@ def build_server(cfg: Optional[Config] = None):
                                         namespace_id=space_id, user_id=user_id,
                                         permission=permission)
 
-        @mcp.tool()
+        @tool()
         def memory_admin_remove_member(space_id: str, user_id: str,
                                        ctx: Context = None) -> dict:
             """Take a shared namespace away again. `removed: false` means they
@@ -1009,7 +1051,7 @@ def build_server(cfg: Optional[Config] = None):
                 return admin.remove_member(conn, _principal(conn, _token(ctx)),
                                            namespace_id=space_id, user_id=user_id)
 
-        @mcp.tool()
+        @tool()
         def memory_admin_transfer_namespace(
                 space_id: str, new_owner_user_id: str,
                 keep_previous_owner: Optional[str] = "admin",
@@ -1028,7 +1070,7 @@ def build_server(cfg: Optional[Config] = None):
                     new_owner_user_id=new_owner_user_id,
                     keep_previous_owner=keep_previous_owner)
 
-        @mcp.tool()
+        @tool()
         def memory_admin_list_requests(space_id: str,
                                        ctx: Context = None) -> List[dict]:
             """Pending requests to join a namespace you administer — who asked,
@@ -1038,7 +1080,7 @@ def build_server(cfg: Optional[Config] = None):
                                           namespace_id=space_id)
             return _iso(out, "created_at")
 
-        @mcp.tool()
+        @tool()
         def memory_admin_decide_access(request_id: str, approve: bool = True,
                                        expect_permission: Optional[str] = None,
                                        ctx: Context = None) -> dict:
@@ -1056,7 +1098,7 @@ def build_server(cfg: Optional[Config] = None):
                                     expect_permission=expect_permission)
             return {"request_id": request_id, "approved": approve}
 
-        @mcp.tool()
+        @tool()
         def memory_admin_set_disabled(user_id: str, disabled: bool = True,
                                       ctx: Context = None) -> dict:
             """Switch an account off, or back on.
@@ -1070,7 +1112,7 @@ def build_server(cfg: Optional[Config] = None):
                 return admin.set_disabled(conn, _principal(conn, _token(ctx)),
                                           user_id=user_id, disabled=disabled)
 
-        @mcp.tool()
+        @tool()
         def memory_admin_list_members(space_id: str,
                                       ctx: Context = None) -> List[dict]:
             """Who can reach a namespace — the owner first, then everyone shared
@@ -1080,7 +1122,7 @@ def build_server(cfg: Optional[Config] = None):
                                          namespace_id=space_id)
             return _iso(out, "created_at")
 
-        @mcp.tool()
+        @tool()
         def memory_admin_issue_token(user_id: str, permission: str = "write",
                                      space_id: Optional[str] = None,
                                      label: str = "",
@@ -1112,7 +1154,7 @@ def build_server(cfg: Optional[Config] = None):
                 out["warning"] = minted["warning"]
             return out
 
-        @mcp.tool()
+        @tool()
         def memory_admin_create_enrollment(
                 user_id: str, permission: str = "write",
                 space_id: Optional[str] = None, label: str = "",
@@ -1146,7 +1188,7 @@ def build_server(cfg: Optional[Config] = None):
             out["expires_at"] = out["expires_at"].isoformat()
             return admin.deliver_key(out, cfg.token_sink)
 
-        @mcp.tool()
+        @tool()
         def memory_admin_list_enrollments(user_id: Optional[str] = None,
                                           ctx: Context = None) -> List[dict]:
             """Enrollment keys and what became of them — `state` is pending,
@@ -1158,7 +1200,7 @@ def build_server(cfg: Optional[Config] = None):
                                              user_id=user_id)
             return _iso(out, "created_at", "expires_at", "used_at", "revoked_at")
 
-        @mcp.tool()
+        @tool()
         def memory_admin_revoke_enrollment(enrollment_id: str,
                                            ctx: Context = None) -> dict:
             """Kill an unredeemed enrollment key. False means it was already
@@ -1169,7 +1211,7 @@ def build_server(cfg: Optional[Config] = None):
                     conn, _principal(conn, _token(ctx)),
                     enrollment_id=enrollment_id)}
 
-        @mcp.tool()
+        @tool()
         def memory_admin_list_tokens(user_id: str,
                                      ctx: Context = None) -> List[dict]:
             """A user's tokens — metadata only, never the secret."""
@@ -1178,7 +1220,7 @@ def build_server(cfg: Optional[Config] = None):
                                         user_id=user_id)
             return _iso(out, *_TOKEN_TIMES)
 
-        @mcp.tool()
+        @tool()
         def memory_admin_revoke_token(token_id: str,
                                       ctx: Context = None) -> dict:
             """Kill any user's token immediately. False means it was already

@@ -5,6 +5,37 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.12.1] — 2026-08-28
+
+A hotfix for the thing 0.12.0 made visible: the server refuses carefully, and
+the caller could not read a word of it.
+
+### Fixed — a refusal now reaches the client
+- **Every tool's domain refusal is re-raised as the SDK's `ToolError`**, whose
+  message is the only kind that survives the trip out. Everything else became
+  `Error executing tool memory_write` with no detail — so "this deployment
+  requires `source` … as an ADDRESS" and "you can reach 2 namespaces, name the
+  one you mean" went to the server log and nowhere else. In production an agent
+  repeated the same rejected edit five times, then the same on reads, against a
+  server that was explaining itself into the void. Internal failures (psycopg, a
+  bug) stay masked: those describe our schema, not the caller's mistake.
+- 🔴 The masking is SDK-version dependent, which is why a wire test alone cannot
+  guard it: mcp **2.0.0** folds the original message into its own error text,
+  **2.1.1** raises `UnexpectedToolError` and drops it. The regression test
+  therefore asserts what was REGISTERED — that the wrapper is in place — and
+  fails on either generation.
+
+### Fixed — a bad path says so instead of leaking Postgres
+- **`path_prefix` is validated before it reaches SQL.** It went in as
+  `%s::ltree` and came back as `psycopg.errors.SyntaxError: ltree syntax error
+  at character 1` — a message about our schema that the caller could do nothing
+  with. Same check now on `path` in a write.
+- **What a path is now lives in one module** (`memgres/paths.py`), used by the
+  link parser and the store alike. Two definitions is what dropped every
+  hyphenated link before 0.12.0; the new one also accepts **non-ASCII labels**,
+  because `ops.тариф` stores and reads perfectly well and a narrower check would
+  have made a working path unwritable — caught by an existing test.
+
 ## [0.12.0] — 2026-08-27
 
 Two failures found while using memgres to document real infrastructure, both of

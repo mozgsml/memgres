@@ -139,8 +139,12 @@ def build_filters(ns, tags: Optional[Sequence[str]], path_prefix: Optional[str],
     # input would filter nothing or everything depending on a mode flag the
     # caller may not have set. Neither is an answer; "no tags requested" is.
     if path_prefix:
+        # Checked here, not by Postgres: an unvalidated prefix came back as
+        # `ltree syntax error at character 1`, which tells the caller nothing
+        # about what they passed.
+        from ..paths import check_path
         sql.append("path <@ %s::ltree")     # subtree of the prefix
-        params.append(path_prefix)
+        params.append(check_path(path_prefix, "path_prefix"))
     return " AND ".join(sql), params
 
 

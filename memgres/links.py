@@ -52,19 +52,11 @@ from typing import Dict, List, Optional
 # edges so they are visible, never resolved — we do not own the address space.
 KNOWN_SCHEMES = ("idea", "file")
 
-# An ltree path: labels of [A-Za-z0-9_-] joined by dots. Deliberately strict —
-# this is what tells a path apart from a slug belonging to another store, and
-# from prose that happens to sit in double brackets.
-#
-# The hyphen is there because PATHS MAY CONTAIN ONE. Postgres has allowed `-` in
-# ltree labels since 13 (the minimum this project supports), `write` accepts such
-# a path without complaint, and real corpora are full of them —
-# `infra.servers.video-production`. While this pattern rejected the hyphen the
-# two halves of the product disagreed about what a path is: the link was stored
-# as prose, `_classify` returned "ignore", and the edge did not even become a
-# DANGLING one. It vanished, and `memory_links` answered "nothing points here",
-# which reads as a fact about the corpus rather than as a parser that quit.
-_PATH = re.compile(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$")
+# What a path is lives in `paths.py`, so the parser and the store cannot drift
+# apart again — that drift is exactly what dropped every hyphenated link before
+# 0.12.0. Kept under the old name because the rest of this module reads better
+# with it.
+from .paths import PATH_RE as _PATH
 
 _LINK = re.compile(r"\[\[([^\[\]\n]+)\]\]")
 _FENCE = re.compile(r"```.*?```|~~~.*?~~~", re.S)

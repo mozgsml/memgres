@@ -35,6 +35,7 @@ from . import identity
 from .config import Config
 from .delimiters import write_warnings
 from .lines import parse_line_spec
+from .paths import check_path
 from .diffing import DiffConflict, apply_diff, byte_len, content_hash, make_diff
 from .embeddings import Embedder, get_embedder
 from .links import parse_links, rewrite_targets
@@ -625,6 +626,7 @@ class Store:
             # stored one way and filtered another.
             tags = normalize_tags(tags)
             valid_at = _as_date(valid_at)
+            check_path(path, "path")
             if id is None and at is None:
                 self._check_path_free(ns, path, if_moved)
                 m = self._create(ns, author, body, path, tags, source, reason,
