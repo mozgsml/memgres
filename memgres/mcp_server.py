@@ -61,7 +61,11 @@ SourceArg = Annotated[Optional[str], Field(
                 "sender -> recipient, date, subject; messenger, who with whom, date; "
                 "machine + project + session/transcript for an agent run; full URL + "
                 "date read. 'email', 'the meeting', 'the user said' is not one — "
-                "nothing can be reached through it, so the fact can only be believed.")]
+                "nothing can be reached through it, so the fact can only be believed. "
+                "It is recorded on THIS revision, not on the memory: a memory has no "
+                "single origin, its edits do. So a later read does not carry it — "
+                "`memory_blame` says where a given line came from, `memory_history` "
+                "where each revision did.")]
 ReasonArg = Annotated[Optional[str], Field(
     default=None,
     description="Why this write happened — what changed and why, in one line. Kept "
@@ -502,6 +506,10 @@ def build_server(cfg: Optional[Config] = None):
 
         The answer carries `usage`: how often this memory has surfaced in search
         (`recalled`) and been fetched (`gets`), and when each last happened.
+
+        It carries NO `source`/`valid_at`, and that is deliberate: provenance
+        belongs to a revision, not to the document. Ask `memory_blame` where a
+        particular line came from, or `memory_history` where each revision did.
 
         `lines` ("40-80", "5", "1,10-12") returns only part of a long body. The
         answer is then marked `partial`, carries `total_lines`, and has NO

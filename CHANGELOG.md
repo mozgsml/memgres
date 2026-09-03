@@ -5,6 +5,36 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.12.2] — 2026-09-03
+
+Provenance stopped lying about itself. Nothing changed in what is stored — only
+in what the answers say about it.
+
+### Fixed — a read no longer reports provenance it does not have
+- **`memory_get` no longer emits `"source": null` and `"valid_at": null`.**
+  `source`/`reason`/`valid_at` live on the history row, because they describe one
+  EDIT and a memory has no single origin (the reasoning is in migration `0016`).
+  A read therefore never had a value to give — but it printed the keys anyway,
+  and `null` beside a `seq` that had not moved does not read as "no such field
+  here", it reads as "the value was there and is gone". Two readers in a row drew
+  exactly that conclusion. The second spent a day on it: four escalating
+  experiments, two no-op `revalidate` edits to "restore" fields that were never
+  lost, a bug report against storage, and a workaround — copying sources into the
+  BODY of records — written into shared memory where it would have taught the
+  next reader the same false thing. The keys are now absent on a read and present
+  on a write, where `null` means "you sent nothing" and is worth seeing.
+- **The `source` argument now says where it lands** — on this revision, read back
+  with `memory_blame` (per line) or `memory_history` (per revision) — and
+  `memory_get` says the same. Neither did, which is why the code was the only
+  place that knew.
+
+### Added — recall says when
+- **Every recall hit carries `updated_at`.** Recall is where staleness gets
+  decided: the caller picks what to read from a ranked list, and until now that
+  list had no dates at all, so a fact from July looked exactly like one from
+  yesterday. `get`, `list` and `history` already said when; the one read that
+  ranks did not.
+
 ## [0.12.1] — 2026-08-28
 
 A hotfix for the thing 0.12.0 made visible: the server refuses carefully, and

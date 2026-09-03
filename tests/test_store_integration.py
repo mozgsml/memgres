@@ -362,6 +362,17 @@ def test_the_light_pass_returns_no_text(store):
     assert row["snippet"] is None and row["title"] == "Fruit Notes"
 
 
+def test_a_recall_hit_says_when_the_memory_last_changed(store):
+    """Recall is where staleness is decided — the caller picks what to read from
+    the ranked list. Without a date that choice is made on wording alone, and a
+    fact from July reads exactly like one from yesterday."""
+    m = store.write(body="the body mentions apples\n", title="Fruit Notes",
+                    path="notes.fruit")
+    [hit] = store.recall(None, "fruit")
+    assert hit.updated_at is not None
+    assert hit.to_recall_dict()["updated_at"] == str(m.updated_at)
+
+
 def test_recall_respects_tag_filter(store):
     store.write(body="x\n", title="alpha report", tags=["keep"])
     store.write(body="y\n", title="alpha summary", tags=["drop"])

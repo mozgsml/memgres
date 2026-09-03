@@ -166,6 +166,26 @@ def test_a_read_claims_no_provenance(conn, monkeypatch):
         "первый источник", "второй источник"]
 
 
+def test_a_read_does_not_even_carry_the_keys(conn, monkeypatch):
+    """`"source": null` on a read does not say "no such field here" — it reads as
+    "the value was there and is gone". Two readers concluded exactly that and went
+    hunting for a bug that did not exist; one spent a day on it. So a read omits
+    the keys outright, and the question belongs to `history`/`blame`."""
+    s = _store(conn, monkeypatch, "")
+    s.write(body="один", path="a.b", title="A", source="источник")
+    d = s.get(None, at="a.b").to_dict(stringify_dates=True)
+    assert "source" not in d and "valid_at" not in d
+
+
+def test_a_write_carries_them_even_when_empty(conn, monkeypatch):
+    """The other half: on a write the keys are always there, because a required
+    field the answer does not confirm is one whose absence nobody notices. Null
+    here means "you sent nothing", which is exactly what the writer must see."""
+    s = _store(conn, monkeypatch, "")
+    d = s.write(body="один", path="a.b", title="A").to_dict(stringify_dates=True)
+    assert d["source"] is None and d["valid_at"] is None
+
+
 # ─── the edit counter ────────────────────────────────────────────────────────
 def test_edits_count_revisions_after_the_creation(conn, monkeypatch):
     s = _store(conn, monkeypatch, "")

@@ -251,12 +251,21 @@ class Memory:
     # Provenance of the REVISION this call just wrote — never of the memory,
     # which has no single source: `source`/`reason`/`valid_at` live on the
     # history row because different edits speak to different origins and dates.
-    # So these are set by `write` and stay None on a read, where the question
-    # belongs to `history`/`blame`. Echoed back because a required field that the
-    # answer does not confirm is a field whose absence nobody notices: four edits
-    # in a row went out with an empty `source` and every reply looked fine.
+    # Echoed back on a write because a required field the answer does not confirm
+    # is a field whose absence nobody notices: four edits in a row went out with
+    # an empty `source` and every reply looked fine.
+    #
+    # `is_write` decides whether they are SERIALIZED at all, and that is the
+    # point: a read used to emit `"source": null`, which does not read as "this
+    # memory has no such field" but as "the value was there and is now gone".
+    # Two readers in a row concluded the field was being silently dropped and
+    # went looking for the bug — one of them spent a day on it and wrote the
+    # workaround into memory. So on a read the keys are ABSENT, and the question
+    # they answer belongs to `history`/`blame`, where the answer is per-revision
+    # and per-line rather than one value pretending to describe the document.
     source: Optional[str] = None
     valid_at: object = None
+    is_write: bool = False
 
     def to_dict(self, *, stringify_dates: bool = False) -> dict:
         """Serialize for an API layer. ``stringify_dates`` str()-coerces the
@@ -264,9 +273,8 @@ class Memory:
         datetimes itself, so the HTTP layer passes them through raw)."""
         def d(v):
             return (str(v) if v is not None else None) if stringify_dates else v
-        return {"id": self.id, "content_hash": self.content_hash, "body": self.body,
+        out = {"id": self.id, "content_hash": self.content_hash, "body": self.body,
                 "title": self.title, "tags": self.tags, "path": self.path,
-                "source": self.source, "valid_at": d(self.valid_at),
                 "seq": self.seq, "created_at": d(self.created_at),
                 "updated_at": d(self.updated_at), "expires_at": d(self.expires_at),
                 "created": self.created, "moved_from": self.moved_from,
@@ -276,6 +284,12 @@ class Memory:
                            "last_recall_at": d(self.usage["last_recall_at"]),
                            "last_get_at": d(self.usage["last_get_at"])}
                           if self.usage else None)}
+        if self.is_write:
+            # Only here: the provenance of the revision just written, confirmed
+            # back to its author. A read carries no such keys (see `is_write`).
+            out["source"] = self.source
+            out["valid_at"] = d(self.valid_at)
+        return out
 
 
 def _sha(text: str) -> str:
@@ -643,7 +657,8 @@ class Store:
             # diff can introduce the stray tag just as a whole body can.
             m.warnings = write_warnings(m.body)
             # The revision's own provenance, straight back to whoever wrote it.
-            m.source, m.valid_at = source, valid_at
+            # `is_write` is what puts these on the wire; a read leaves them off.
+            m.source, m.valid_at, m.is_write = source, valid_at, True
             return m
 
     def _check_path_free(self, ns: str, path: Optional[str],

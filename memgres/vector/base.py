@@ -66,6 +66,12 @@ class Hit:
     # set by a backend's grouped search: the (start, end) char offsets of the
     # winning chunk, so attach_snippets slices the snippet with no re-embedding.
     chunk_span: Optional[Tuple[int, int]] = None
+    # When the memory was last changed. Carried because recall is where staleness
+    # is decided: a caller picks which hit to read from the ranked list, and
+    # without a date the choice is made on wording alone. Every other read
+    # (`get`, `list`, `history`) already says when — this was the one that did
+    # not, and it is the one that ranks.
+    updated_at: object = None
 
     def to_recall_dict(self) -> dict:
         """The recall wire shape — one definition, so the HTTP and MCP layers
@@ -74,6 +80,10 @@ class Hit:
         return {"id": self.id, "title": self.title, "tags": self.tags,
                 "path": self.path, "score": self.score, "snippet": self.snippet,
                 "kind": self.kind, "lines": self.lines,
+                # str() rather than a datetime: the MCP layer needs plain
+                # strings, and FastAPI passes a string through unchanged, so one
+                # shape serves both transports.
+                "updated_at": str(self.updated_at) if self.updated_at else None,
                 "space_id": self.namespace, "space": self.space}
 
 
@@ -86,13 +96,13 @@ def _vec_literal(vec: Sequence[float]) -> str:
 # definition so lexical and both chunk backends SELECT the same set and adding a
 # field is one edit. When a backend ranks in SQL and appends its score column
 # AFTER these, the score is row[len(HIT_COLUMNS)].
-HIT_COLUMNS = "id, body, tags, path::text, title, namespace"
+HIT_COLUMNS = "id, body, tags, path::text, title, namespace, updated_at"
 
 
 def row_to_hit(row, score: float) -> "Hit":
     """Build a Hit from a (HIT_COLUMNS) row plus a separately-supplied score."""
     return Hit(str(row[0]), row[1], list(row[2]), row[3], float(score),
-               title=row[4], namespace=str(row[5]))
+               title=row[4], namespace=str(row[5]), updated_at=row[6])
 
 
 def as_namespaces(ns) -> List[str]:
