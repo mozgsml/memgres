@@ -230,6 +230,38 @@ def test_replace_not_found_leaves_record_untouched(store):
     assert again.body == "alpha\nbeta\n" and again.seq == 1
 
 
+def test_a_missed_replace_says_the_quote_crossed_a_line_break(store):
+    """The commonest miss: the body wraps, the phrase reads as one line on
+    screen, and the quote comes back with a space where the record has \n. The
+    refusal has to name that, or the author goes re-reading the whole record."""
+    store.write(body="хвост ниши по деньгам — перепродажа\nExa через x402\n",
+                path="a.b", title="A")
+    with pytest.raises(ReplaceNotFound) as e:
+        store.write(at="a.b", replace=("перепродажа Exa", "перепродажа Exa Search"))
+    msg = str(e.value)
+    assert "whitespace differs" in msg and "memory_get" in msg
+
+
+def test_a_missed_replace_shows_where_the_quote_parts_from_the_body(store):
+    """When it is not whitespace, the useful answer is the point of divergence
+    and what the body actually says there."""
+    store.write(body="верх ниши — **«rail dead»** значит другое\n",
+                path="a.c", title="A")
+    with pytest.raises(ReplaceNotFound) as e:
+        store.write(at="a.c", replace=("верх ниши — «rail dead»", "x"))
+    msg = str(e.value)
+    assert "chars match" in msg and "«rail dead»**" in msg
+
+
+def test_a_replace_of_something_absent_says_so_plainly(store):
+    """No prefix at all is a different mistake — wrong record, or a quote written
+    from memory — and must not be dressed up as a near miss."""
+    store.write(body="alpha\nbeta\n", path="a.d", title="A")
+    with pytest.raises(ReplaceNotFound) as e:
+        store.write(at="a.d", replace=("zzz", "x"))
+    assert "not one character" in str(e.value)
+
+
 def test_replace_ambiguous_requires_all_or_context(store):
     m = store.write(body="x x x\n")
     with pytest.raises(AmbiguousReplace):

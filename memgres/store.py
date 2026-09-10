@@ -451,6 +451,57 @@ def _slice_lines(m: "Memory", spec: str) -> "Memory":
     return m
 
 
+
+# How much body text a "why did my replace miss" hint may quote, per side.
+_HINT_CONTEXT = 48
+
+
+def _why_replace_missed(body: str, old: str) -> str:
+    """Say WHY a substring edit found nothing — the refusal alone sends the author
+    to re-read the whole record, when the useful answer is almost always "your
+    quote is not what the body says, here is what it says".
+
+    Three causes, in the order they actually happen:
+
+    1. **Whitespace.** Bodies are hard-wrapped, so a phrase that reads as one line
+       on screen contains a newline. Retyped as a space, it can never match.
+    2. **Case.**
+    3. **Everything else** — then the most useful thing is the point where the
+       quote stops agreeing with the body, and what the body has instead.
+
+    The quote itself is usually reconstructed by eye rather than copied, which is
+    why the hint ends by naming the one reliable source: `memory_get`. A recall
+    snippet is a slice of the body (`lines` says which) EXCEPT on the ts_headline
+    path, where Postgres rebuilds the text from tokens and `lines` is null — that
+    one is not quotable at all.
+    """
+    squashed_old = " ".join(old.split())
+    if squashed_old and squashed_old in " ".join(body.split()):
+        return (" — the text IS in the body, but the whitespace differs: bodies "
+                "wrap, so a line break in the record reads as a space on screen. "
+                "Copy the line from `memory_get`, not from a recall snippet")
+    if old.lower() in body.lower():
+        return (" — it is there in a different case. Copy it from `memory_get`, "
+                "not from a recall snippet")
+    # Longest prefix of `old` the body still agrees with: the point of divergence
+    # is what the author needs to see. Binary search — bodies are capped, but a
+    # linear scan would re-scan the whole body once per character.
+    lo, hi = 0, len(old)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if old[:mid] in body:
+            lo = mid
+        else:
+            hi = mid - 1
+    if lo == 0:
+        return (" — not one character of it is in the body; wrong memory, or the "
+                "quote was written from memory rather than copied from `memory_get`")
+    at = body.find(old[:lo])
+    reads = body[at:at + lo + _HINT_CONTEXT]
+    return (f" — the first {lo} chars match, then they part: the body reads "
+            f"{reads!r}. Copy from `memory_get`, not from a recall snippet")
+
+
 class Store:
     def __init__(self, cfg: Config, embedder: Optional[Embedder] = None,
                  conn: Optional["psycopg.Connection"] = None,
@@ -773,11 +824,38 @@ class Store:
                 f"this deployment requires `{field}` on every write that stores "
                 f"content — {help_text}")
 
+    # How much of the title to quote either side of the cut. Enough to recognise
+    # the words, short enough that a pathological title cannot turn the refusal
+    # into a wall of text.
+    _TITLE_CUT_CONTEXT = 40
+
     def _check_title_size(self, title: Optional[str]):
-        if title is not None and byte_len(title) > self.cfg.max_title_bytes:
-            raise TooLarge(
-                f"title is {byte_len(title)}B > MEMGRES_MAX_TITLE_BYTES "
-                f"{self.cfg.max_title_bytes}")
+        """Refuse an oversized title, and SHOW WHERE IT STOPS FITTING.
+
+        The ceiling is in bytes because that is what storage and the wire count,
+        but the author is writing characters — and in UTF-8 the exchange rate
+        depends on the script: Latin runs ~1 B/char, Cyrillic ~2, so the same 256
+        B is ~256 characters in one language and ~148 in another. A refusal that
+        names only bytes leaves the author trimming blind, one attempt at a time
+        (observed: four rejected writes in a row on one record). So the message
+        carries the character counts and quotes the cut itself, marked with ✂ —
+        what survives on the left, what has to go on the right."""
+        if title is None:
+            return
+        size, cap = byte_len(title), self.cfg.max_title_bytes
+        if size <= cap:
+            return
+        # Truncating BYTES can land mid-character; decoding with "ignore" drops
+        # that partial character, which is exactly the last one that does NOT fit.
+        fits = title.encode("utf-8")[:cap].decode("utf-8", "ignore")
+        over = title[len(fits):]
+        ctx = self._TITLE_CUT_CONTEXT
+        left = ("…" if len(fits) > ctx else "") + fits[-ctx:]
+        right = over[:ctx] + ("…" if len(over) > ctx else "")
+        raise TooLarge(
+            f"title is {size}B > MEMGRES_MAX_TITLE_BYTES {cap}: "
+            f"{len(title)} chars, {len(fits)} fit, drop {len(over)} — "
+            f"{left}[✂]{right}")
 
     def _create(self, ns, author, body, path, tags, source, reason,
                 title=None, valid_at=None) -> Memory:
@@ -868,7 +946,9 @@ class Store:
                 raise Conflict(f"stale replace: base {base_hash[:12]} != current {cur_hash[:12]}")
             count = cur_body.count(old)
             if count == 0:
-                raise ReplaceNotFound(f"replace text not found in body: {old[:60]!r}")
+                raise ReplaceNotFound(
+                    f"replace text not found in body: {old[:60]!r}"
+                    f"{_why_replace_missed(cur_body, old)}")
             if count > 1 and not replace_all:
                 raise AmbiguousReplace(
                     f"replace text occurs {count}× — pass replace_all, or add "

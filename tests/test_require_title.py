@@ -26,7 +26,7 @@ psycopg = pytest.importorskip("psycopg")
 
 from memgres.config import load  # noqa: E402
 from memgres.schema import migrate  # noqa: E402
-from memgres.store import MissingTitle, Store  # noqa: E402
+from memgres.store import MissingTitle, Store, TooLarge  # noqa: E402
 
 DSN = os.environ.get("MEMGRES_TEST_DSN",
                      "postgresql://memgres:memgres@localhost:55432/memgres")
@@ -181,3 +181,36 @@ def test_a_create_with_no_body_blames_the_body(conn, monkeypatch):
     s = _store(conn, monkeypatch, True)
     with pytest.raises(ValueError, match="needs a body"):
         s.write(path="a.b")
+
+
+# ─── the size ceiling explains itself ────────────────────────────────────────
+def test_an_oversized_title_shows_where_it_stops_fitting(conn, monkeypatch):
+    """The ceiling counts bytes, the author counts characters, and in UTF-8 the
+    rate depends on the script — so a refusal naming only bytes leaves them
+    trimming blind. The message quotes the cut: what fits, what has to go."""
+    monkeypatch.setenv("MEMGRES_MAX_TITLE_BYTES", "40")
+    s = _store(conn, monkeypatch, True)
+    title = "Лимит заголовка меряется в байтах, а не в символах"
+    with pytest.raises(TooLarge) as e:
+        s.write(body="one", path="a.b", title=title)
+    msg = str(e.value)
+    # counts in BOTH units, and how much to drop
+    assert f"{len(title.encode())}B" in msg and "40" in msg
+    assert f"{len(title)} chars" in msg
+    # the cut is quoted, and the two sides really are the two sides
+    assert "[✂]" in msg
+    fits = title.encode()[:40].decode("utf-8", "ignore")
+    assert f"{len(fits)} fit" in msg
+    assert f"drop {len(title) - len(fits)}" in msg
+    assert fits[-10:] + "[✂]" in msg          # left of the cut survives
+    assert "[✂]" + title[len(fits):][:10] in msg   # right of it is what to drop
+
+
+def test_a_title_that_only_just_fits_is_accepted(conn, monkeypatch):
+    """The boundary itself is not an error — byte_len == cap must pass, or the
+    limit silently means one byte less than it says."""
+    monkeypatch.setenv("MEMGRES_MAX_TITLE_BYTES", "40")
+    s = _store(conn, monkeypatch, True)
+    title = "я" * 20                      # exactly 40 bytes
+    assert len(title.encode()) == 40
+    assert s.write(body="one", path="a.b", title=title).title == title

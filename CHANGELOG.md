@@ -5,6 +5,32 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.12.3] — 2026-09-09
+
+Two refusals that were technically correct and practically useless. Same theme
+as 0.12.2: an answer that does not teach costs someone an afternoon.
+
+### Fixed — a refusal now shows what it is talking about
+- **An oversized title says where it stops fitting.** The ceiling counts BYTES,
+  the author counts characters, and in UTF-8 the rate depends on the script:
+  Latin runs ~1 B/char, Cyrillic ~2 — so the same 256 B is ~256 characters in one
+  language and ~148 in another. `title is 265B > MEMGRES_MAX_TITLE_BYTES 256` gave
+  the author nothing to aim at, and they trimmed blind, one rejected write at a
+  time (four in a row, observed). It now reads
+  `265B > 256: 153 chars, 148 fit, drop 5 — …остальных вм[✂]есте взятых`: both
+  units, how much to drop, and the cut itself quoted in context. Truncating bytes
+  can land mid-character, so the prefix is decoded with `errors="ignore"` — the
+  dropped fragment IS the first character that does not fit, which keeps the
+  count exact.
+- **A substring edit that finds nothing says why.** `replace text not found in
+  body: '…'` sent the author to re-read the whole record, when the answer is
+  nearly always "your quote is not what the body says". Three causes, in the order
+  they happen: the whitespace differs (bodies wrap, and a line break reads as a
+  space on screen — the commonest miss by far); the case differs; or neither, and
+  then the message names the point where the quote stops agreeing and quotes what
+  the body has there instead. Each ends by naming the one reliable source to copy
+  from — `memory_get`, not a recall snippet.
+
 ## [0.12.2] — 2026-09-03
 
 Provenance stopped lying about itself. Nothing changed in what is stored — only
