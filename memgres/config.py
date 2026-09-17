@@ -140,6 +140,20 @@ class Config:
     # database
     database_url: str
     pool_size: int               # max pooled connections (HTTP + http-MCP servers)
+    # web panel (served by memgres-server; see docs/WEB.md)
+    web_enabled: bool = False    # mount the panel and its /ui/api on the REST server
+    web_cookie_secure: bool = True   # session cookie only over HTTPS. Off is for a
+                                 # plain-http LAN, where the cookie can be read off
+                                 # the wire by anyone on it — say so in the docs
+    web_session_hours: int = 12  # a session ends this long after sign-in, used or not
+    public_url: str = ""         # where people reach the panel, e.g.
+                                 # https://memory.example.com — the one origin state-
+                                 # changing calls are accepted from, and the base of
+                                 # the OIDC redirect URI. Empty = the request's own Host
+    mcp_public_url: str = ""     # the MCP endpoint people put in their clients, e.g.
+                                 # https://memory.example.com/mcp — shown in the panel's
+                                 # config snippets. The panel cannot know it: MCP is
+                                 # usually another container, port or host
 
     def validate(self) -> None:
         if self.pool_size < 1:
@@ -195,6 +209,13 @@ class Config:
             # and the CLI would write the same operator's secrets to different
             # directories — and neither would say so.
             raise ValueError("MEMGRES_TOKEN_SINK must be an absolute path")
+        if self.web_session_hours < 1:
+            raise ValueError("MEMGRES_WEB_SESSION_HOURS must be >= 1")
+        if self.public_url and not self.public_url.startswith(("http://", "https://")):
+            raise ValueError("MEMGRES_PUBLIC_URL must start with http:// or https://")
+        if self.web_enabled and self.key_mode == "single":
+            # Nobody to sign in as: single mode has no accounts and no tokens.
+            raise ValueError("the web panel needs MEMGRES_KEY_MODE=open or managed")
         if self.admin_token and self.admin_token_file:
             raise ValueError(
                 "set only one of MEMGRES_ADMIN_TOKEN / MEMGRES_ADMIN_TOKEN_FILE")
@@ -259,6 +280,11 @@ def load() -> Config:
         embed_max_seq=_int("MEMGRES_EMBED_MAX_SEQ", 0),
         database_url=_str("MEMGRES_DATABASE_URL", ""),
         pool_size=_int("MEMGRES_POOL_SIZE", 4),
+        web_enabled=_bool("MEMGRES_WEB_ENABLED", False),
+        web_cookie_secure=_bool("MEMGRES_WEB_COOKIE_SECURE", True),
+        web_session_hours=_int("MEMGRES_WEB_SESSION_HOURS", 12),
+        public_url=_str("MEMGRES_PUBLIC_URL", "").rstrip("/"),
+        mcp_public_url=_str("MEMGRES_MCP_PUBLIC_URL", ""),
     )
     cfg.validate()
     return cfg

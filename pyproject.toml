@@ -56,4 +56,4 @@ version = { attr = "memgres._version.__version__" }
 include = ["memgres*"]
 
 [tool.setuptools.package-data]
-memgres = ["migrations/*.sql"]
+memgres = ["migrations/*.sql", "web/static/*", "web/static/**/*"]

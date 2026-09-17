@@ -732,6 +732,10 @@ def create_app(cfg: Optional[Config] = None):
             return _guard(lambda: admin.revoke_superadmin(
                 conn, p, user_id=user_id, demote_to=req.demote_to))
 
+    if cfg.web_enabled:
+        from .web.routes import mount
+        mount(app, cfg, pool, _store)
+
     return app
 
 

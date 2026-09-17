@@ -525,6 +525,20 @@ class Store:
             self._conn.close()
 
     # ─── namespace resolution / authorization ───────────────────────────────
+    def _principal(self, token) -> "identity.Principal":
+        """Who is calling: a bearer secret to authenticate, or a principal that
+        has already been authenticated some other way.
+
+        The second form exists for the web panel, whose credential is a browser
+        session rather than a token. It is not a way around authentication — the
+        panel builds the principal from a session it has just checked, with a
+        read-only ceiling — but it does mean anything handed a `Principal` is
+        trusted as-is, so only server code may construct one."""
+        if isinstance(token, identity.Principal):
+            return token
+        return identity.resolve(self._conn, self.cfg,
+                                token or self.cfg.default_token or None)
+
     def _authorize(self, token: Optional[str], *, space: Optional[str] = None,
                    space_id: Optional[str] = None, need: str = "read",
                    for_write: bool = False):
@@ -536,9 +550,8 @@ class Store:
         token is required and the returned id-string is a namespace uuid."""
         if not self._identity_on:
             return "", None
-        token = token or self.cfg.default_token or None
         with self._conn.transaction():
-            principal = identity.resolve(self._conn, self.cfg, token)
+            principal = self._principal(token)
             nsid, perm = identity.resolve_space(
                 self._conn, principal, space=space, space_id=space_id,
                 for_write=for_write)
@@ -560,9 +573,8 @@ class Store:
         which are the only ones that can legitimately span namespaces."""
         if not self._identity_on:
             return [""], {}
-        token = token or self.cfg.default_token or None
         with self._conn.transaction():
-            principal = identity.resolve(self._conn, self.cfg, token)
+            principal = self._principal(token)
             resolved = identity.resolve_spaces(self._conn, principal,
                                                space=space, space_id=space_id)
         for nsid, perm in resolved:
