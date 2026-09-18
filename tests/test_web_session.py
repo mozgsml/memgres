@@ -52,7 +52,7 @@ def box(monkeypatch):
     for k, v in {"MEMGRES_DATABASE_URL": DSN, "MEMGRES_KEY_MODE": "managed",
                  "MEMGRES_EMBED_PROVIDER": "none", "MEMGRES_FTS_LANGUAGE": "simple",
                  "MEMGRES_REQUIRE_TITLE": "false", "MEMGRES_ADMIN_TOKEN": root,
-                 "MEMGRES_ADMIN_ROLE": "superadmin", "MEMGRES_WEB_ENABLED": "true"}.items():
+                 "MEMGRES_ADMIN_ROLE": "superadmin", "MEMGRES_WEB_ENABLED": "true", "MEMGRES_PUBLIC_URL": "https://testserver"}.items():
         monkeypatch.setenv(k, v)
     cfg = load()
     with TestClient(create_app(cfg), base_url=ORIGIN) as c:
@@ -63,11 +63,13 @@ def _bearer(tok):
     return {"Authorization": f"Bearer {tok}"}
 
 
-def _user(client, root, name, role="user"):
-    """An account and a personal token for it."""
+def _user(client, root, name, role="user", permission=None):
+    """An account and a personal token for it — a full admin-ceiling token for an
+    administrator, since that is what the administrator door accepts."""
     uid = client.post("/admin/users", json={"name": name, "role": role},
                       headers=_bearer(root)).json()["id"]
-    tok = client.post("/admin/tokens", json={"user_id": uid},
+    perm = permission or ("admin" if role != "user" else "write")
+    tok = client.post("/admin/tokens", json={"user_id": uid, "permission": perm},
                       headers=_bearer(root)).json()["token"]
     return uid, tok
 
@@ -109,6 +111,33 @@ def test_a_plain_users_valid_token_is_refused_like_a_made_up_one(box):
     assert real.status_code == fake.status_code == 403
     assert real.json() == fake.json()
     assert COOKIE not in client.cookies
+
+
+def test_a_weakened_admin_token_does_not_open_the_door(box):
+    """A read-only or space-pinned token minted for an agent, on an admin
+    account, must not become a session with the account's whole authority —
+    from there it could mint an unpinned token and outlive its own revocation."""
+    client, root, _ = box
+    uid, _ = _user(client, root, "olga", role="superadmin")
+    ns = client.post("/admin/namespaces", json={"owner_user_id": uid, "name": "olga"},
+                     headers=_bearer(root)).json()["id"]
+    weak = [client.post("/admin/tokens", json={"user_id": uid, "permission": p, "namespace_id": n},
+                        headers=_bearer(root)).json()["token"]
+            for p, n in (("read", None), ("write", None), ("admin", ns))]
+    fake = _sign_in(client, identity.new_token())
+    for tok in weak:
+        r = _sign_in(client, tok)
+        assert r.status_code == 403 and r.json() == fake.json()
+    assert COOKIE not in client.cookies
+
+
+def test_a_refused_token_is_not_marked_used(box):
+    client, root, _ = box
+    _, tok = _user(client, root, "mark")
+    _sign_in(client, tok)
+    with psycopg.connect(DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT last_used_at FROM token WHERE token_hash = %s", (identity.token_hash(tok),))
+        assert cur.fetchone()[0] is None
 
 
 def test_sign_in_needs_the_panels_own_origin(box):
@@ -314,10 +343,37 @@ def test_the_panel_is_off_unless_enabled(monkeypatch):
         assert c.get("/signin").status_code == 404
 
 
+def test_the_panel_needs_a_public_url(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith("MEMGRES_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MEMGRES_KEY_MODE", "managed")
+    monkeypatch.setenv("MEMGRES_WEB_ENABLED", "true")
+    with pytest.raises(ValueError, match="PUBLIC_URL"):
+        load()
+
+
+@pytest.mark.parametrize("url, ok", [("http://127.0.0.1:8080", True), ("http://localhost:8080", True),
+                                     ("http://memory.lan", False), ("https://memory.example.com", False)])
+def test_oidc_over_insecure_cookies_only_on_localhost(monkeypatch, url, ok):
+    for k in list(os.environ):
+        if k.startswith("MEMGRES_"):
+            monkeypatch.delenv(k, raising=False)
+    for k, v in {"MEMGRES_KEY_MODE": "managed", "MEMGRES_WEB_ENABLED": "true", "MEMGRES_PUBLIC_URL": url,
+                 "MEMGRES_OIDC_CONFIG": "/nonexistent.toml", "MEMGRES_WEB_COOKIE_SECURE": "false"}.items():
+        monkeypatch.setenv(k, v)
+    if ok:
+        load()
+    else:
+        with pytest.raises(ValueError, match="COOKIE_SECURE"):
+            load()
+
+
 def test_single_mode_cannot_enable_the_panel(monkeypatch):
     for k in list(os.environ):
         if k.startswith("MEMGRES_"):
             monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("MEMGRES_WEB_ENABLED", "true")
+    monkeypatch.setenv("MEMGRES_PUBLIC_URL", "https://testserver")
     with pytest.raises(ValueError, match="KEY_MODE"):
         load()

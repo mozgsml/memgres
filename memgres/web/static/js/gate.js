@@ -40,6 +40,13 @@ export function showGate({ path, options, onSignedIn }) {
     setTimeout(() => $("#admin-token").focus(), 0);
   } else {
     renderProviders(options.providers || []);
+    const result = new URLSearchParams(location.search).get("auth");
+    const note = $("#auth-note");
+    note.hidden = !result;
+    if (result) {
+      note.className = "auth-note " + (result === "pending" ? "wait" : "bad");
+      note.textContent = t("auth." + result) === "auth." + result ? t("auth.failed") : t("auth." + result);
+    }
   }
   applyStatic($("#gate"));
   startArt();

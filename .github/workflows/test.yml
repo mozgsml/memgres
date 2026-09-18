@@ -44,7 +44,7 @@ jobs:
           python-version: '3.12'
       - name: Install (no heavy local-embeddings extra)
         run: |
-          pip install -e ".[server,mcp,qdrant]" pytest httpx
+          pip install -e ".[server,mcp,qdrant,web]" pytest httpx
           if [ "${{ matrix.mcp }}" != "latest" ]; then
             pip install "mcp${{ matrix.mcp }}"
           fi

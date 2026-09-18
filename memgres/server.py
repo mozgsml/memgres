@@ -742,8 +742,14 @@ def create_app(cfg: Optional[Config] = None):
 def main():  # pragma: no cover - entrypoint
     import os
     import uvicorn
+    # Behind a reverse proxy, the client address (used to throttle sign-in
+    # attempts) is only real if the proxy's X-Forwarded-For is trusted:
+    # MEMGRES_FORWARDED_ALLOW_IPS lists the proxy addresses (uvicorn's
+    # forwarded_allow_ips; unset = uvicorn's own default, 127.0.0.1).
     uvicorn.run(create_app(), host=os.environ.get("MEMGRES_HTTP_HOST", "0.0.0.0"),
-                port=int(os.environ.get("MEMGRES_HTTP_PORT", "8080")))
+                port=int(os.environ.get("MEMGRES_HTTP_PORT", "8080")),
+                proxy_headers=True,
+                forwarded_allow_ips=os.environ.get("MEMGRES_FORWARDED_ALLOW_IPS") or None)
 
 
 if __name__ == "__main__":  # pragma: no cover

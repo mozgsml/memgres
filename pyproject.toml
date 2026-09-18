@@ -33,6 +33,7 @@ local = ["sentence-transformers>=3.0"]                    # local embeddings on 
 qdrant = ["qdrant-client>=1.7"]                            # optional vector backend
 server = ["fastapi>=0.110", "uvicorn>=0.29", "psycopg-pool>=3.2"]  # optional HTTP layer
 mcp = ["mcp>=1.2", "psycopg-pool>=3.2"]                    # optional MCP server (stdio/http)
+web = ["pyjwt[crypto]>=2.8", "tomli>=2.0; python_version<'3.11'"]  # web panel: OIDC sign-in (the panel itself needs [server])
 dev = ["pytest>=8.0"]
 
 [project.scripts]

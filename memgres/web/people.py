@@ -1,0 +1,374 @@
+"""People: a profile, write activity, and the administrators' directory.
+
+Who sees what:
+
+* **yourself** — everything: spaces, sign-in methods, tokens, activity;
+* **a service administrator** (user_manager, superadmin) — the same about
+  anyone, plus the switches: role, disabled, tokens, sessions, sign-in methods.
+  The control plane's own rules still apply: a user_manager cannot act on an
+  administrator's account, and only a superadmin hands out roles;
+* **someone you share a space with** — who they are (name, department,
+  position) and what they wrote in the spaces you can both read;
+* **anyone else** — not found. There is no directory for ordinary users.
+
+Activity is writes only, taken from memory history: what someone created,
+changed, moved or retagged. Reads are not tracked per person. History goes away
+with a record that is erased, so a person's past activity can shrink.
+"""
+
+import datetime as dt
+from typing import Optional
+
+from .. import admin, identity
+from ..identity import ADMIN_ROLES
+
+ACTIVITY_DAYS = 182          # 26 weeks, the width of the chart
+MAX_PEOPLE_PAGE = 100
+
+
+class Refused(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+def _uuid(value) -> str:
+    try:
+        return identity._as_uuid(value)
+    except ValueError:
+        raise Refused(404, "not found") from None
+
+
+def _shared_spaces(cur, viewer: str, target: str) -> list:
+    cur.execute(
+        "WITH reach AS ("
+        "  SELECT id AS ns, owner_user_id AS uid FROM namespace "
+        "  UNION SELECT namespace_id, user_id FROM namespace_member) "
+        "SELECT a.ns FROM reach a JOIN reach b ON a.ns = b.ns "
+        "WHERE a.uid = %s AND b.uid = %s", (viewer, target))
+    return [str(r[0]) for r in cur.fetchall()]
+
+
+def _reachable(conn, user_id: str) -> list:
+    return [s["id"] for s in identity.list_spaces(conn, user_id)]
+
+
+def activity(conn, user_id: str, *, spaces: Optional[list]) -> dict:
+    """Writes by day over the chart's window, with totals by space and by kind.
+    ``spaces=None`` counts every space (an administrator's view); otherwise only
+    the spaces listed."""
+    params = [user_id, ACTIVITY_DAYS]
+    where = ""
+    if spaces is not None:
+        if not spaces:
+            return {"days": [], "by_space": [], "by_op": {}, "total": 0, "window_days": ACTIVITY_DAYS}
+        where = " AND m.namespace = ANY(%s::text[])"
+        params.append(spaces)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT (h.created_at AT TIME ZONE 'UTC')::date, m.namespace, h.op, count(*) "
+            "FROM memory_history h JOIN memory m ON m.id = h.memory_id "
+            "WHERE h.author_user_id = %s AND h.created_at > now() - make_interval(days => %s)"
+            + where + " GROUP BY 1, 2, 3", params)
+        rows = cur.fetchall()
+        ns_ids = sorted({r[1] for r in rows if r[1]})
+        names = {}
+        if ns_ids:
+            cur.execute("SELECT id::text, name FROM namespace WHERE id = ANY(%s::uuid[])", (ns_ids,))
+            names = dict(cur.fetchall())
+    days, by_space, by_op, total = {}, {}, {}, 0
+    for day, ns, op, n in rows:
+        days[day] = days.get(day, 0) + n
+        by_space[ns] = by_space.get(ns, 0) + n
+        by_op[op] = by_op.get(op, 0) + n
+        total += n
+    return {
+        "days": [{"day": d.isoformat(), "n": n} for d, n in sorted(days.items())],
+        "by_space": sorted(({"id": ns, "name": names.get(ns, ""), "n": n} for ns, n in by_space.items()),
+                           key=lambda x: -x["n"]),
+        "by_op": by_op,
+        "total": total,
+        "window_days": ACTIVITY_DAYS,
+        "today": dt.datetime.now(dt.timezone.utc).date().isoformat(),
+    }
+
+
+def _account(cur, user_id: str):
+    cur.execute("SELECT id, name, full_name, email, department, position, role, "
+                "disabled_at IS NOT NULL, created_at, can_create_namespace FROM app_user WHERE id = %s",
+                (user_id,))
+    return cur.fetchone()
+
+
+def profile(conn, viewer, target_id: str, *, providers: dict) -> dict:
+    """``viewer`` is the session. Raises Refused(404) for anyone the viewer may
+    not look at — the same answer as an id that does not exist."""
+    from . import admission, tokens
+    target_id = _uuid(target_id)
+    is_self = viewer.user_id == target_id
+    is_service_admin = viewer.role in ADMIN_ROLES
+    with conn.cursor() as cur:
+        row = _account(cur, target_id)
+        if row is None:
+            raise Refused(404, "not found")
+        shared = [] if (is_self or is_service_admin or viewer.user_id is None) else \
+            _shared_spaces(cur, viewer.user_id, target_id)
+    if not (is_self or is_service_admin or shared):
+        raise Refused(404, "not found")
+    uid, name, full_name, email, dept, position, role, disabled, created, can_create = row
+    person = {"id": str(uid), "name": name, "full_name": full_name, "department": dept,
+              "position": position}
+    if not (is_self or is_service_admin):
+        # a colleague: who they are, and only where your spaces meet
+        mine = _reachable(conn, viewer.user_id)
+        together = [s for s in shared if s in mine]
+        with conn.cursor() as cur:
+            cur.execute("SELECT id::text, name FROM namespace WHERE id = ANY(%s::uuid[]) ORDER BY name",
+                        (together,))
+            spaces = [{"id": i, "name": n} for i, n in cur.fetchall()]
+        return {"view": "colleague", "person": person, "shared_spaces": spaces,
+                "activity": activity(conn, str(uid), spaces=together)}
+
+    # who holds authority on the server is not a colleague's business
+    person.update({"role": role, "email": email, "disabled": bool(disabled), "created_at": created,
+                   "can_create_namespace": bool(can_create)})
+    spaces = identity.list_spaces(conn, str(uid))
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM web_session WHERE user_id = %s AND revoked_at IS NULL "
+                    "AND expires_at > now()", (str(uid),))
+        live_sessions = cur.fetchone()[0]
+    # A user_manager hands out access without gaining it, so an administrator's
+    # tokens and sign-in methods are not theirs to see (admin.list_tokens
+    # refuses the same thing).
+    may_manage = is_self or viewer.role == "superadmin" or role not in ADMIN_ROLES
+    out = {
+        "view": "self" if is_self else "admin",
+        "person": person,
+        "spaces": [{"id": s["id"], "name": s["name"], "permission": s["permission"], "mine": s["mine"]}
+                   for s in spaces],
+        "signins": admission.identities(conn, str(uid), providers) if may_manage else None,
+        "tokens": tokens.list_own(conn, str(uid)) if may_manage else None,
+        "sessions": live_sessions,
+        "activity": activity(conn, str(uid), spaces=None if is_service_admin else [s["id"] for s in spaces]),
+    }
+    if not is_self:
+        # what this administrator may do to this account, by the rules that
+        # will enforce it
+        out["can"] = {"manage": may_manage, "set_role": viewer.role == "superadmin"}
+    return out
+
+
+# ─── the directory (service administrators) ──────────────────────────────────
+def directory(conn, *, q: str = "", limit: int = 50, offset: int = 0) -> dict:
+    q = (q or "").strip()[:200]
+    limit = max(1, min(int(limit), MAX_PEOPLE_PAGE))
+    where, params = "", []
+    if q:
+        like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        where = ("WHERE u.name ILIKE %(q)s OR u.full_name ILIKE %(q)s OR u.email ILIKE %(q)s "
+                 "OR u.department ILIKE %(q)s OR EXISTS (SELECT 1 FROM app_user_identity i "
+                 "WHERE i.user_id = u.id AND i.email ILIKE %(q)s)")
+        params = {"q": like}
+    else:
+        params = {}
+    params.update({"limit": limit, "offset": max(0, int(offset))})
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM app_user u {where}", params)
+        total = cur.fetchone()[0]
+        cur.execute(
+            "SELECT u.id, u.name, u.full_name, u.email, u.department, u.role, u.disabled_at IS NOT NULL, "
+            "       u.created_at, "
+            "       (SELECT max(last_login_at) FROM app_user_identity i WHERE i.user_id = u.id), "
+            "       (SELECT max(created_at) FROM memory_history h WHERE h.author_user_id = u.id), "
+            "       (SELECT count(*) FROM app_user_identity i WHERE i.user_id = u.id) "
+            f"FROM app_user u {where} "
+            "ORDER BY u.disabled_at IS NOT NULL, lower(COALESCE(NULLIF(u.full_name, ''), u.name)), u.id "
+            "LIMIT %(limit)s OFFSET %(offset)s", params)
+        people = [{"id": str(i), "name": n, "full_name": fn, "email": e, "department": d, "role": r,
+                   "disabled": bool(off), "created_at": c, "last_signin_at": ls, "last_write_at": lw,
+                   "signins": si}
+                  for i, n, fn, e, d, r, off, c, ls, lw, si in cur.fetchall()]
+    return {"people": people, "total": total, "limit": limit, "offset": offset}
+
+
+def _guard(fn):
+    try:
+        return fn()
+    except admin.Forbidden as e:
+        raise Refused(403, str(e)) from None
+    except admin.Lockout as e:
+        raise Refused(409, str(e)) from None
+    except identity.SpaceNotFound:
+        raise Refused(404, "not found") from None
+    except identity.AuthError as e:
+        raise Refused(409, str(e)) from None
+    except ValueError as e:
+        raise Refused(422, str(e)) from None
+
+
+def end_sessions(conn, p, user_id: str) -> int:
+    user_id = _uuid(user_id)
+    _guard(lambda: admin._require_target_is_plain_user(conn, admin.require_manage_users(p), user_id,
+                                                       "ending sessions"))
+    with conn.cursor() as cur:
+        cur.execute("UPDATE web_session SET revoked_at = now() WHERE user_id = %s AND revoked_at IS NULL",
+                    (user_id,))
+        return cur.rowcount
+
+
+def unlink_signin(conn, p, user_id: str, identity_id: str) -> None:
+    """An administrator removes a sign-in method — the last one too: that is how
+    a wrongly linked sign-in is taken back. Its sessions end with it."""
+    user_id, identity_id = _uuid(user_id), _uuid(identity_id)
+    _guard(lambda: admin._require_target_is_plain_user(conn, admin.require_manage_users(p), user_id,
+                                                       "removing a sign-in method"))
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM app_user_identity WHERE id = %s AND user_id = %s RETURNING id",
+                    (identity_id, user_id))
+        if cur.fetchone() is None:
+            raise Refused(404, "not found")
+        cur.execute("UPDATE web_session SET revoked_at = now() WHERE user_id = %s AND identity_id = %s "
+                    "AND revoked_at IS NULL", (user_id, identity_id))
+
+
+def revoke_token(conn, p, user_id: str, token_id: str) -> None:
+    user_id, token_id = _uuid(user_id), _uuid(token_id)
+    if identity.token_owner(conn, token_id) != user_id:
+        raise Refused(404, "not found")
+    _guard(lambda: admin.revoke_token(conn, p, token_id=token_id))
+
+
+PROFILE_EDITABLE = ("full_name", "email", "department", "position")
+
+
+def edit(conn, p, user_id: str, changes: dict) -> None:
+    user_id = _uuid(user_id)
+    fields = {}
+    for k, v in changes.items():
+        if k not in PROFILE_EDITABLE or v is None:
+            continue
+        if not isinstance(v, str):
+            raise Refused(422, f"{k} must be text")
+        fields[k] = v.strip()
+    if "email" in fields:
+        if fields["email"]:
+            from .spaces import Refused as SpaceRefused, normalize_email
+            try:
+                fields["email"] = normalize_email(fields["email"])
+            except SpaceRefused as e:
+                raise Refused(422, str(e)) from None
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM app_user WHERE lower(email) = lower(%s) AND id <> %s",
+                            (fields["email"], user_id))
+                if cur.fetchone():
+                    raise Refused(409, "another account already has this email")
+        else:
+            # an empty email is "none", which the unique index allows many of
+            with conn.cursor() as cur:
+                _guard(lambda: admin._require_target_is_plain_user(conn, admin.require_manage_users(p), user_id,
+                                                                   "editing a profile"))
+                cur.execute("UPDATE app_user SET email = NULL WHERE id = %s", (user_id,))
+            fields.pop("email")
+    for k, v in fields.items():
+        if len(v) > 200:
+            raise Refused(422, f"{k} is longer than 200 characters")
+    _guard(lambda: admin.edit_user(conn, p, user_id=user_id, **fields))
+
+
+# ─── record history (for authors) ────────────────────────────────────────────
+def record_history(store, principal, space_id: str, record_id: str) -> list:
+    """Who changed a record and when — the way into a person's profile from
+    what they wrote. No diffs: the panel shows the record as it is now."""
+    rows = store.history(principal, id=record_id, space_id=space_id)
+    return [{"seq": r["seq"], "op": r["op"], "at": r["created_at"], "author_id": r["author_user_id"],
+             "author": r["author_name"], "reason": r["reason"],
+             "path_before": r["path_before"], "path_after": r["path_after"]}
+            for r in reversed(rows)]
+
+
+# ─── HTTP ────────────────────────────────────────────────────────────────────
+def mount(app, cfg, pool, panel, providers, make_store) -> None:
+    from fastapi import Body, HTTPException, Request
+
+    from .sessions import control_principal
+
+    def _run(fn, *, tx=True):
+        with pool.connection() as conn:
+            try:
+                if tx:
+                    with conn.transaction():
+                        return fn(conn)
+                return fn(conn)
+            except Refused as e:
+                raise HTTPException(e.status, str(e))
+
+    def _admin(request: Request, changing: bool = False):
+        s = panel["changing"](request) if changing else panel["session"](request)
+        if s.role not in ADMIN_ROLES:
+            raise HTTPException(403, "administrators only")
+        return s
+
+    @app.get("/ui/api/people/{user_id}")
+    def person(user_id: str, request: Request):
+        s = panel["session"](request)
+        return _run(lambda conn: profile(conn, s, user_id, providers=providers), tx=False)
+
+    @app.get("/ui/api/admin/people")
+    def people(request: Request, q: str = "", limit: int = 50, offset: int = 0):
+        _admin(request)
+        return _run(lambda conn: directory(conn, q=q, limit=limit, offset=offset), tx=False)
+
+    @app.patch("/ui/api/admin/people/{user_id}")
+    def edit_person(user_id: str, request: Request, changes: dict = Body(...)):
+        p = control_principal(_admin(request, changing=True))
+        _run(lambda conn: edit(conn, p, user_id, changes))
+        return {"user_id": user_id}
+
+    @app.post("/ui/api/admin/people/{user_id}/role")
+    def set_role(user_id: str, request: Request, role: str = Body(..., embed=True)):
+        p = control_principal(_admin(request, changing=True))
+        return _run(lambda conn: _guard(lambda: admin.set_role(conn, p, user_id=_uuid(user_id), role=role)))
+
+    @app.post("/ui/api/admin/people/{user_id}/disabled")
+    def set_disabled(user_id: str, request: Request, disabled: bool = Body(..., embed=True)):
+        s = _admin(request, changing=True)
+        try:
+            same = s.user_id is not None and identity._as_uuid(user_id) == s.user_id
+        except ValueError:
+            raise HTTPException(404, "not found")
+        if same and disabled:
+            raise HTTPException(409, "you can’t switch off your own account")
+        p = control_principal(s)
+        return _run(lambda conn: _guard(lambda: admin.set_disabled(conn, p, user_id=_uuid(user_id),
+                                                                   disabled=disabled)))
+
+    @app.post("/ui/api/admin/people/{user_id}/sessions/end")
+    def sessions_end(user_id: str, request: Request):
+        p = control_principal(_admin(request, changing=True))
+        return {"ended": _run(lambda conn: end_sessions(conn, p, user_id))}
+
+    @app.delete("/ui/api/admin/people/{user_id}/signins/{identity_id}")
+    def signin_remove(user_id: str, identity_id: str, request: Request):
+        p = control_principal(_admin(request, changing=True))
+        _run(lambda conn: unlink_signin(conn, p, user_id, identity_id))
+        return {"unlinked": identity_id}
+
+    @app.delete("/ui/api/admin/people/{user_id}/tokens/{token_id}")
+    def token_revoke(user_id: str, token_id: str, request: Request):
+        p = control_principal(_admin(request, changing=True))
+        _run(lambda conn: revoke_token(conn, p, user_id, token_id))
+        return {"revoked": token_id}
+
+    @app.get("/ui/api/spaces/{space_id}/records/{record_id}/history")
+    def history(space_id: str, record_id: str, request: Request):
+        from ..identity import AuthError, SpaceNotFound
+        from ..store import NotFound
+        s = panel["session"](request)
+        if s.user_id is None:
+            raise HTTPException(409, "the administrator token has no memory to show")
+        with pool.connection() as conn:
+            try:
+                sid, rid = identity._as_uuid(space_id), identity._as_uuid(record_id)
+                return {"history": record_history(make_store(conn), panel["principal"](s), sid, rid)}
+            except (NotFound, SpaceNotFound, AuthError, KeyError, ValueError):
+                raise HTTPException(404, "not found")

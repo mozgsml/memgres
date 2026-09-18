@@ -150,6 +150,8 @@ class Config:
                                  # https://memory.example.com — the one origin state-
                                  # changing calls are accepted from, and the base of
                                  # the OIDC redirect URI. Empty = the request's own Host
+    oidc_config: str = ""        # path of the TOML file listing sign-in providers
+                                 # (see memgres/web/oidc_config.py and docs/OIDC.md)
     mcp_public_url: str = ""     # the MCP endpoint people put in their clients, e.g.
                                  # https://memory.example.com/mcp — shown in the panel's
                                  # config snippets. The panel cannot know it: MCP is
@@ -213,6 +215,16 @@ class Config:
             raise ValueError("MEMGRES_WEB_SESSION_HOURS must be >= 1")
         if self.public_url and not self.public_url.startswith(("http://", "https://")):
             raise ValueError("MEMGRES_PUBLIC_URL must start with http:// or https://")
+        if self.web_enabled and not self.public_url:
+            # Without it the allowed Origin and the OIDC redirect URI would come
+            # from the request's Host header — wrong behind a proxy, and
+            # attacker-chosen in front of none.
+            raise ValueError("the web panel needs MEMGRES_PUBLIC_URL (e.g. https://memory.example.com)")
+        if self.web_enabled and self.oidc_config and not self.web_cookie_secure:
+            from urllib.parse import urlsplit
+            if (urlsplit(self.public_url).hostname or "") not in ("localhost", "127.0.0.1", "::1"):
+                raise ValueError("OIDC sign-in needs MEMGRES_WEB_COOKIE_SECURE=true "
+                                 "(insecure cookies are allowed only on localhost)")
         if self.web_enabled and self.key_mode == "single":
             # Nobody to sign in as: single mode has no accounts and no tokens.
             raise ValueError("the web panel needs MEMGRES_KEY_MODE=open or managed")
@@ -285,6 +297,7 @@ def load() -> Config:
         web_session_hours=_int("MEMGRES_WEB_SESSION_HOURS", 12),
         public_url=_str("MEMGRES_PUBLIC_URL", "").rstrip("/"),
         mcp_public_url=_str("MEMGRES_MCP_PUBLIC_URL", ""),
+        oidc_config=_str("MEMGRES_OIDC_CONFIG", ""),
     )
     cfg.validate()
     return cfg

@@ -17,8 +17,12 @@ window.memgresPanel = state;
 function areaOf(path) {
   if (path.startsWith("/account")) return "account";
   if (path.startsWith("/admin")) return "admin";
+  if (path === "/space") return "space";
+  if (path === "/people") return "people";
   return "memory";
 }
+
+const AREAS = ["memory", "space", "people", "account", "admin"];
 
 export function navigate(path, { replace = false } = {}) {
   if (replace) history.replaceState(null, "", path); else history.pushState(null, "", path);
@@ -54,10 +58,15 @@ async function render() {
   if (area === "memory" && !s.can.memory) return navigate(s.can.admin ? "/admin" : "/account", { replace: true });
 
   renderSidebar(area);
-  for (const id of ["memory", "account", "admin"]) $("#area-" + id).hidden = id !== area;
+  for (const id of AREAS) $("#area-" + id).hidden = id !== area;
   const root = $("#area-" + area);
-  const ctx = { session: s, path, navigate, onLanguage, refreshSession, pane: path === "/account/tokens" ? "tokens" : "profile",
-    renderTokens: state.modules.tokens };
+  const pane = path === "/account/tokens" ? "tokens" : path === "/account/signins" ? "signins" : "profile";
+  const ctx = { session: s, path, navigate, onLanguage, refreshSession, pane,
+    renderTokens: state.modules.tokens, renderSignins: state.modules.signins,
+    // memberships changed elsewhere: the memory area reloads its space list next time
+    invalidateSpaces: () => { state.spacesStale = true; },
+    get forceReload() { const v = !!state.spacesStale; state.spacesStale = false; return v; } };
+  if (area !== "memory" && s.can.memory) state.modules.sidebarSpaces?.(ctx);
   if (area === "account") renderAccount(root, ctx);
   else if (state.modules[area]) state.modules[area](root, ctx);
   else root.innerHTML = `<div class="page-in"><p class="note">${esc(t("app.notYet"))}</p></div>`;
@@ -66,7 +75,9 @@ async function render() {
 // ─── sidebar ────────────────────────────────────────────────────────────────
 function renderSidebar(area) {
   const s = state.session;
-  for (const a of $$(".navbtn")) a.setAttribute("aria-current", String(a.dataset.area === area));
+  // a person's page belongs with the directory for an administrator, with memory for everyone else
+  const lit = area === "people" ? (s.can.admin ? "admin" : "memory") : area === "space" ? "memory" : area;
+  for (const a of $$(".navbtn")) a.setAttribute("aria-current", String(a.dataset.area === lit));
   $('.navbtn[data-area="admin"]').hidden = !s.can.admin;
   $('.navbtn[data-area="memory"]').hidden = !s.can.memory;
   $("#spaces-sec").hidden = !s.can.memory;
@@ -75,6 +86,9 @@ function renderSidebar(area) {
   $("#me").textContent = initials(name);
   $("#me-name").textContent = name;
   $("#me-role").textContent = t("role." + s.role);
+  const badge = $("#admin-badge");
+  badge.textContent = s.pending_requests || "";
+  badge.hidden = !(s.can.admin && s.pending_requests);
 }
 
 function initials(name) {
@@ -174,7 +188,11 @@ async function boot() {
   // later areas load themselves; a missing one leaves the shell usable
   await Promise.all([
     import("./tokens.js").then((m) => { state.modules.tokens = m.renderTokens; }).catch(() => {}),
-    import("./memory.js").then((m) => { state.modules.memory = m.renderMemory; }).catch(() => {}),
+    import("./memory.js").then((m) => { state.modules.memory = m.renderMemory; state.modules.sidebarSpaces = m.sidebarSpaces; }).catch(() => {}),
+    import("./signins.js").then((m) => { state.modules.signins = m.renderSignins; }).catch(() => {}),
+    import("./admin.js").then((m) => { state.modules.admin = m.renderAdmin; }).catch(() => {}),
+    import("./space.js").then((m) => { state.modules.space = m.renderSpace; }).catch(() => {}),
+    import("./people.js").then((m) => { state.modules.people = m.renderPerson; }).catch(() => {}),
   ]);
   render();
 }

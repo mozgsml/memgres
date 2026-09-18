@@ -1,7 +1,7 @@
 // Memory: a space drawn as a graph or a tree, search, the local view and a record's card.
 // Read-only in this release.
 
-import { get, ApiError } from "./api.js";
+import { get, post, ApiError } from "./api.js";
 import { ago, fmtDate, nf, t } from "./i18n.js";
 import { VISUALIZERS } from "./viz.js";
 import { $, $$, autoSlots, esc, hexIcon, PALETTE, PALETTE_KEYS, reducedMotion, store, toast } from "./ui.js";
@@ -18,15 +18,27 @@ const m = {
 export async function renderMemory(root, ctx) {
   m.root = root;
   m.navigate = ctx.navigate;
+  m.session = ctx.session;
   if (!root.dataset.built) buildArea(root);
   applyAreaText();
-  if (!m.spaces.length || ctx.forceReload) await loadSpaces();
-  const wanted = new URLSearchParams(location.search).get("space") || store.get("memgres.space");
-  const target = m.spaces.find((s) => s.id === wanted) || [...m.spaces].sort(byRecords)[0];
+  const reload = ctx.forceReload;
+  if (!m.loaded || reload) { await loadSpaces(); if (reload) m.graph = null; }
+  const asked = new URLSearchParams(location.search).get("space");
   renderSpaceList();
+  if (asked && !m.spaces.some((s) => s.id === asked)) { showNoAccess(asked); return; }
+  const wanted = asked || store.get("memgres.space");
+  const target = m.spaces.find((s) => s.id === wanted) || [...m.spaces].sort(byRecords)[0];
   if (!target) { showEmpty(); return; }
   if (!m.space || m.space.id !== target.id || !m.graph) await openSpace(target);
   else { mountViz(); inspect(); }
+}
+
+// The sidebar's list of spaces, on every page — not only while memory is open.
+export async function sidebarSpaces(ctx) {
+  m.navigate = ctx.navigate;
+  wireSidebar();
+  if (!m.loaded || ctx.forceReload) { try { await loadSpaces(); } catch { return; } m.graph = null; }
+  renderSpaceList();
 }
 
 const byRecords = (a, b) => b.records - a.records || a.name.localeCompare(b.name);
@@ -111,6 +123,14 @@ function buildArea(root) {
     if (cp) (navigator.clipboard?.writeText(cp.dataset.copy) || Promise.reject()).then(() => toast(t("toast.copied", { v: cp.dataset.copy })), () => toast(cp.dataset.copy));
   });
 
+  $("#inspector", root).addEventListener("click", onInspectorAction);
+  wireSidebar();
+  document.addEventListener("keydown", onKey);
+}
+
+function wireSidebar() {
+  if (m.sidebarWired) return;
+  m.sidebarWired = true;
   $("#spacelist").addEventListener("click", (e) => {
     const b = e.target.closest("[data-space]");
     if (!b) return;
@@ -119,7 +139,6 @@ function buildArea(root) {
     m.navigate(`/memory?space=${encodeURIComponent(b.dataset.space)}`);
   });
   $("#space-filter").addEventListener("input", renderSpaceList);
-  document.addEventListener("keydown", onKey);
 }
 
 function applyAreaText() {
@@ -152,6 +171,7 @@ function onKey(e) {
 // ─── spaces ──────────────────────────────────────────────────────────────────
 async function loadSpaces() {
   m.spaces = (await get("/spaces")).spaces;
+  m.loaded = true;
   m.spaceAuto = autoSlots(m.spaces.map((s) => s.name));
 }
 
@@ -163,18 +183,65 @@ function renderSpaceList() {
   $("#space-filter-wrap").hidden = list.length <= 8;
   $("#spaces-total").textContent = nf(list.length);
   const shown = list.filter((s) => !q || s.name.toLowerCase().includes(q));
-  $("#spacelist").innerHTML = shown.map((s) => `<a class="spaceitem" role="listitem" href="/memory?space=${encodeURIComponent(s.id)}" data-space="${esc(s.id)}" style="--c:${spaceColor(s)}" aria-current="${m.space?.id === s.id}" title="${esc(s.name)}">${hexIcon(spaceColor(s), false, 16)}<span class="nm">${esc(s.name)}</span><span class="ct">${nf(s.records)}</span></a>`).join("")
+  $("#spacelist").innerHTML = shown.map((s) => `<a class="spaceitem" role="listitem" href="/memory?space=${encodeURIComponent(s.id)}" data-space="${esc(s.id)}" style="--c:${spaceColor(s)}" aria-current="${m.space?.id === s.id}" title="${esc(s.name)}">${hexIcon(spaceColor(s), false, 16)}<span class="nm">${esc(s.name)}</span>${s.waiting ? `<span class="wait-dot" title="${esc(t("sp.waitingN", { n: s.waiting }))}">${nf(s.waiting)}</span>` : `<span class="ct">${nf(s.records)}</span>`}</a>`).join("")
     || `<p class="side-empty">${esc(list.length ? t("side.noSpaces", { q }) : t("mem.noSpaces"))}</p>`;
   if (m.space) $("#mbar-space").innerHTML = `${hexIcon(spaceColor(m.space), false, 14)}${esc(m.space.name)}`;
 }
 
+// A link to a space this person cannot open — or that does not exist; the two look
+// the same. What they can do is ask the people who run it.
+async function showNoAccess(id) {
+  m.space = null; m.graph = null;
+  for (const sel of [".stagebar", ".zoom", "#suggest"]) $(sel, m.root).hidden = true;
+  $("#q", m.root).disabled = true;
+  $("#spacetitle", m.root).innerHTML = "";
+  $("#mbar-space").innerHTML = "";
+  const host = $("#viz-host", m.root);
+  $("#inspector", m.root).innerHTML = `<p class="note">${esc(t("noacc.side"))}</p>`;
+  host.innerHTML = `<div class="noaccess"><div class="card">
+    ${hexIcon("#707aa0", true, 34)}
+    <h2>${esc(t("noacc.title"))}</h2>
+    <p class="note">${esc(t("noacc.lead"))}</p>
+    <div id="na-state"><p class="note">${esc(t("mem.loading"))}</p></div>
+  </div></div>`;
+  let state = { status: null };
+  try { state = await get(`/spaces/${encodeURIComponent(id)}/access`); } catch { /* treat as none */ }
+  const box = $("#na-state", host);
+  if (!box) return;
+  const form = (again) => `<form class="invite-row" id="na-form">
+      <div class="field"><label for="na-perm">${esc(t("tok.access"))}</label><select id="na-perm" class="sel">
+        ${["read", "write", "admin"].map((p) => `<option value="${p}">${esc(t("perm." + p))}</option>`).join("")}</select></div>
+      <button class="btn primary" type="submit">${esc(t(again ? "noacc.askAgain" : "noacc.ask"))}</button></form>`;
+  if (state.status === "pending") box.innerHTML = `<div class="auth-note wait">${esc(t("noacc.pending", { perm: t("perm." + state.permission), ago: ago(state.created_at) }))}</div>`;
+  else box.innerHTML = (state.status === "denied" ? `<div class="auth-note bad">${esc(t("noacc.denied"))}</div>` : "") + form(state.status === "denied");
+  $("#na-form", box)?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const b = $("button", e.target);
+    b.disabled = true;
+    try {
+      const r = await post(`/spaces/${encodeURIComponent(id)}/access`, { permission: $("#na-perm", box).value });
+      if (r.status === "already_reachable") { m.loaded = false; return m.navigate(`/memory?space=${encodeURIComponent(id)}`, { replace: true }); }
+      toast(t("noacc.sent"));
+      showNoAccess(id);
+    } catch (ex) {
+      b.disabled = false;
+      toast(ex instanceof ApiError && ex.status === 409 ? String(ex.detail) : t("err.save"));
+    }
+  });
+}
+
 function showEmpty() {
+  m.space = null; m.graph = null;
+  for (const sel of [".stagebar", ".zoom", "#suggest"]) $(sel, m.root).hidden = true;
+  $("#q", m.root).disabled = true;
   $("#spacetitle", m.root).innerHTML = "";
   $("#viz-host", m.root).innerHTML = `<p class="viz-empty">${esc(t("mem.noSpaces"))}</p>`;
   $("#inspector", m.root).innerHTML = `<p class="note">${esc(t("mem.noSpacesHelp"))}</p>`;
 }
 
 async function openSpace(space) {
+  for (const sel of [".stagebar", ".zoom"]) $(sel, m.root).hidden = false;
+  $("#q", m.root).disabled = false;
   m.space = space;
   store.set("memgres.space", space.id);
   m.selected = null; m.query = ""; m.hits = null; m.scope = "all";
@@ -437,6 +504,11 @@ async function inspect() {
       <div><p class="h3">${esc(t("insp.color"))}</p><div class="colorline"><span class="txt">${hexIcon(sc, false, 14)} ${t("color.spaceAuto", { name: esc(colorName(sc)) })}</span></div></div>
       <div><p class="h3">${esc(t("insp.mostLinked"))}</p>${listOf(hubs)}</div>
       ${m.graph.truncated ? `<p class="note" style="color:var(--admin)">${esc(t("mem.truncatedNote", { shown: nf(m.graph.records.length), total: nf(m.graph.total) }))}</p>` : ""}
+      <div class="row">
+        ${m.space.permission === "admin" ? `<a class="btn" href="/space?id=${encodeURIComponent(m.space.id)}">${esc(t("insp.members"))}${m.space.waiting ? ` <span class="badge">${nf(m.space.waiting)}</span>` : ""}</a>` : ""}
+        <button class="btn quiet" data-sp="link">${esc(t("insp.copyLink"))}</button>
+        ${m.space.mine ? "" : `<button class="btn quiet" data-sp="leave">${esc(t("sp.leave"))}</button>`}
+      </div>
       <p class="note">${esc(t("insp.spaceNote"))}</p>`;
     return;
   }
@@ -471,5 +543,44 @@ async function inspect() {
     <div><p class="h3">${esc(t("insp.linksTo"))}</p>${listOf(outIds)}${dangling.length ? `<p class="note">${esc(t("insp.danglingList", { list: dangling.map((l) => l.target).join(", ") }))}</p>` : ""}</div>
     <div><p class="h3">${esc(t("insp.linkedFrom"))}</p>${listOf(inIds)}</div>
     <div><p class="h3">${esc(t("insp.color"))}</p><div class="colorline"><span class="txt">${hexIcon(c, false, 14)} ${t("color.auto", { name: esc(colorName(c)), root: esc(n.root) })}</span></div></div>
+    <div><p class="h3">${esc(t("insp.history"))}</p><div class="hist" id="insp-hist"><p class="note">…</p></div></div>
     <div class="row">${n.path ? `<button class="btn quiet" data-copy="${esc(n.path)}">${esc(t("insp.copy"))}</button>` : ""}<button class="btn quiet" data-copy="${esc(r.id)}">${esc(t("insp.copyId"))}</button></div>`;
+  let hist;
+  try {
+    hist = (await get(`/spaces/${encodeURIComponent(m.space.id)}/records/${encodeURIComponent(rec.id)}/history`)).history;
+  } catch {
+    hist = null;
+  }
+  const el = seq === inspectSeq && $("#insp-hist", box);
+  if (!el) return;
+  if (!hist) { el.innerHTML = `<p class="note">${esc(t("err.network"))}</p>`; return; }
+  const shown = hist.slice(0, 8);
+  el.innerHTML = shown.map((h) => `<div class="hrow"><span class="op">${esc(t("op." + h.op) === "op." + h.op ? h.op : t("op." + h.op))}</span>
+      ${h.author_id ? `<a class="person" href="/people?id=${encodeURIComponent(h.author_id)}">${esc(h.author || t("people.unnamed"))}</a>` : `<span class="note">${esc(t("insp.noAuthor"))}</span>`}
+      <time class="note" datetime="${esc(h.at)}" title="${esc(fmtDate(h.at))}">${esc(ago(h.at))}</time>
+      ${h.reason ? `<small>${esc(h.reason)}</small>` : ""}</div>`).join("")
+    + (hist.length > shown.length ? `<p class="note">${esc(t("insp.andMore", { n: hist.length - shown.length }))}</p>` : "");
+}
+
+async function onInspectorAction(e) {
+  const b = e.target.closest("[data-sp]");
+  if (!b || !m.space) return;
+  const space = m.space;
+  if (b.dataset.sp === "link") {
+    const link = `${location.origin}/memory?space=${encodeURIComponent(space.id)}`;
+    (navigator.clipboard?.writeText(link) || Promise.reject()).then(() => toast(t("insp.linkCopied")), () => toast(link));
+    return;
+  }
+  if (b.dataset.sp === "leave" && m.session?.user && confirm(t("sp.leaveConfirm", { space: space.name }))) {
+    try {
+      const { del } = await import("./api.js");
+      await del(`/spaces/${encodeURIComponent(space.id)}/members/${encodeURIComponent(m.session.user.id)}`);
+      toast(t("sp.left", { space: space.name }));
+      store.set("memgres.space", "");
+      m.loaded = false; m.space = null; m.graph = null;
+      m.navigate("/memory", { replace: true });
+    } catch (ex) {
+      toast(ex instanceof ApiError && ex.detail ? String(ex.detail) : t("err.save"));
+    }
+  }
 }

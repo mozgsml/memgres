@@ -61,17 +61,26 @@ def authenticate_admin_token(conn, cfg, secret: str) -> Principal:
     if not secret or len(secret) > 512:
         raise refused
     try:
-        p = identity.resolve(conn, cfg, secret)
+        # touch=False: being refused here is not "using" the token
+        p = identity.resolve(conn, cfg, secret, touch=False)
     except AuthError:
         raise refused from None
     if p.provisional:
         raise refused
     if not (p.is_admin or p.role in ADMIN_ROLES):
         raise refused
+    # The token's own limits count, not only the account's role. A read-only
+    # token pinned to one space, minted for an agent, must not open a session
+    # with the account's whole authority — from which it could mint an unpinned
+    # token or link a sign-in method and outlive its own revocation. The REST
+    # control plane refuses such a credential for the same reason
+    # (admin._require_full_credential).
+    if p.permission != "admin" or p.scope_namespace_id is not None:
+        raise refused
     return p
 
 
-def create(conn, cfg, p: Principal, *, via: str) -> tuple:
+def create(conn, cfg, p: Principal, *, via: str, identity_id: Optional[str] = None) -> tuple:
     """Open a session for an authenticated principal. Returns ``(sid, csrf)``;
     only the sid's hash is stored."""
     sid = secrets.token_urlsafe(32)
@@ -84,10 +93,13 @@ def create(conn, cfg, p: Principal, *, via: str) -> tuple:
             raise AuthError("this token cannot sign in here")
         root_fp = identity.token_hash(cfg.admin_token)
     with conn.cursor() as cur:
+        # sessions that ended a day ago are only clutter
+        cur.execute("DELETE FROM web_session WHERE expires_at < now() - interval '1 day' "
+                    "OR revoked_at < now() - interval '1 day'")
         cur.execute(
-            "INSERT INTO web_session (id_hash, user_id, via, token_id, root_fp, csrf, "
-            "expires_at) VALUES (%s, %s, %s, %s, %s, %s, now() + make_interval(hours => %s))",
-            (_hash(sid), p.user_id, via, p.token_id, root_fp, csrf,
+            "INSERT INTO web_session (id_hash, user_id, via, token_id, root_fp, csrf, identity_id, "
+            "expires_at) VALUES (%s, %s, %s, %s, %s, %s, %s, now() + make_interval(hours => %s))",
+            (_hash(sid), p.user_id, via, p.token_id, root_fp, csrf, identity_id,
              cfg.web_session_hours))
     return sid, csrf
 
@@ -102,6 +114,18 @@ def load(conn, cfg, sid: Optional[str]) -> Optional[Session]:
     """
     if not sid or len(sid) > 128:
         return None
+    return load_by_hash(conn, cfg, _hash(sid))
+
+
+def session_hash(sid: str) -> str:
+    return _hash(sid)
+
+
+def load_by_hash(conn, cfg, id_hash: Optional[str]) -> Optional[Session]:
+    """:func:`load`, for a session known by its stored hash (an OIDC link flow
+    records the hash of the session that started it)."""
+    if not id_hash:
+        return None
     with conn.cursor() as cur:
         cur.execute(
             "SELECT s.id_hash, s.user_id, s.via, s.token_id, s.root_fp, s.csrf, "
@@ -113,7 +137,7 @@ def load(conn, cfg, sid: Optional[str]) -> Optional[Session]:
             "LEFT JOIN app_user u ON u.id = s.user_id "
             "LEFT JOIN token t ON t.id = s.token_id "
             "WHERE s.id_hash = %s AND s.revoked_at IS NULL AND s.expires_at > now()",
-            (_hash(sid),))
+            (id_hash,))
         row = cur.fetchone()
         if row is None:
             return None
@@ -158,16 +182,37 @@ def csrf_ok(session: Session, offered: Optional[str]) -> bool:
 
 
 def principal(session: Session) -> Principal:
-    """The caller, for everything the panel asks of memory and the control plane.
+    """The caller, for everything the panel asks of memory.
 
     The ceiling is READ: this release of the panel only looks. Service authority
-    (the role) is carried as-is, because the admin area needs it and it was
-    re-checked when the session loaded.
+    (the role) is carried as-is, because it was re-checked when the session
+    loaded.
     """
     if session.user_id is None:
         return Principal(user_id=None, permission="read", scope_namespace_id=None,
                          is_admin=True, role="superadmin")
     return Principal(user_id=session.user_id, permission="read",
+                     scope_namespace_id=None, role=session.role,
+                     is_admin=session.role == "superadmin")
+
+
+def control_principal(session: Session) -> Principal:
+    """The caller, for the control plane: who is in a space, people, roles.
+
+    Unlike :func:`principal` this carries an ``admin`` ceiling and no scope —
+    what :mod:`memgres.admin` requires of a credential before it lets anyone
+    manage anything. That is what a session is: it opens only through a
+    provider (the account itself) or through an admin-ceiling, unscoped token
+    (see :func:`authenticate_admin_token`), never through a weakened one. What
+    the ACCOUNT may do — its role, its membership of a space, the target's
+    role — is still decided by the control plane's own checks.
+
+    Memory is never read or written with this principal.
+    """
+    if session.user_id is None:
+        return Principal(user_id=None, permission="admin", scope_namespace_id=None,
+                         is_admin=True, role="superadmin")
+    return Principal(user_id=session.user_id, permission="admin",
                      scope_namespace_id=None, role=session.role,
                      is_admin=session.role == "superadmin")
 

@@ -28,9 +28,16 @@ def spaces(conn, user_id: str) -> list:
         cur.execute(f"SELECT namespace, count(*) FROM memory WHERE {where} GROUP BY namespace",
                     params)
         counts = {str(ns): n for ns, n in cur.fetchall()}
+        # people waiting to join — only where this person decides
+        admin_ids = [r["id"] for r in rows if r["permission"] == "admin"]
+        waiting = {}
+        if admin_ids:
+            cur.execute("SELECT namespace_id, count(*) FROM access_request WHERE status = 'pending' "
+                        "AND namespace_id = ANY(%s::uuid[]) GROUP BY namespace_id", (admin_ids,))
+            waiting = {str(ns): n for ns, n in cur.fetchall()}
     return [{"id": r["id"], "name": r["name"], "description": r["description"],
              "permission": r["permission"], "mine": r["mine"], "alias": r["alias"],
-             "records": counts.get(r["id"], 0)} for r in rows]
+             "records": counts.get(r["id"], 0), "waiting": waiting.get(r["id"], 0)} for r in rows]
 
 
 def graph(conn, principal, space_id: str) -> dict:
@@ -105,7 +112,7 @@ def mount(app, cfg, pool, panel, make_store) -> None:
         with pool.connection() as conn:
             store = make_store(conn)
             sid, rid = _guard(lambda: (identity._as_uuid(space_id), identity._as_uuid(record_id)))
-            m = _guard(lambda: store.get(p, id=rid, space_id=sid)).to_dict()
+            m = _guard(lambda: store.get(p, id=rid, space_id=sid, _count=False)).to_dict()
             links = _guard(lambda: store.links(p, id=rid, direction="both", space_id=sid))
             return {"record": m, "links": links}
 
@@ -121,5 +128,5 @@ def mount(app, cfg, pool, panel, make_store) -> None:
             sid = _guard(lambda: identity._as_uuid(space_id))
             hits = _guard(lambda: make_store(conn).recall(
                 p, q, k=min(k or MAX_SEARCH_HITS, MAX_SEARCH_HITS), space_id=sid,
-                bodies=True, snippet=True))
+                bodies=True, snippet=True, _count=False))
             return {"hits": [h.to_recall_dict() for h in hits]}

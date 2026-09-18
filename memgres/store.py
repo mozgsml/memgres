@@ -1314,7 +1314,7 @@ class Store:
                match: Optional[str] = None,
                snippet: Optional[bool] = None, full_body: Optional[bool] = None,
                bodies: bool = True, match_tags: Optional[str] = None,
-               space=None, space_id=None):
+               space=None, space_id=None, _count: bool = True):
         """Search bodies AND curated titles. ``space``/``space_id`` may name one
         namespace, several, or ``'all'`` — see :func:`identity.resolve_spaces`.
 
@@ -1336,7 +1336,8 @@ class Store:
         # A hit is a surfacing: this memory was findable for what someone asked.
         # Counted for what came BACK, not for what was considered — a candidate
         # the ranking discarded showed nobody anything.
-        self._count_usage("recall", [h.id for h in hits])
+        if _count:      # False for a person browsing the panel: usage counts what agents recall
+            self._count_usage("recall", [h.id for h in hits])
         return hits
 
     # ─── links: the graph between memories ──────────────────────────────────

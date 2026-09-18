@@ -1,10 +1,10 @@
 # memgres image — runs the HTTP server (default) or the MCP server
 # (`docker run … memgres-mcp`). Light by design: cloud embeddings use the stdlib,
 # so the base image needs no ML stack. For local (sentence-transformers)
-# embeddings, build with:  --build-arg EXTRAS=server,mcp,qdrant,local
+# embeddings, build with:  --build-arg EXTRAS=server,mcp,qdrant,web,local
 FROM python:3.12-slim
 
-ARG EXTRAS=server,mcp,qdrant
+ARG EXTRAS=server,mcp,qdrant,web
 WORKDIR /app
 
 # Install deps first (better layer caching), then the package.

@@ -27,7 +27,8 @@ LOCALES = tuple(sorted(p.stem for p in (STATIC_DIR / "locales").glob("*.json")))
 
 # Paths the single-page app answers itself; the server hands every one of them
 # the same shell. A path not listed here is a 404, not a blank app.
-APP_PATHS = ("/", "/memory", "/account", "/account/tokens", "/admin")
+APP_PATHS = ("/", "/memory", "/space", "/people", "/account", "/account/tokens", "/account/signins",
+             "/admin", "/admin/people")
 
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
        "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
@@ -41,10 +42,20 @@ class _Throttle:
     token is 256 bits) and does not replace a rate limit in front of the server.
     """
 
+    MAX_KEYS = 10_000     # rotating addresses must not grow this without bound
+
     def __init__(self, limit: int = 10, window_s: float = 900.0):
         self.limit, self.window_s = limit, window_s
         self._fails: dict = {}
         self._lock = threading.Lock()
+
+    def _prune(self, now: float) -> None:
+        if len(self._fails) < self.MAX_KEYS:
+            return
+        for k in [k for k, v in self._fails.items() if not v or now - v[-1] >= self.window_s]:
+            del self._fails[k]
+        while len(self._fails) >= self.MAX_KEYS:
+            self._fails.pop(next(iter(self._fails)))
 
     def blocked(self, key: str) -> bool:
         now = time.monotonic()
@@ -54,21 +65,27 @@ class _Throttle:
             return len(hits) >= self.limit
 
     def fail(self, key: str) -> None:
+        now = time.monotonic()
         with self._lock:
-            self._fails.setdefault(key, []).append(time.monotonic())
+            self._prune(now)
+            self._fails.setdefault(key, []).append(now)
 
     def clear(self, key: str) -> None:
         with self._lock:
             self._fails.pop(key, None)
 
 
-def mount(app, cfg, pool, make_store) -> None:
+def mount(app, cfg, pool, make_store, *, oidc_fetch=None) -> None:
     from fastapi import Body, HTTPException, Request, Response
     from fastapi.responses import FileResponse, RedirectResponse
     from fastapi.staticfiles import StaticFiles
 
+    from . import oidc_config
     cookie_name = "__Host-memgres_session" if cfg.web_cookie_secure else "memgres_session"
     throttle = _Throttle()
+    # read at startup: a broken provider file stops the server rather than
+    # leaving a sign-in door that half-works
+    providers = oidc_config.load(cfg.oidc_config, key_mode=cfg.key_mode)
 
     # ─── plumbing ───────────────────────────────────────────────────────────
     def _origin_of(url: str) -> str:
@@ -76,9 +93,8 @@ def mount(app, cfg, pool, make_store) -> None:
         return f"{parts.scheme}://{parts.netloc}".lower()
 
     def _allowed_origin(request: Request) -> str:
-        if cfg.public_url:
-            return _origin_of(cfg.public_url)
-        return _origin_of(str(request.base_url))
+        # config refuses to start the panel without it
+        return _origin_of(cfg.public_url)
 
     def _require_same_origin(request: Request) -> None:
         offered = request.headers.get("origin")
@@ -109,9 +125,15 @@ def mount(app, cfg, pool, make_store) -> None:
                             samesite="strict")
 
     def _session_view(s) -> dict:
+        pending = 0
         with pool.connection() as conn:
             me = sessions.profile(conn, s.user_id)
+            if s.role in identity.ADMIN_ROLES:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT count(*) FROM signin_request WHERE status = 'pending'")
+                    pending = cur.fetchone()[0]
         return {
+            "pending_requests": pending,
             "user": me,
             "role": s.role,
             "via": s.via,
@@ -208,7 +230,8 @@ def mount(app, cfg, pool, make_store) -> None:
         administrator links one, the screen sends people to the admin door."""
         with pool.connection() as conn:
             linked = sessions.admin_has_linked_signin(conn)
-        return {"providers": [], "admin_redirect": not linked, "locales": list(LOCALES)}
+        return {"providers": [{"id": p.id, "label": p.label, "hint": p.hint} for p in providers.values()],
+                "admin_redirect": not linked, "locales": list(LOCALES)}
 
     # ─── the person ─────────────────────────────────────────────────────────
     @app.patch("/ui/api/me")
@@ -225,8 +248,13 @@ def mount(app, cfg, pool, make_store) -> None:
 
     # the other modules of the panel attach here
     app.state.panel = {"session": _signed_in, "changing": _changing,
-                       "principal": sessions.principal}
+                       "principal": sessions.principal, "cookie_name": cookie_name,
+                       "set_cookie": _set_cookie, "client_key": _client_key,
+                       "same_origin": _require_same_origin}
 
-    from . import memory, tokens
+    from . import auth_routes, memory, people, spaces, tokens
     tokens.mount(app, cfg, pool, app.state.panel)
     memory.mount(app, cfg, pool, app.state.panel, make_store)
+    spaces.mount(app, cfg, pool, app.state.panel)
+    people.mount(app, cfg, pool, app.state.panel, providers, make_store)
+    auth_routes.mount(app, cfg, pool, app.state.panel, providers, fetch=oidc_fetch)
