@@ -97,15 +97,18 @@ token that does not exist.
   - optionally one space, from those the person reaches;
   - at most 50 live tokens per account.
 
-  The secret is shown once, with ready configs for Claude Code, Cursor and
-  OpenCode. A token never reaches further than its account.
+  The secret is shown once, with ready configs for Claude Code (`claude mcp
+  add`), Cursor and OpenCode, and the Tokens page explains connecting a client
+  step by step with this server's MCP address. A token never reaches further
+  than its account.
 - **Sign-in methods** (Account). Link another provider, or unlink one — not the
   last.
 - **Language** (Account → Profile, and on the sign-in page). Otherwise the
   browser's language, otherwise English.
 - **Their own activity** (Account → Profile): what they and their agents wrote,
-  day by day for 26 weeks, by space and by kind. Only writes — reading is not
-  tracked per person. A record that is erased takes its history with it.
+  day by day for 26 weeks, by space and by kind, and their latest edits — each
+  one opens the record. Only writes — reading is not tracked per person. A record
+  that is erased takes its history with it.
 
 ### Members of a space
 
@@ -173,11 +176,20 @@ Administrators (`user_manager`, `superadmin`) also see **Admin**:
 - **Waiting to sign in** — people a provider vouched for whom no rule let in.
   Link them to the suggested account, to **another account** found by search,
   create an account, or reject. See [docs/OIDC.md](OIDC.md#waiting-for-approval).
-- **People** — everyone with an account, searchable by name, email or
-  department, with their last sign-in and last write. From a person's page:
-  edit name, email, department and position; switch the account off or on; end
-  their panel sessions; revoke a token; remove a sign-in method (the last one
-  too — that is how a wrong link is undone); and, for a superadmin, set the role.
+- **People** — everyone with an account, a page at a time, searchable by name,
+  email or department, with their last sign-in and last write. **New person**
+  creates an account (no spaces, no rights; with an email, their first sign-in
+  finds it — still subject to approval). From a person's page: edit name, email,
+  department and position; allow or withdraw **creating their own spaces**;
+  **issue a token** for them (read or write, always expiring — for a service, or
+  someone who has not signed in yet; the secret is shown once, to you); revoke a
+  token; switch the account off or on; end their panel sessions; remove a
+  sign-in method (the last one too — that is how a wrong link is undone); and,
+  for a superadmin, set the role.
+
+What someone wrote — the chart and the recent edits on their page — is shown
+only where the viewer can read too: a superadmin reads every space, everyone
+else, a user manager included, only the spaces they are in.
 
 The control plane's rules apply unchanged: a `user_manager` cannot act on — or
 see the tokens and sign-in methods of — an administrator's account, only a

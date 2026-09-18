@@ -2,7 +2,8 @@
 
 import { del, get, patch, post, ApiError } from "./api.js";
 import { ago, fmtDate, nf, t } from "./i18n.js";
-import { $, esc, toast } from "./ui.js";
+import { openTokenDialog } from "./tokens.js";
+import { $, esc, hexIcon, PALETTE, fnv, toast } from "./ui.js";
 
 export const personName = (p) => (p && (p.full_name || p.name || p.email)) || t("people.unnamed");
 
@@ -54,6 +55,22 @@ export function activityCard(act, { note } = {}) {
   </div>`;
 }
 
+// What the person changed last — only in spaces the viewer can read (the server
+// filters); each row opens the record where it is.
+export function recentCard(recent, { note } = {}) {
+  if (!recent) return "";
+  return `<div class="card"><div class="card-h"><h3>${esc(t("recent.title"))}</h3></div>
+    ${recent.length ? `<div class="recent">${recent.map((r) => {
+      const c = PALETTE[fnv(r.space || "") % PALETTE.length];
+      const opLabel = t("op." + r.op) === "op." + r.op ? r.op : t("op." + r.op);
+      return `<a class="rrow" href="/memory?space=${encodeURIComponent(r.space_id)}&record=${encodeURIComponent(r.record_id)}">
+        <span class="op">${esc(opLabel)}</span>
+        <span class="rt"><b>${esc(r.title || r.path || "—")}</b><small>${hexIcon(c, false, 10)}${esc(r.space)}${r.path ? " · " + esc(r.path) : ""}</small></span>
+        <time title="${esc(fmtDate(r.at))}">${esc(ago(r.at))}</time></a>`;
+    }).join("")}</div>` : `<p class="note">${esc(t("recent.none"))}</p>`}
+    <p class="note" style="margin-top:10px">${esc(note || t("recent.note"))}</p></div>`;
+}
+
 export function spacesCard(spaces, { title } = {}) {
   return `<div class="card"><div class="card-h"><h3>${esc(title || t("people.spaces"))}</h3><span class="note">${nf(spaces.length)}</span></div>
     ${spaces.length ? `<div class="x"><table><tbody>${spaces.map((s) => `<tr>
@@ -94,9 +111,10 @@ function draw(root, ctx, data) {
     </div>
     ${admin ? detailsCard(p) : ""}
     ${activityCard(data.activity, { note: data.view === "colleague" ? t("act.noteShared") : undefined })}
+    ${recentCard(data.recent)}
     ${data.view === "colleague" ? spacesCard(data.shared_spaces, { title: t("people.shared") }) : spacesCard(data.spaces)}
     ${admin && data.signins ? signinsCard(data) : ""}
-    ${admin && data.tokens ? tokensCard(data) : ""}
+    ${admin && data.tokens ? tokensCard(data, ctx) : ""}
     ${admin ? actionsCard(ctx, data) : ""}
   </div>`;
   if (admin) wire(root, ctx, data);
@@ -133,12 +151,13 @@ function signinsCard(data) {
 function tokensCard(data) {
   const can = data.can?.manage;
   const rows = data.tokens;
-  return `<div class="card"><div class="card-h"><h3>${esc(t("people.tokens"))}</h3></div>
+  return `<div class="card"><div class="card-h"><h3>${esc(t("people.tokens"))}</h3>
+      ${can && !data.person.disabled ? `<button class="btn small" data-act="token">${esc(t("people.issueToken"))}</button>` : ""}</div>
     ${rows.length ? `<div class="x"><table><thead><tr>${["tok.device", "tok.access", "tok.space", "tok.lastUsed", "tok.expires", "tok.status"].map((k) => `<th>${esc(t(k))}</th>`).join("")}<th></th></tr></thead><tbody>
     ${rows.map((x) => `<tr>
       <td class="strong">${esc(x.label || t("tok.unlabelled"))}</td>
       <td><span class="perm ${esc(x.permission)}">${esc(t("perm." + x.permission))}</span></td>
-      <td class="mono">${x.namespace ? esc(x.namespace) : `<span class="note">${esc(t("tok.allSpaces"))}</span>`}</td>
+      <td class="mono">${x.namespace ? esc(x.namespace) : `<span class="note">${esc(t("tok.allTheirSpaces"))}</span>`}</td>
       <td>${esc(x.last_used_at ? ago(x.last_used_at) : t("tok.never"))}</td>
       <td class="num">${x.expires_at ? esc(fmtDate(x.expires_at)) : "—"}</td>
       <td><span class="dot ${x.state === "active" ? "on" : "off"}"><i></i>${esc(t("tok.state." + x.state))}</span></td>
@@ -154,6 +173,8 @@ function actionsCard(ctx, data) {
     <div class="stack">
       ${can.set_role ? `<div class="item"><div class="grow"><b>${esc(t("acc.role"))}</b><small>${esc(t("people.roleNote"))}</small></div>
         <select id="pp-role" class="sel">${["user", "user_manager", "superadmin"].map((r) => `<option value="${r}"${r === p.role ? " selected" : ""}>${esc(t("role." + r))}</option>`).join("")}</select></div>` : ""}
+      <div class="item"><div class="grow"><b>${esc(t("people.canCreate"))}</b><small>${esc(t("people.canCreateNote"))}</small></div>
+        <label class="switch"><input type="checkbox" id="pp-cancreate" ${p.can_create_namespace ? "checked" : ""}><span>${esc(t(p.can_create_namespace ? "people.allowed" : "people.notAllowed"))}</span></label></div>
       <div class="item"><div class="grow"><b>${esc(t("people.sessions", { n: data.sessions }))}</b><small>${esc(t("people.sessionsNote"))}</small></div>
         <button class="btn small" data-act="end" ${data.sessions ? "" : "disabled"}>${esc(t("people.endSessions"))}</button></div>
       <div class="item"><div class="grow"><b>${esc(t(p.disabled ? "people.isOff" : "people.isOn"))}</b><small>${esc(t("people.disableNote"))}</small></div>
@@ -177,6 +198,11 @@ function wire(root, ctx, data) {
       toast(ex instanceof ApiError && ex.detail ? String(ex.detail) : t("err.save"));
     }
   };
+  $("#pp-cancreate", root)?.addEventListener("change", (e) => {
+    const allowed = e.target.checked;
+    act(() => post(`/admin/people/${encodeURIComponent(p.id)}/can-create-spaces`, { allowed }),
+      t(allowed ? "people.canCreateOn" : "people.canCreateOff", { name: personName(p) }));
+  });
   $("#pp-role", root)?.addEventListener("change", (e) => {
     const role = e.target.value;
     if (!confirm(t("people.roleConfirm", { name: personName(p), role: t("role." + role) }))) { e.target.value = p.role; return; }
@@ -188,6 +214,9 @@ function wire(root, ctx, data) {
     const base = `/admin/people/${encodeURIComponent(p.id)}`;
     switch (b.dataset.act) {
       case "edit": return editDialog(p, reload);
+      case "token":
+        return openTokenDialog({ endpoint: `${base}/tokens`, spaces: data.spaces, mcpUrl: ctx.session.mcp_url,
+          title: t("people.issueTokenFor", { name: personName(p) }), note: t("people.issueTokenNote"), onCreated: reload });
       case "end":
         if (confirm(t("people.endConfirm", { name: personName(p) }))) act(() => post(`${base}/sessions/end`), t("people.ended"));
         return;

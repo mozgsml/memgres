@@ -170,6 +170,8 @@ def mount(app, cfg, pool, make_store, *, oidc_fetch=None) -> None:
                 "admin": s.role in identity.ADMIN_ROLES,
             },
             "locales": list(LOCALES),
+            # where agents connect, for the token dialogs (the panel cannot work it out)
+            "mcp_url": cfg.mcp_public_url or None,
         }
 
     def _client_key(request: Request) -> str:

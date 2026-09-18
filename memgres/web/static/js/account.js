@@ -2,7 +2,7 @@
 
 import { get, patch } from "./api.js";
 import { fillLanguageSelect, t } from "./i18n.js";
-import { activityCard, spacesCard } from "./people.js";
+import { activityCard, recentCard, spacesCard } from "./people.js";
 import { $, esc, toast } from "./ui.js";
 
 export function renderAccount(root, ctx) {
@@ -35,7 +35,7 @@ export function renderAccount(root, ctx) {
     <div class="pane" id="acc-more"></div>`;
   get(`/people/${encodeURIComponent(me.id)}`).then((data) => {
     const more = $("#acc-more", box);
-    if (more) more.innerHTML = activityCard(data.activity, { note: t("act.noteSelf") }) + spacesCard(data.spaces);
+    if (more) more.innerHTML = activityCard(data.activity, { note: t("act.noteSelf") }) + recentCard(data.recent, { note: t("recent.noteSelf") }) + spacesCard(data.spaces);
   }).catch(() => {});
   const select = $("#acc-lang", box);
   fillLanguageSelect(select, me.ui_language || "auto");

@@ -34,6 +34,9 @@ export async function renderMemory(root, ctx) {
   if (!target) { showEmpty(); return; }
   if (!m.space || m.space.id !== target.id || !m.graph) await openSpace(target);
   else { mountViz(); inspect(); }
+  // a link to one record (from a person's recent edits): open it where it is
+  const rec = new URLSearchParams(location.search).get("record");
+  if (rec && m.byRecord.has(rec)) select(m.byRecord.get(rec), { centre: true });
 }
 
 // The sidebar's list of spaces, on every page — not only while memory is open.

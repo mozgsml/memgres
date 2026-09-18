@@ -93,29 +93,30 @@ async function renderRequests(box, ctx) {
 }
 
 // ─── the directory ───────────────────────────────────────────────────────────
+const PAGE = 25;
+
 async function renderPeople(box) {
-  box.innerHTML = `<div class="card"><div class="card-h"><h3>${esc(t("adm.people"))}</h3><span class="note" id="pp-total"></span></div>
+  box.innerHTML = `<div class="card"><div class="card-h"><h3>${esc(t("adm.people"))}</h3>
+        <button class="btn adminbtn small" id="pp-new">${esc(t("adm.newPerson"))}</button></div>
       <div class="filter" style="max-width:none;margin-bottom:12px"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.6" fill="none" stroke="#707aa0" stroke-width="1.6"/><path d="m10.4 10.4 3.4 3.4" stroke="#707aa0" stroke-width="1.6" stroke-linecap="round"/></svg>
         <input id="pp-q" type="search" autocomplete="off" placeholder="${esc(t("people.searchPh"))}" aria-label="${esc(t("people.searchPh"))}"></div>
       <div class="x"><table id="pp-table"><tbody><tr><td class="note">…</td></tr></tbody></table></div>
-      <div class="row" id="pp-more" style="justify-content:center;margin-top:10px" hidden><button class="btn small">${esc(t("viz.showMore"))}</button></div>
+      <div class="pager" id="pp-pager"></div>
     </div>
     <p class="note">${esc(t("adm.peopleNote"))}</p>`;
-  const PAGE = 50;
-  let rows = [], seq = 0, timer = null;
-  const load = async (append = false) => {
+  let offset = 0, total = 0, seq = 0, timer = null;
+  const load = async () => {
     const my = ++seq, q = $("#pp-q", box).value.trim();
     let got;
     try {
-      got = await get(`/admin/people?limit=${PAGE}&offset=${append ? rows.length : 0}&q=${encodeURIComponent(q)}`);
+      got = await get(`/admin/people?limit=${PAGE}&offset=${offset}&q=${encodeURIComponent(q)}`);
     } catch {
       if (my === seq) $("#pp-table", box).innerHTML = `<tbody><tr><td class="note">${esc(t("err.network"))}</td></tr></tbody>`;
       return;
     }
     if (my !== seq) return;
-    rows = append ? rows.concat(got.people) : got.people;
-    $("#pp-total", box).textContent = t("adm.peopleCount", { n: got.total });
-    $("#pp-more", box).hidden = rows.length >= got.total;
+    total = got.total;
+    const rows = got.people;
     $("#pp-table", box).innerHTML = rows.length ? `<thead><tr>${["adm.col.person", "acc.role", "adm.col.signins", "adm.col.lastSignin", "adm.col.lastWrite", "tok.status"].map((k) => `<th>${esc(t(k))}</th>`).join("")}</tr></thead>
       <tbody>${rows.map((p) => `<tr>
         <td class="strong">${personLink(p.id, personName(p))}<small class="cell-sub">${esc([p.email, p.department].filter(Boolean).join(" · "))}</small></td>
@@ -125,8 +126,55 @@ async function renderPeople(box) {
         <td>${esc(p.last_write_at ? ago(p.last_write_at) : t("tok.never"))}</td>
         <td><span class="dot ${p.disabled ? "off" : "on"}"><i></i>${esc(t(p.disabled ? "people.disabled" : "people.active"))}</span></td>
       </tr>`).join("")}</tbody>` : `<tbody><tr><td class="note">${esc(t("people.noneFound"))}</td></tr></tbody>`;
+    const from = total ? offset + 1 : 0, to = offset + rows.length;
+    $("#pp-pager", box).innerHTML = `<span class="note">${esc(t("adm.range", { from: nf(from), to: nf(to), total: nf(total) }))}</span>
+      <button class="btn small quiet" data-page="-1" ${offset === 0 ? "disabled" : ""} aria-label="${esc(t("adm.prev"))}">‹ ${esc(t("adm.prev"))}</button>
+      <button class="btn small quiet" data-page="1" ${to >= total ? "disabled" : ""} aria-label="${esc(t("adm.next"))}">${esc(t("adm.next"))} ›</button>`;
   };
-  $("#pp-q", box).addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => load(), 220); });
-  $("#pp-more button", box).onclick = () => load(true);
+  $("#pp-q", box).addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => { offset = 0; load(); }, 220); });
+  $("#pp-pager", box).addEventListener("click", (e) => {
+    const b = e.target.closest("[data-page]");
+    if (!b || b.disabled) return;
+    offset = Math.max(0, offset + Number(b.dataset.page) * PAGE);
+    load();
+  });
+  $("#pp-new", box).onclick = () => newPersonDialog();
   await load();
+}
+
+function newPersonDialog() {
+  const veil = document.createElement("div");
+  veil.className = "veil";
+  const field = (k, label, type = "text") => `<div class="field"><label for="np-${k}">${esc(label)}</label><input id="np-${k}" type="${type}" maxlength="200"></div>`;
+  veil.innerHTML = `<form class="dialog" role="dialog" aria-modal="true" aria-labelledby="np-title">
+    <h3 id="np-title">${esc(t("adm.newPerson"))}</h3>
+    ${field("full_name", t("acc.name"))}
+    ${field("email", t("acc.email"), "email")}
+    <div class="two">${field("department", t("people.department"))}${field("position", t("people.position"))}</div>
+    <p class="note">${esc(t("adm.newPersonNote"))}</p>
+    <p class="err" id="np-err" role="alert" hidden></p>
+    <div class="row" style="justify-content:flex-end"><button type="button" class="btn quiet" data-x>${esc(t("common.cancel"))}</button>
+      <button type="submit" class="btn adminbtn">${esc(t("adm.create"))}</button></div>
+  </form>`;
+  document.body.append(veil);
+  const close = () => veil.remove();
+  veil.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+  veil.addEventListener("click", (e) => { if (e.target === veil || e.target.closest("[data-x]")) close(); });
+  $("#np-full_name", veil).focus();
+  $("form", veil).addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const body = {};
+    for (const k of ["full_name", "email", "department", "position"]) body[k] = $("#np-" + k, veil).value.trim();
+    try {
+      const { id } = await post("/admin/people", body);
+      close();
+      toast(t("adm.created", { name: body.full_name || body.email }));
+      history.pushState(null, "", `/people?id=${encodeURIComponent(id)}`);
+      window.memgresPanel?.render?.();
+    } catch (ex) {
+      const err = $("#np-err", veil);
+      err.textContent = ex instanceof ApiError && ex.detail ? String(ex.detail) : t("err.save");
+      err.hidden = false;
+    }
+  });
 }

@@ -1,19 +1,34 @@
-// Account → Tokens: the person's own tokens for AI clients.
+// Account → Tokens: the person's own tokens for AI clients, and how to connect one.
+// The token dialog is shared with the admin area, which mints tokens for others.
 
 import { del, get, post, ApiError } from "./api.js";
 import { ago, fmtDate, t } from "./i18n.js";
 import { $, $$, esc, toast } from "./ui.js";
 
-const SNIPPETS = {
-  "Claude Code": (url, k) => `// ~/.claude.json\n{\n  "mcpServers": {\n    "memgres": {\n      "type": "http",\n      "url": "${url}",\n      "headers": { "Authorization": "Bearer ${k}" }\n    }\n  }\n}`,
-  Cursor: (url, k) => `// ~/.cursor/mcp.json\n{\n  "mcpServers": {\n    "memgres": {\n      "url": "${url}",\n      "headers": { "Authorization": "Bearer ${k}" }\n    }\n  }\n}`,
-  OpenCode: (url, k) => `// ~/.config/opencode/opencode.jsonc\n{\n  "mcp": {\n    "memgres": {\n      "type": "remote",\n      "url": "${url}",\n      "headers": { "Authorization": "Bearer ${k}" }\n    }\n  }\n}`,
+const EXAMPLE_URL = "https://memgres.example/mcp";
+
+// How each client is told about the server. Formats as each project documents
+// them (Claude Code: `claude mcp add`; Cursor: mcp.json; OpenCode: opencode.json).
+const CLIENTS = {
+  "Claude Code": {
+    where: "clients.claude",
+    text: (url, k) => `claude mcp add --transport http --scope user memgres ${url} \\\n  --header "Authorization: Bearer ${k}"`,
+  },
+  Cursor: {
+    where: "clients.cursor",
+    text: (url, k) => `{\n  "mcpServers": {\n    "memgres": {\n      "url": "${url}",\n      "headers": { "Authorization": "Bearer ${k}" }\n    }\n  }\n}`,
+  },
+  OpenCode: {
+    where: "clients.opencode",
+    text: (url, k) => `{\n  "$schema": "https://opencode.ai/config.json",\n  "mcp": {\n    "memgres": {\n      "type": "remote",\n      "url": "${url}",\n      "enabled": true,\n      "headers": { "Authorization": "Bearer ${k}" }\n    }\n  }\n}`,
+  },
 };
 
 export async function renderTokens(box) {
   box.innerHTML = `<div class="card"><div class="card-h"><h3>${esc(t("tok.title"))}</h3>
       <button class="btn primary" id="tok-new">${esc(t("tok.new"))}</button></div>
       <div class="x"><table id="tok-table"><tbody><tr><td class="note">…</td></tr></tbody></table></div></div>
+    <div id="tok-howto"></div>
     <p class="note">${esc(t("tok.note"))}</p>`;
   let data;
   try {
@@ -37,6 +52,7 @@ export async function renderTokens(box) {
       </tr>`).join("")}</tbody>` : `<tbody><tr><td class="note">${esc(t("tok.none"))}</td></tr></tbody>`;
   };
   draw();
+  howTo($("#tok-howto", box), data.mcp_url);
 
   $("#tok-table", box).addEventListener("click", async (e) => {
     const b = e.target.closest("[data-revoke]");
@@ -58,27 +74,55 @@ export async function renderTokens(box) {
   $("#tok-new", box).onclick = async () => {
     let spaces = [];
     try { spaces = (await get("/spaces")).spaces; } catch { /* all spaces only */ }
-    openNewTokenDialog(data, spaces, async () => { data = await get("/tokens"); draw(); });
+    openTokenDialog({ endpoint: "/tokens", spaces, expiryChoices: data.expiry_choices, mcpUrl: data.mcp_url,
+      onCreated: async () => { data = await get("/tokens"); draw(); } });
   };
 }
 
-function openNewTokenDialog(data, spaces, onCreated) {
+// ─── how to connect a client ────────────────────────────────────────────────
+function howTo(box, mcpUrl) {
+  const url = mcpUrl || EXAMPLE_URL;
+  box.innerHTML = `<div class="card howto"><div class="card-h"><h3>${esc(t("howto.title"))}</h3></div>
+    <ol class="steps">
+      <li>${esc(t("howto.step1"))}</li>
+      <li>${esc(t("howto.step2"))}
+        <div class="snips" role="tablist">${Object.keys(CLIENTS).map((k, i) => `<button role="tab" data-client="${esc(k)}" aria-selected="${i === 0}">${esc(k)}</button>`).join("")}</div>
+        <p class="note" id="howto-where"></p>
+        <pre class="code" id="howto-snip"></pre></li>
+      <li>${esc(t("howto.step3"))}</li>
+    </ol>
+    ${mcpUrl ? `<p class="note">${esc(t("howto.address", { url }))}</p>` : `<p class="note" style="color:var(--admin)">${esc(t("tok.noMcpUrl"))}</p>`}
+    <p class="note">${esc(t("howto.safety"))}</p>
+  </div>`;
+  const show = (name) => {
+    $("#howto-snip", box).textContent = CLIENTS[name].text(url, t("howto.tokenHere"));
+    $("#howto-where", box).textContent = t(CLIENTS[name].where);
+    for (const b of $$("[data-client]", box)) b.setAttribute("aria-selected", String(b.dataset.client === name));
+  };
+  show("Claude Code");
+  box.addEventListener("click", (e) => { const b = e.target.closest("[data-client]"); if (b) show(b.dataset.client); });
+}
+
+// ─── the dialog: a new token, then its secret once ──────────────────────────
+// endpoint: "/tokens" for your own, "/admin/people/<id>/tokens" for someone else's.
+export function openTokenDialog({ endpoint, spaces = [], expiryChoices = [30, 90, 180, 365], mcpUrl = null,
+  title = t("tok.new"), note = t("tok.ceiling"), onCreated = async () => {} }) {
   const veil = document.createElement("div");
   veil.className = "veil";
   veil.innerHTML = `<form class="dialog" role="dialog" aria-modal="true" aria-labelledby="tk-title">
-    <h3 id="tk-title">${esc(t("tok.new"))}</h3>
+    <h3 id="tk-title">${esc(title)}</h3>
     <div class="field"><label for="tk-label">${esc(t("tok.label"))}</label>
       <input id="tk-label" maxlength="100" placeholder="${esc(t("tok.labelPlaceholder"))}"></div>
     <div class="two">
       <div class="field"><label for="tk-perm">${esc(t("tok.access"))}</label><select id="tk-perm">
         <option value="write">${esc(t("tok.permWrite"))}</option><option value="read">${esc(t("tok.permRead"))}</option></select></div>
       <div class="field"><label for="tk-exp">${esc(t("tok.expAfter"))}</label><select id="tk-exp">
-        ${data.expiry_choices.map((n) => `<option value="${n}"${n === 90 ? " selected" : ""}>${esc(t("tok.days", { n }))}</option>`).join("")}</select></div>
+        ${expiryChoices.map((n) => `<option value="${n}"${n === 90 ? " selected" : ""}>${esc(t("tok.days", { n }))}</option>`).join("")}</select></div>
     </div>
     <div class="field"><label for="tk-space">${esc(t("tok.space"))}</label><select id="tk-space">
       <option value="">${esc(t("tok.allSpaces"))}</option>
       ${spaces.map((s) => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join("")}</select></div>
-    <p class="note">${esc(t("tok.ceiling"))}</p>
+    <p class="note">${esc(note)}</p>
     <p class="err" id="tk-err" role="alert" hidden></p>
     <div class="row" style="justify-content:flex-end"><button type="button" class="btn quiet" data-x>${esc(t("common.cancel"))}</button>
       <button type="submit" class="btn primary">${esc(t("tok.create"))}</button></div>
@@ -95,17 +139,17 @@ function openNewTokenDialog(data, spaces, onCreated) {
     const submit = $("button[type=submit]", dlg);
     submit.disabled = true;
     try {
-      const made = await post("/tokens", {
+      const made = await post(endpoint, {
         label: $("#tk-label", dlg).value.trim(),
         permission: $("#tk-perm", dlg).value,
         expires_days: Number($("#tk-exp", dlg).value),
         namespace_id: $("#tk-space", dlg).value || null,
       });
       await onCreated();
-      showSecret(dlg, made.token, data.mcp_url);
+      showSecret(dlg, made.token, mcpUrl);
     } catch (ex) {
       const err = $("#tk-err", dlg);
-      err.textContent = ex instanceof ApiError && ex.status === 422 ? String(ex.detail) : t("err.save");
+      err.textContent = ex instanceof ApiError && ex.detail ? String(ex.detail) : t("err.save");
       err.hidden = false;
       submit.disabled = false;
     }
@@ -113,19 +157,21 @@ function openNewTokenDialog(data, spaces, onCreated) {
 }
 
 function showSecret(dlg, secret, mcpUrl) {
-  const url = mcpUrl || "https://memgres.example/mcp";
+  const url = mcpUrl || EXAMPLE_URL;
   dlg.outerHTML = `<div class="dialog" role="dialog" aria-modal="true" aria-labelledby="tk-done">
     <h3 id="tk-done">${esc(t("tok.copyNow"))}</h3>
     <div class="secret"><code id="tk-secret">${esc(secret)}</code><button class="btn" data-copy>${esc(t("tok.copy"))}</button></div>
     <p class="note">${esc(t("tok.fingerprint"))}</p>
     ${mcpUrl ? "" : `<p class="note" style="color:var(--admin)">${esc(t("tok.noMcpUrl"))}</p>`}
-    <div class="snips" role="tablist">${Object.keys(SNIPPETS).map((k, i) => `<button role="tab" data-snip="${esc(k)}" aria-selected="${i === 0}">${esc(k)}</button>`).join("")}</div>
+    <div class="snips" role="tablist">${Object.keys(CLIENTS).map((k, i) => `<button role="tab" data-snip="${esc(k)}" aria-selected="${i === 0}">${esc(k)}</button>`).join("")}</div>
+    <p class="note" id="tk-where"></p>
     <pre class="code" id="tk-snip"></pre>
     <div class="row" style="justify-content:flex-end"><button class="btn primary" data-x>${esc(t("tok.done"))}</button></div>
   </div>`;
   const box = document.querySelector(".veil .dialog");
   const show = (name) => {
-    $("#tk-snip", box).textContent = SNIPPETS[name](url, secret);
+    $("#tk-snip", box).textContent = CLIENTS[name].text(url, secret);
+    $("#tk-where", box).textContent = t(CLIENTS[name].where);
     for (const b of $$("[data-snip]", box)) b.setAttribute("aria-selected", String(b.dataset.snip === name));
   };
   show("Claude Code");
