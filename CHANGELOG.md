@@ -5,6 +5,73 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.13.0] — 2026-09-18
+
+A web panel for people. Until now memgres had two audiences, agents (MCP) and
+operators (REST, CLI); the people whose memory it is had neither. The panel
+lets them look through what their agents wrote, sign in the way they sign in
+everywhere else, hand out their own tokens, and run their own spaces — without
+an operator in the loop for each of those. Off by default: nothing changes for
+an existing deployment until `MEMGRES_WEB_ENABLED=true`.
+
+### Added — the web panel (`docs/WEB.md`)
+- **Served by `memgres-server`** from the same image, at `/`, with its API under
+  `/ui/api` (cookie sessions only; the REST API stays bearer-only, so a signed-in
+  browser does not make it callable by other pages). No build step, no CDN:
+  fonts and the graph library ship in the package. English and Russian; a
+  language is one JSON file.
+- **Memory, read-only:** every space you reach as a graph (records as
+  hexagons) or a tree, a local view around one record with the path back to the
+  root, search, a record with what it links to and what links to it, and who
+  changed it when. The session reads with a `read` ceiling, so the panel cannot
+  write memory even by mistake; browsing does not count toward usage statistics.
+- **Your own tokens** for AI clients: `read` or `write` (never `admin`), always
+  expiring (30–365 days), optionally pinned to one space, at most 50 live; the
+  secret is shown once with ready configs for Claude Code, Cursor and OpenCode.
+- **Sign-in through OpenID Connect providers** (`docs/OIDC.md`) — Zitadel,
+  Keycloak, Entra ID, Google, any number at once — each with its own admission
+  rules: required claims, allowed email domains, and what an email match or a
+  stranger gets (`link`, `pending`, `create`, `deny`). Identity is (issuer,
+  subject); an email counts only when the provider marks it verified and never
+  links an administrator account by itself. `pending` creates a request, not an
+  account; administrators link it to an account, create one or reject it.
+  Several sign-in methods per account. `sync_on_login` cuts off someone who no
+  longer meets the rules. `/signin/admin` takes an unscoped admin-ceiling token
+  for the day no provider works.
+- **Spaces, run by their administrators:** add people by email (an existing
+  account at once; anyone else by an invitation that opens the space on their
+  first sign-in with that address verified — it opens the space, never the
+  server), change and remove members, decide requests to join, hand the space
+  over. A link to a space you cannot open offers to ask for access, and looks the
+  same for a space that does not exist.
+- **People:** a person's page with their spaces and a 26-week chart of what
+  they wrote — everything to themselves and to service administrators, only
+  shared spaces to a colleague. Admin: the sign-in queue and a searchable
+  directory with the switches (edit, switch off, end sessions, revoke a token,
+  remove a sign-in method, set the role) under the control plane's own rules.
+- **A superadmin opens any space** from "All spaces…" under their own; it sits
+  in a marked group for the rest of the session and never becomes a membership.
+- New settings: `MEMGRES_WEB_ENABLED`, `MEMGRES_PUBLIC_URL` (required with the
+  panel), `MEMGRES_MCP_PUBLIC_URL`, `MEMGRES_OIDC_CONFIG`,
+  `MEMGRES_WEB_SESSION_HOURS`, `MEMGRES_WEB_COOKIE_SECURE`,
+  `MEMGRES_FORWARDED_ALLOW_IPS`. New extra `web` (PyJWT); the image includes it.
+- Schema v25 (migration `0024`, additive): sessions, sign-in identities, OIDC
+  flows, sign-in requests, space invitations, a UI language per person.
+
+### Changed — `all` means your namespaces, for a superadmin too
+- `space="all"` is now the namespaces you own or were added to **for every
+  caller**. It used to be refused to a superadmin whenever namespaces existed
+  outside its memberships, which left that role no way to say "mine". A search
+  naming no namespace follows the same rule. `space="*"` still means every
+  namespace in the deployment and is still superadmin-only; `memory_whoami`
+  tells a superadmin so (`search_hint`) instead of every tool description telling
+  every agent. Nothing that used to work changes meaning — where `all` now
+  answers for a superadmin, it used to refuse.
+- A keyword collides only with a name **you** chose — a namespace you own, or an
+  alias you set. A namespace shared with you and called `all` (or `*`) no longer
+  switches your keyword off; that let whoever named it decide what your words
+  meant.
+
 ## [0.12.3] — 2026-09-09
 
 Two refusals that were technically correct and practically useless. Same theme
