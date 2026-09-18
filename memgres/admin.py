@@ -230,7 +230,7 @@ def whoami(conn, p: Principal) -> dict:
 
     Never echoes the credential; `token_id` identifies it without revealing it.
     """
-    return {
+    out = {
         "user_id": p.user_id,
         "role": p.role,
         "permission": p.permission,          # this credential's ceiling
@@ -238,6 +238,13 @@ def whoami(conn, p: Principal) -> dict:
         "token_id": p.token_id,
         "capabilities": capabilities(conn, p),
     }
+    if p.is_admin and p.scope_namespace_id is None and p.user_id is not None:
+        # The one caller for whom `all` is narrower than what it can read. Said
+        # here rather than in every tool's description, which everybody's agent
+        # reads and only a superadmin could use.
+        out["search_hint"] = ("space='all' searches the namespaces you belong to; "
+                              "space='*' searches every namespace in this deployment")
+    return out
 
 
 # ─── users ───────────────────────────────────────────────────────────────────

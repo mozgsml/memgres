@@ -115,28 +115,33 @@ curl -s "$BASE/recall?q=pricing&space=*"                   # superadmin: everyth
 
 Every hit says which namespace answered, via `space` and `space_id`.
 
-**`all` is refused for a superadmin** whenever it would answer with less than
-that credential can read — that is, whenever namespaces exist outside its
-memberships. A superadmin reaches any namespace by id, so for that one caller
-the word asks two different questions, and the narrow answer looks exactly like
-the wide one: nothing found reads as "there is nothing", not as "not where I
-looked". The refusal names what `all` would have covered and offers `*`, which
-adds no reach — it spends in one call the access `space_id` already gives that
-role one namespace at a time. A token scoped to a single namespace stays scoped
-under either word. For everyone else `all` is unchanged, because for them it is
-genuinely everything.
+**`all` is the namespaces you belong to** — the ones you own and the ones shared
+with you — for every caller, a superadmin included. A superadmin's role also
+reaches every other namespace by id; to search those too it says **`*`**, which
+means every namespace in the deployment and is refused to anyone else. `*` adds
+no reach: it spends in one call the access `space_id` already gives that role
+one namespace at a time. A token scoped to a single namespace stays scoped under
+either word.
 
-The same refusal covers a search that names **no** namespace at all, which is
-the same trap reached by saying nothing. (A *write* still resolves to your one
-membership: it has to land somewhere, and nothing is being left out of an
-answer.)
+`*` is not advertised in the tools' descriptions, which every agent reads and
+only a superadmin could use. A superadmin's agent finds it in `memory_whoami`,
+whose answer carries a `search_hint` for that role alone.
 
-There is deliberately no keyword for "the namespaces I belong to". Namespace
-names are free text and the obvious candidates are names people use — the first
-draft of this shadowed a namespace literally called `mine` in the test suite.
-`*` survives that objection, and the collision is still checked rather than
-assumed away: if a namespace **you reach** is named `*`, the keyword is refused
-as ambiguous and you address that one by id. The check is deliberately scoped to
+(Until 0.13, `all` was refused for a superadmin whenever namespaces existed
+outside its memberships, on the grounds that the narrow answer could be mistaken
+for the wide one. It left a superadmin no way to say "mine", so the word now
+means the same for everyone and the wide question has its own word.)
+
+A search that names **no** namespace follows the same rule: your one namespace
+is used, and several are an error. (A *write* resolves the same way: it has to
+land somewhere.)
+
+There is deliberately no other keyword. Namespace names are free text and the
+obvious candidates (`mine`, `own`) are names people use — the first draft of
+this shadowed a namespace literally called `mine` in the test suite. `*`
+survives that objection, and the collision is still checked rather than assumed
+away: if a namespace **you reach** is named `*`, the keyword is refused as
+ambiguous and you address that one by id. The check is deliberately scoped to
 what you reach — checking every name in the deployment let any tenant disable
 the keyword for the superadmin by naming a namespace `*`, and a stranger's
 choice of name must not reach into what your words mean.

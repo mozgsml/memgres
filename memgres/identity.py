@@ -435,18 +435,23 @@ def resolve_space(conn, principal: Principal, *, space_id: Optional[str] = None,
 
 # The two words that address a SET of namespaces rather than one.
 #
-# `all` means every namespace you reach as a member. For a superadmin that is
-# NOT everything it can read — its role reaches any namespace by id — so for
-# that one caller the word asks two different questions, and answering the
-# narrow one silently is a partial result wearing the shape of a complete one.
-# `*` is the wide answer, said out loud.
+# `all` means every namespace you belong to — you own it, or you were added to
+# it — for everyone, superadmin included. `*` means every namespace in the
+# deployment, and only a superadmin may say it: its role reaches any namespace
+# by id, and `*` spends that reach in one call instead of N.
 #
-# There is deliberately no second word for "the ones I belong to": a namespace
-# can be called anything, and the obvious candidates (`mine`, `own`) are names
-# people actually use — the first draft of this shadowed a namespace literally
-# named `mine` in this repo's own tests. `*` survives that objection because a
-# namespace named `*` is not something anyone types by accident, and the
-# collision is still checked rather than assumed away.
+# A superadmin's `all` used to be refused while namespaces existed outside its
+# memberships, on the grounds that "mine" and "everything I can read" differ for
+# that one caller. That left a superadmin no way to say "mine" at all, and a
+# refusal is the wrong tool for a question that has a plain answer: `all` is the
+# namespaces you are in, the same sentence for every caller, and `*` is there
+# for the wider one.
+#
+# There is deliberately no second WORD for "the ones I belong to" beyond `all`:
+# a namespace can be called anything, and the obvious candidates (`mine`, `own`)
+# are names people actually use. `*` survives that objection because a namespace
+# named `*` is not something anyone types by accident, and the collision is still
+# checked rather than assumed away.
 ALL_SPACES = "all"
 EVERY_SPACE = "*"
 
@@ -509,7 +514,6 @@ def resolve_spaces(conn, principal: Principal, *, space=None,
                 "— drop `space_id`, or list the namespaces you want explicitly")
         if _wants(space, EVERY_SPACE):
             return _every_namespace(conn, principal)
-        _refuse_ambiguous_all(conn, principal, ALL_SPACES)
         return _all_reachable(conn, principal)
 
     if not names and not ids:
@@ -544,55 +548,6 @@ def _no_such_name(names: Sequence[str], keyword: str) -> None:
             f"ambiguous — address that one by `space_id`")
 
 
-def _unreached_count(conn, principal: Principal) -> int:
-    """How many namespaces the caller could read but is not a member of.
-
-    Zero for everyone but a superadmin, whose reach is defined by its role
-    rather than by membership rows — which is precisely why `all` has to be
-    disambiguated for it and for nobody else.
-    """
-    if not principal.is_admin or principal.user_id is None:
-        return 0
-    if principal.scope_namespace_id is not None:
-        return 0                              # pinned to one; nothing is outside
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT count(*) FROM namespace n WHERE n.owner_user_id <> %(u)s "
-            "AND NOT EXISTS (SELECT 1 FROM namespace_member m "
-            "                WHERE m.namespace_id=n.id AND m.user_id=%(u)s)",
-            {"u": principal.user_id})
-        return int(cur.fetchone()[0])
-
-
-def _refuse_ambiguous_all(conn, principal: Principal,
-                          said: Optional[str] = None) -> None:
-    """A superadmin read that would answer with less than the role can read.
-
-    For every other caller `all` IS everything, and the word stays untouched.
-    For a superadmin it is two different questions, and the narrow answer looks
-    exactly like the wide one — a search returning nothing reads as "there is
-    nothing", not as "not where I looked". So it is refused, the wide word is
-    named, and it is refused only while the two answers differ: a superadmin
-    whose memberships already cover the deployment sees no change.
-
-    ``said`` is the word the caller used, or None when they named no namespace
-    at all — the same trap, reached by saying nothing.
-    """
-    outside = _unreached_count(conn, principal)
-    if not outside:
-        return
-    own = [s["name"] for s in list_spaces(conn, principal.user_id)]
-    listed = ", ".join(repr(n) for n in sorted(own)) or "none"
-    opening = (f"'{said}' is ambiguous here" if said
-               else "naming no namespace would answer too narrowly here")
-    raise SpaceAmbiguous(
-        f"you are a superadmin, so {opening}: you belong to {len(own)} "
-        f"namespace(s) ({listed}), and {outside} more exist that your role can "
-        f"also read. Say `space='{EVERY_SPACE}'` for every namespace in this "
-        f"deployment, or name the ones you mean with `space=[…]` / "
-        f"`space_id=[…]`")
-
-
 def _all_reachable(conn, principal: Principal,
                    keyword: str = ALL_SPACES) -> List[Tuple[str, str]]:
     """Every namespace the caller reaches, capped by the token ceiling."""
@@ -617,11 +572,11 @@ def _all_reachable(conn, principal: Principal,
 def _every_namespace(conn, principal: Principal) -> List[Tuple[str, str]]:
     """Every namespace in the deployment — the superadmin's explicit wide read.
 
-    The counterpart to refusing `all` for a superadmin: having said that the
-    narrow answer must not be given silently, there has to be a way to ask for
-    the wide one. It is the same reach `resolve_space(space_id=…)` already grants
-    that role one namespace at a time, so it adds no authority — only a way to
-    spend it in one call instead of N.
+    `all` is the namespaces you belong to, for a superadmin as for anyone; this
+    is the wider answer, asked for by its own word. It is the same reach
+    `resolve_space(space_id=…)` already grants that role one namespace at a
+    time, so it adds no authority — only a way to spend it in one call instead
+    of N.
     """
     # The name check comes FIRST, and against the caller's OWN reachable set.
     # Two reasons, both learned the hard way:
@@ -659,14 +614,10 @@ def _every_namespace(conn, principal: Principal) -> List[Tuple[str, str]]:
 def _sole_reachable(conn, principal: Principal) -> Tuple[str, str]:
     """The caller's only namespace, or an error naming the candidates.
 
-    This is the READ path — a search that named no namespace at all. It carries
-    the same superadmin refusal as `all`, and for the same reason: with one
-    membership and other namespaces on the deployment, "your only namespace"
-    silently answers a narrower question than the caller asked, and an empty
-    result reads as "there is nothing". (The WRITE path deliberately keeps
-    resolving to the single membership: a write has to land somewhere, the one
-    namespace you belong to is the only sane target, and nothing is silently
-    left out of an answer.)
+    This is the READ path — a search that named no namespace at all. One
+    namespace you belong to is used; several are an error naming them. For a
+    superadmin, too, this is about membership: the namespaces it reaches only by
+    its role are searched when it says `*`.
     """
     if principal.user_id is None:
         if principal.is_admin:            # env break-glass root owns nothing
@@ -675,7 +626,6 @@ def _sole_reachable(conn, principal: Principal) -> Tuple[str, str]:
     if principal.scope_namespace_id is not None:
         return resolve_space(conn, principal,
                              space_id=principal.scope_namespace_id)
-    _refuse_ambiguous_all(conn, principal)
     reachable = list_spaces(conn, principal.user_id)
     if len(reachable) == 1:
         only = reachable[0]

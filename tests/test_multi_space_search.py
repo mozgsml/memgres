@@ -229,28 +229,21 @@ def _superadmin(setup, name, *spaces):
     return uid, tok, ids
 
 
-def test_all_is_refused_for_a_superadmin_that_would_under_answer(env):
-    """The failure this closes: `all` returned the caller's MEMBERSHIPS, while a
-    superadmin reads any namespace by id. Searching 2 of 3 namespaces and
-    reporting nothing found is indistinguishable from an answer — the same class
-    of silent partial result the whole addressing model exists to prevent."""
+def test_all_means_the_superadmins_own_namespaces_and_star_means_everything(env):
+    """`all` is the same sentence for every caller: the namespaces you belong to
+    — owned or shared with you. A superadmin reaches more by its role, and asks
+    for that with its own word, `*`."""
     setup, s = env
-    _, root, _ = _superadmin(setup, "root", "ops")
-    _, other, _ = _owner(setup, "tenant", "theirs")
+    uid, root, ids = _superadmin(setup, "root", "ops")
+    _, other, other_ids = _owner(setup, "tenant", "theirs", "shared")
+    ident.add_member(setup, other_ids[1], uid, "read")
     s.write(other, body="apple in someone else's space\n", space="theirs")
+    s.write(other, body="apple shared with root\n", space="shared")
     s.write(root, body="apple in mine\n", space="ops")
 
-    with pytest.raises(SpaceAmbiguous) as e:
-        s.recall(root, "apple", space="all")
-    msg = str(e.value)
-    assert "superadmin" in msg and "'ops'" in msg      # names what it DOES cover
-    assert "'*'" in msg                                # …and the wide word
-
-    # `*` is the explicit wide read, and it sees both
-    assert len(s.recall(root, "apple", space="*")) == 2
-    # naming them still works, and stays narrow
+    assert {h.namespace for h in s.recall(root, "apple", space="all")} == {ids[0], other_ids[1]}
+    assert len(s.recall(root, "apple", space="*")) == 3
     assert len(s.recall(root, "apple", space="ops")) == 1
-
 
 def test_a_plain_user_never_sees_the_ambiguity_or_the_wide_word(env):
     """`all` is unchanged for everyone whose reach IS their memberships."""
@@ -289,25 +282,16 @@ def test_the_wide_word_does_not_widen_a_scoped_token(env):
     assert [h.namespace for h in hits] == [ids[0]]
 
 
-def test_naming_no_namespace_at_all_gets_the_same_refusal(env):
-    """The trap reached by saying nothing. A superadmin with ONE membership was
-    silently answered from that one namespace — the exact partial answer the
-    keyword refusal exists to prevent, one function away from the fix."""
+def test_naming_no_namespace_is_about_membership_for_a_superadmin_too(env):
+    """With one namespace of its own, a superadmin that names none searches that
+    one — as anyone would. The rest of the deployment is `*`."""
     setup, s = env
     _, root, _ = _superadmin(setup, "root", "ops")
     _, other, _ = _owner(setup, "tenant", "theirs")
     s.write(other, body="apple elsewhere\n", space="theirs")
-
-    with pytest.raises(SpaceAmbiguous) as e:
-        s.recall(root, "apple")                     # no space, no space_id
-    assert "'*'" in str(e.value)
-    assert len(s.recall(root, "apple", space="*")) == 1
-
-    # a WRITE with no address still resolves to the single membership: it has to
-    # land somewhere, and nothing is left out of an answer
     s.write(root, body="apple of my own\n")
-    assert len(s.recall(root, "apple", space="ops")) == 1
-
+    assert len(s.recall(root, "apple")) == 1
+    assert len(s.recall(root, "apple", space="*")) == 2
 
 def test_a_stranger_cannot_take_the_wide_keyword_away(env):
     """`*` was checked against EVERY name in the deployment, so any tenant could
@@ -369,3 +353,18 @@ def test_single_mode_ignores_addressing(env):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_only_a_superadmin_is_told_about_the_wide_word(env):
+    """`*` is in no tool description — every agent reads those. The role that can
+    use it learns it from whoami."""
+    from memgres import admin
+    setup, s = env
+    uid, root, _ = _superadmin(setup, "root", "ops")
+    _, tok, _ = _owner(setup, "plain", "work")
+    cfg = s.cfg
+    with setup.transaction():
+        boss = ident.resolve(setup, cfg, root)
+        plain = ident.resolve(setup, cfg, tok)
+    assert "'*'" in admin.whoami(setup, boss)["search_hint"]
+    assert "search_hint" not in admin.whoami(setup, plain)
