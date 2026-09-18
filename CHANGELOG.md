@@ -5,7 +5,7 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
-## [0.13.1] — unreleased
+## [0.13.1] — 2026-09-18
 
 What the first days of the panel on a real deployment turned up, plus the
 reading improvements that came with them.
