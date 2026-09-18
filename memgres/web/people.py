@@ -9,6 +9,11 @@ Who sees what:
   administrator's account, and only a superadmin hands out roles;
 * **someone you share a space with** — who they are (name, department,
   position) and what they wrote in the spaces you can both read;
+* **what someone wrote** — the activity chart and the list of recent edits —
+  is only ever shown where the VIEWER can read too: a superadmin reads every
+  space, everyone else (a user_manager included) only the spaces they are in.
+  An administrator looking after accounts does not thereby get a window into
+  spaces they cannot open;
 * **anyone else** — not found. There is no directory for ordinary users.
 
 Activity is writes only, taken from memory history: what someone created,
@@ -93,6 +98,38 @@ def activity(conn, user_id: str, *, spaces: Optional[list]) -> dict:
     }
 
 
+RECENT_EDITS = 30
+
+
+def recent_edits(conn, user_id: str, *, spaces: Optional[list]) -> list:
+    """The person's latest changes, newest first — record, space, kind, when.
+    ``spaces=None`` means every space (a superadmin looking)."""
+    params: list = [user_id]
+    where = ""
+    if spaces is not None:
+        if not spaces:
+            return []
+        where = " AND m.namespace = ANY(%s::text[])"
+        params.append(spaces)
+    params.append(RECENT_EDITS)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT h.created_at, h.op, m.id::text, m.namespace, m.path::text, m.title, n.name "
+            "FROM memory_history h JOIN memory m ON m.id = h.memory_id "
+            "JOIN namespace n ON n.id::text = m.namespace "
+            "WHERE h.author_user_id = %s" + where + " ORDER BY h.created_at DESC, h.id DESC LIMIT %s", params)
+        return [{"at": at, "op": op, "record_id": rid, "space_id": ns, "path": path, "title": title or "",
+                 "space": sname} for at, op, rid, ns, path, title, sname in cur.fetchall()]
+
+
+def _viewer_scope(conn, viewer) -> Optional[list]:
+    """The spaces whose contents this viewer may see: every one for a superadmin
+    (its role reads them all), otherwise its own."""
+    if viewer.user_id is None or viewer.role == "superadmin":
+        return None
+    return _reachable(conn, viewer.user_id)
+
+
 def _account(cur, user_id: str):
     cur.execute("SELECT id, name, full_name, email, department, position, role, "
                 "disabled_at IS NOT NULL, created_at, can_create_namespace FROM app_user WHERE id = %s",
@@ -127,7 +164,8 @@ def profile(conn, viewer, target_id: str, *, providers: dict) -> dict:
                         (together,))
             spaces = [{"id": i, "name": n} for i, n in cur.fetchall()]
         return {"view": "colleague", "person": person, "shared_spaces": spaces,
-                "activity": activity(conn, str(uid), spaces=together)}
+                "activity": activity(conn, str(uid), spaces=together),
+                "recent": recent_edits(conn, str(uid), spaces=together)}
 
     # who holds authority on the server is not a colleague's business
     person.update({"role": role, "email": email, "disabled": bool(disabled), "created_at": created,
@@ -141,6 +179,7 @@ def profile(conn, viewer, target_id: str, *, providers: dict) -> dict:
     # tokens and sign-in methods are not theirs to see (admin.list_tokens
     # refuses the same thing).
     may_manage = is_self or viewer.role == "superadmin" or role not in ADMIN_ROLES
+    scope = _viewer_scope(conn, viewer)
     out = {
         "view": "self" if is_self else "admin",
         "person": person,
@@ -149,7 +188,8 @@ def profile(conn, viewer, target_id: str, *, providers: dict) -> dict:
         "signins": admission.identities(conn, str(uid), providers) if may_manage else None,
         "tokens": tokens.list_own(conn, str(uid)) if may_manage else None,
         "sessions": live_sessions,
-        "activity": activity(conn, str(uid), spaces=None if is_service_admin else [s["id"] for s in spaces]),
+        "activity": activity(conn, str(uid), spaces=scope),
+        "recent": recent_edits(conn, str(uid), spaces=scope),
     }
     if not is_self:
         # what this administrator may do to this account, by the rules that
@@ -275,6 +315,74 @@ def edit(conn, p, user_id: str, changes: dict) -> None:
     _guard(lambda: admin.edit_user(conn, p, user_id=user_id, **fields))
 
 
+def create_person(conn, p, fields: dict) -> str:
+    """An account made by an administrator — for someone who will sign in later
+    (the email is how their first sign-in finds it) or for a service that only
+    ever uses tokens. It gets no spaces and no rights: those are separate acts."""
+    clean = {}
+    for k in ("name", "full_name", "email", "department", "position"):
+        v = fields.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, str):
+            raise Refused(422, f"{k} must be text")
+        v = v.strip()
+        if len(v) > 200:
+            raise Refused(422, f"{k} is longer than 200 characters")
+        if v:
+            clean[k] = v
+    if "email" in clean:
+        from .spaces import Refused as SpaceRefused, normalize_email
+        try:
+            clean["email"] = normalize_email(clean["email"])
+        except SpaceRefused as e:
+            raise Refused(422, str(e)) from None
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM app_user WHERE lower(email) = lower(%s)", (clean["email"],))
+            if cur.fetchone():
+                raise Refused(409, "another account already has this email")
+    if not (clean.get("full_name") or clean.get("email") or clean.get("name")):
+        raise Refused(422, "give the account a name or an email")
+    name = clean.pop("name", None) or clean.get("email") or clean.get("full_name")
+    return _guard(lambda: admin.create_user(conn, p, name=name, **clean))
+
+
+def set_can_create_spaces(conn, p, user_id: str, allowed: bool) -> None:
+    user_id = _uuid(user_id)
+    _guard(lambda: admin.set_can_create_namespace(conn, p, user_id=user_id, allowed=bool(allowed)))
+
+
+def issue_for(conn, p, user_id: str, *, label: str, permission: str,
+              namespace_id: Optional[str], expires_days: int) -> dict:
+    """A token for someone else — the same shape a person gets for themselves
+    (read or write, always expiring, optionally one of their spaces), minted by
+    an administrator for an account that cannot do it itself: a service, or
+    someone who has not signed in yet. The secret is shown once, to the
+    administrator, who hands it over."""
+    from .tokens import EXPIRY_CHOICES, MAX_LABEL, PERMISSIONS
+    user_id = _uuid(user_id)
+    label = (label or "").strip()
+    if len(label) > MAX_LABEL:
+        raise Refused(422, f"the label is longer than {MAX_LABEL} characters")
+    if permission not in PERMISSIONS:
+        raise Refused(422, "access must be read or write")
+    if expires_days not in EXPIRY_CHOICES:
+        raise Refused(422, f"expiry must be one of {', '.join(map(str, EXPIRY_CHOICES))} days")
+    if namespace_id:
+        namespace_id = _uuid(namespace_id)
+        if identity.reaches(conn, user_id, namespace_id) is None:
+            raise Refused(422, "that person cannot open this space — add them to it first")
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM app_user WHERE id = %s", (user_id,))
+        if cur.fetchone() is None:
+            raise Refused(404, "not found")
+    out = _guard(lambda: admin.issue_token(conn, p, user_id=user_id, namespace_id=namespace_id or None,
+                                           permission=permission, label=label, expires_days=expires_days,
+                                           defer_delivery=True))
+    return {"id": out["id"], "token": out["secret"], "permission": permission,
+            "namespace_id": namespace_id or None, "expires_days": expires_days}
+
+
 # ─── record history (for authors) ────────────────────────────────────────────
 def record_history(store, principal, space_id: str, record_id: str) -> list:
     """Who changed a record and when — the way into a person's profile from
@@ -323,6 +431,26 @@ def mount(app, cfg, pool, panel, providers, make_store) -> None:
         p = control_principal(_admin(request, changing=True))
         _run(lambda conn: edit(conn, p, user_id, changes))
         return {"user_id": user_id}
+
+    @app.post("/ui/api/admin/people", status_code=201)
+    def new_person(request: Request, fields: dict = Body(...)):
+        p = control_principal(_admin(request, changing=True))
+        return {"id": _run(lambda conn: create_person(conn, p, fields))}
+
+    @app.post("/ui/api/admin/people/{user_id}/can-create-spaces")
+    def can_create(user_id: str, request: Request, allowed: bool = Body(..., embed=True)):
+        p = control_principal(_admin(request, changing=True))
+        _run(lambda conn: set_can_create_spaces(conn, p, user_id, allowed))
+        return {"user_id": user_id, "can_create_namespace": bool(allowed)}
+
+    @app.post("/ui/api/admin/people/{user_id}/tokens", status_code=201)
+    def token_for(user_id: str, request: Request, label: str = Body("", embed=True),
+                  permission: str = Body("write", embed=True),
+                  namespace_id: Optional[str] = Body(None, embed=True),
+                  expires_days: int = Body(90, embed=True)):
+        p = control_principal(_admin(request, changing=True))
+        return _run(lambda conn: issue_for(conn, p, user_id, label=label, permission=permission,
+                                           namespace_id=namespace_id, expires_days=expires_days))
 
     @app.post("/ui/api/admin/people/{user_id}/role")
     def set_role(user_id: str, request: Request, role: str = Body(..., embed=True)):

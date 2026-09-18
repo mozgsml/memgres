@@ -364,7 +364,10 @@ def test_an_administrator_sees_anyones_profile(box):
     client, cfg, _, ids = box
     _as(client, cfg, ids["mgr"])
     got = client.get(f"/ui/api/people/{ids['olga']}").json()
-    assert got["view"] == "admin" and got["activity"]["total"] == 1 and got["can"]["manage"]
+    # the account is theirs to look after; what she wrote in spaces the manager
+    # cannot open is not
+    assert got["view"] == "admin" and got["can"]["manage"]
+    assert got["activity"]["total"] == 0 and got["recent"] == []
     boss = client.get(f"/ui/api/people/{ids['boss']}").json()
     # a user manager does not get to look at an administrator's credentials
     assert boss["tokens"] is None and boss["signins"] is None and not boss["can"]["manage"]
@@ -542,3 +545,74 @@ def test_profile_fields_must_be_text(box):
     client, cfg, _, ids = box
     h = _as(client, cfg, ids["mgr"])
     assert client.patch(f"/ui/api/admin/people/{ids['olga']}", json={"full_name": 5}, headers=h).status_code == 422
+
+
+# ─── recent edits, shown only where the viewer can read ──────────────────────
+def test_recent_edits_follow_what_the_viewer_can_read(box):
+    client, cfg, root, ids = box
+    _share(client, root, ids["sales"], ids["olga"], "read")
+    # olga writes in her own hr and — via a token — nowhere else; mark writes in sales
+    _as(client, cfg, ids["olga"])
+    mine = client.get(f"/ui/api/people/{ids['olga']}").json()
+    assert [r["path"] for r in mine["recent"]] == ["policies.vacation"]
+    # mark, a colleague through sales, sees none of her hr writes
+    _as(client, cfg, ids["mark"])
+    assert client.get(f"/ui/api/people/{ids['olga']}").json()["recent"] == []
+    # olga looking at mark sees his sales writes, newest first
+    _as(client, cfg, ids["olga"])
+    got = client.get(f"/ui/api/people/{ids['mark']}").json()["recent"]
+    assert {r["path"] for r in got} == {"leads.qualify", "deals.stages"} and got[0]["space"] == "sales"
+    # a superadmin reads every space, so sees everything
+    _as(client, cfg, ids["boss"])
+    assert len(client.get(f"/ui/api/people/{ids['mark']}").json()["recent"]) == 2
+    assert client.get(f"/ui/api/people/{ids['olga']}").json()["activity"]["total"] == 1
+
+
+# ─── administrators provision people ─────────────────────────────────────────
+def test_an_administrator_creates_a_person(box):
+    client, cfg, _, ids = box
+    h = _as(client, cfg, ids["mgr"])
+    r = client.post("/ui/api/admin/people", json={"full_name": "Pavel Orlov", "email": "Pavel@Example.com",
+                                                  "department": "Service"}, headers=h)
+    assert r.status_code == 201, r.text
+    got = client.get(f"/ui/api/people/{r.json()['id']}").json()["person"]
+    assert got["email"] == "Pavel@Example.com" and got["role"] == "user" and got["department"] == "Service"
+    assert client.post("/ui/api/admin/people", json={"email": "mark@example.com"}, headers=h).status_code == 409
+    assert client.post("/ui/api/admin/people", json={}, headers=h).status_code == 422
+    _as(client, cfg, ids["mark"])
+    assert client.post("/ui/api/admin/people", json={"email": "x@example.com"},
+                       headers=_as(client, cfg, ids["mark"])).status_code == 403
+
+
+def test_the_right_to_create_spaces_is_a_switch(box):
+    client, cfg, _, ids = box
+    h = _as(client, cfg, ids["mgr"])
+    url = f"/ui/api/admin/people/{ids['olga']}/can-create-spaces"
+    assert client.post(url, json={"allowed": True}, headers=h).status_code == 200
+    assert client.get(f"/ui/api/people/{ids['olga']}").json()["person"]["can_create_namespace"] is True
+    assert client.post(url, json={"allowed": False}, headers=h).status_code == 200
+    assert client.get(f"/ui/api/people/{ids['olga']}").json()["person"]["can_create_namespace"] is False
+    # not on an administrator's account
+    assert client.post(f"/ui/api/admin/people/{ids['boss']}/can-create-spaces", json={"allowed": True},
+                       headers=h).status_code == 403
+
+
+def test_an_administrator_issues_a_token_for_someone(box):
+    client, cfg, _, ids = box
+    h = _as(client, cfg, ids["mgr"])
+    url = f"/ui/api/admin/people/{ids['olga']}/tokens"
+    r = client.post(url, json={"label": "olga laptop", "permission": "read", "namespace_id": ids["hr"],
+                               "expires_days": 30}, headers=h)
+    assert r.status_code == 201, r.text
+    tok = r.json()["token"]
+    assert client.get("/memories", params={"space": "hr"}, headers=_bearer(tok)).status_code == 200
+    assert client.post("/memories", json={"space": "hr", "path": "x.y", "body": "no"},
+                       headers=_bearer(tok)).status_code in (401, 403)
+    # the panel's own shape: never admin, always expiring, only a space she reaches
+    assert client.post(url, json={"permission": "admin", "expires_days": 30}, headers=h).status_code == 422
+    assert client.post(url, json={"permission": "read", "expires_days": 7}, headers=h).status_code == 422
+    assert client.post(url, json={"permission": "read", "expires_days": 30, "namespace_id": ids["sales"]},
+                       headers=h).status_code == 422
+    # and a user manager cannot mint one for an administrator
+    assert client.post(f"/ui/api/admin/people/{ids['boss']}/tokens",
+                       json={"permission": "read", "expires_days": 30}, headers=h).status_code == 403
