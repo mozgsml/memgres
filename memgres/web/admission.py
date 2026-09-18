@@ -88,8 +88,10 @@ def _request(cur, provider: Provider, claims: dict, suggested: Optional[str]) ->
     if verified_email(claims) is None:
         # A request an administrator must judge needs at least an address the
         # provider vouches for; without one, anyone who can make accounts at an
-        # open provider could fill the queue with nobodies.
-        return Outcome("denied", reason="no_account")
+        # open provider could fill the queue with nobodies. Said as it is: the
+        # person can fix this at the provider, and "no account" would send them
+        # to the wrong place.
+        return Outcome("denied", reason="email_unverified")
     cur.execute("DELETE FROM signin_request WHERE status <> 'pending' "
                 "AND decided_at < now() - make_interval(days => %s)", (REJECTION_MEMORY_DAYS * 3,))
     cur.execute("SELECT count(*), count(*) FILTER (WHERE provider = %s) FROM signin_request "
@@ -193,6 +195,10 @@ def admit(conn, cfg, provider: Provider, claims: dict, *, link_user_id: Optional
 
         # ─── nobody ─────────────────────────────────────────────────────────
         if provider.on_no_match == "deny":
+            # with a confirmed address this could have matched an account; say
+            # what is missing rather than that nothing exists
+            if email is None and provider.on_email_match != "deny":
+                return Outcome("denied", reason="email_unverified")
             return Outcome("denied", reason="no_account")
         if provider.on_no_match == "pending":
             return _request(cur, provider, claims, None)

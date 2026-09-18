@@ -57,8 +57,12 @@ def mount(app, cfg, pool, panel, providers, fetch=None) -> None:
         starts.fail(key)
         state, nonce, browser = secrets.token_urlsafe(32), secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         verifier, challenge = new_pkce()
+        # Linking asks the provider to show its account chooser: a browser often
+        # holds another session there (a service admin, a colleague's), and the
+        # provider would otherwise hand that one back without asking.
         url = client.authorize_url(redirect_uri=_redirect_uri(request, pid), state=state,
-                                   nonce=nonce, challenge=challenge)
+                                   nonce=nonce, challenge=challenge,
+                                   prompt="select_account" if link_session else None)
         with pool.connection() as conn, conn.transaction(), conn.cursor() as cur:
             cur.execute("DELETE FROM oidc_flow WHERE expires_at < now()")
             cur.execute("SELECT count(*) FROM oidc_flow")
@@ -166,7 +170,10 @@ def mount(app, cfg, pool, panel, providers, fetch=None) -> None:
         except psycopg.errors.UniqueViolation:
             # two callbacks linking the same sign-in at the same moment: one wins
             return _go(f"{back}?auth=denied_taken")
-        log.info("oidc %s: %s%s", pid, outcome.kind, f" ({outcome.reason})" if outcome.reason else "")
+        # a refusal is what an administrator will be asked about: log its reason
+        # (never the person's email) where the default log level shows it
+        (log.warning if outcome.kind == "denied" else log.info)(
+            "oidc %s: %s%s", pid, outcome.kind, f" ({outcome.reason})" if outcome.reason else "")
         if outcome.kind == "signed_in":
             r = _go("/memory")
             panel["set_cookie"](r, sid)

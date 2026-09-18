@@ -12,6 +12,7 @@ Two rules keep a browser session from widening what an attacker can reach:
   ``SameSite=Strict`` as well; that is the second lock, not the only one.
 """
 
+import logging
 import threading
 import time
 from pathlib import Path
@@ -75,6 +76,27 @@ class _Throttle:
             self._fails.pop(key, None)
 
 
+class _ScrubSignInQuery(logging.Filter):
+    """Keep the query string of /ui/auth/* out of the access log.
+
+    The provider's redirect back carries a one-time code and the state. Both are
+    spent by the time the line is written and useless without the PKCE verifier,
+    but a log is kept and copied, and there is no reason for them to be in it."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str) \
+                and args[2].startswith("/ui/auth/") and "?" in args[2]:
+            record.args = args[:2] + (args[2].split("?", 1)[0] + "?…",) + args[3:]
+        return True
+
+
+def _scrub_access_log() -> None:
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, _ScrubSignInQuery) for f in access.filters):
+        access.addFilter(_ScrubSignInQuery())
+
+
 def mount(app, cfg, pool, make_store, *, oidc_fetch=None) -> None:
     from fastapi import Body, HTTPException, Request, Response
     from fastapi.responses import FileResponse, RedirectResponse
@@ -83,6 +105,7 @@ def mount(app, cfg, pool, make_store, *, oidc_fetch=None) -> None:
     from . import oidc_config
     cookie_name = "__Host-memgres_session" if cfg.web_cookie_secure else "memgres_session"
     throttle = _Throttle()
+    _scrub_access_log()
     # read at startup: a broken provider file stops the server rather than
     # leaving a sign-in door that half-works
     providers = oidc_config.load(cfg.oidc_config, key_mode=cfg.key_mode)
@@ -172,17 +195,19 @@ def mount(app, cfg, pool, make_store, *, oidc_fetch=None) -> None:
         return FileResponse(shell, media_type="text/html",
                             headers={"Cache-Control": "no-cache"})
 
+    # HEAD too: a page answers HEAD as it answers GET (RFC 9110), and uptime
+    # checks use it — a 405 there reads as "the panel is down"
     for p in APP_PATHS:
-        app.add_api_route(p, _page, methods=["GET"], include_in_schema=False)
+        app.add_api_route(p, _page, methods=["GET", "HEAD"], include_in_schema=False)
 
-    @app.get("/signin", include_in_schema=False)
+    @app.api_route("/signin", methods=["GET", "HEAD"], include_in_schema=False)
     def signin_page():
         with pool.connection() as conn:
             if not sessions.admin_has_linked_signin(conn):
                 return RedirectResponse("/signin/admin?from=signin", status_code=307)
         return _page()
 
-    @app.get("/signin/admin", include_in_schema=False)
+    @app.api_route("/signin/admin", methods=["GET", "HEAD"], include_in_schema=False)
     def signin_admin_page():
         return _page()
 

@@ -126,13 +126,15 @@ class Client:
 
     # ─── the flow ───────────────────────────────────────────────────────────
     def authorize_url(self, *, redirect_uri: str, state: str, nonce: str, challenge: str,
-                      login_hint: Optional[str] = None) -> str:
+                      login_hint: Optional[str] = None, prompt: Optional[str] = None) -> str:
         meta = self.metadata()
         q = {"response_type": "code", "client_id": self.p.client_id, "redirect_uri": redirect_uri,
              "scope": " ".join(self.p.scopes), "state": state, "nonce": nonce,
              "code_challenge": challenge, "code_challenge_method": "S256"}
         if login_hint:
             q["login_hint"] = login_hint
+        if prompt:
+            q["prompt"] = prompt
         sep = "&" if "?" in meta["authorization_endpoint"] else "?"
         return meta["authorization_endpoint"] + sep + urllib.parse.urlencode(q)
 

@@ -254,9 +254,10 @@ def test_an_unverified_email_links_nobody(box):
     client, root, idp, _ = box
     uid = client.post("/admin/users", json={"name": "mark", "email": "mark@example.com"},
                       headers=_bearer(root)).json()["id"]
-    # google: managed defaults; unverified email → no match → deny
+    # google: managed defaults; an unverified email matches nobody — and the person
+    # is told it is the confirmation that is missing, not an account
     assert sign_in(client, idp, "google", claims={"sub": "g-1", "email": "mark@example.com",
-                                                  "email_verified": False}) == "/signin?auth=denied_no_account"
+                                                  "email_verified": False}) == "/signin?auth=denied_email_unverified"
     with psycopg.connect(DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM app_user_identity WHERE user_id = %s", (uid,))
         assert cur.fetchone()[0] == 0
@@ -479,9 +480,9 @@ def test_a_request_needs_a_verified_email(box):
     provider = oidc_config.parse({"providers": {"g": {"issuer": OTHER, "client_id": "m", "on_no_match": "pending"}}},
                                  key_mode="managed")["g"]
     with psycopg.connect(DSN) as conn:
-        assert admission.admit(conn, cfg, provider, {"sub": "x1"}).reason == "no_account"
+        assert admission.admit(conn, cfg, provider, {"sub": "x1"}).reason == "email_unverified"
         assert admission.admit(conn, cfg, provider, {"sub": "x2", "email": "a@b.c",
-                                                     "email_verified": False}).reason == "no_account"
+                                                     "email_verified": False}).reason == "email_unverified"
         assert admission.admit(conn, cfg, provider, {"sub": "x3", "email": "a@b.c",
                                                      "email_verified": True}).kind == "pending"
 
@@ -633,3 +634,41 @@ def test_userinfo_cannot_vouch_for_an_address_it_does_not_name():
     assert "email_verified" not in oidc.merged_claims(id_claims, info)
     assert oidc.merged_claims(id_claims, {**info, "email": "BOSS@example.com"})["email_verified"] is True
     assert oidc.merged_claims({**id_claims, "email_verified": False}, info)["email_verified"] is False
+
+
+def test_a_verified_stranger_is_still_told_there_is_no_account(box):
+    client, _, idp, _ = box
+    assert sign_in(client, idp, "google", claims={"sub": "g-9", "email": "x@gmail.com",
+                                                  "email_verified": True}) == "/signin?auth=denied_no_account"
+
+
+def test_linking_asks_the_provider_to_let_the_person_choose(box):
+    """A browser often holds another session at the provider — a service admin's
+    — and without this the provider hands that one back without asking."""
+    client, root, idp, _ = box
+    _admin_client(client, root)
+    csrf = client.get("/ui/api/session").json()["csrf"]
+    url = client.post("/ui/api/me/signins/link", json={"provider": "corp"},
+                      headers={"Origin": ORIGIN, "X-Memgres-CSRF": csrf}).json()["url"]
+    assert parse_qs(urlsplit(url).query)["prompt"] == ["select_account"]
+    plain = client.get("/ui/auth/corp/start", follow_redirects=False).headers["location"]
+    assert "prompt" not in parse_qs(urlsplit(plain).query)
+
+
+def test_the_access_log_does_not_keep_the_code(box):
+    import logging
+    from memgres.web.routes import _ScrubSignInQuery
+    rec = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                            ("1.2.3.4:0", "GET", "/ui/auth/corp/callback?code=SECRET&state=S", "1.1", 303), None)
+    _ScrubSignInQuery().filter(rec)
+    assert "SECRET" not in rec.getMessage() and "/ui/auth/corp/callback" in rec.getMessage()
+    other = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                              ("1.2.3.4:0", "GET", "/ui/api/spaces?x=1", "1.1", 200), None)
+    _ScrubSignInQuery().filter(other)
+    assert "?x=1" in other.getMessage()
+
+
+def test_pages_answer_head(box):
+    client, _, _, _ = box
+    for path in ("/signin", "/signin/admin", "/memory", "/account"):
+        assert client.head(path, follow_redirects=False).status_code in (200, 307), path

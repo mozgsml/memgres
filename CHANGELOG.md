@@ -5,6 +5,38 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.13.1] — unreleased
+
+What the first days of the panel on a real deployment turned up, plus the
+reading improvements that came with them.
+
+### Fixed — sign-in says what is actually wrong
+- **A provider that has not confirmed the person's email is named as the
+  reason.** Such a sign-in was refused as "there is no account here", which
+  sends the person to an administrator who cannot help; the fix is a
+  confirmation code at the provider. The refusal is now `email_unverified`, with
+  its own message — also when the provider sent no email at all.
+- **Linking a sign-in method asks the provider to let the person choose**
+  (`prompt=select_account`). A browser often holds another session at the
+  provider — a service administrator's, say — and the provider handed that one
+  back without asking, so the wrong identity got linked.
+- **Refusals are logged with their reason** (`oidc <provider>: denied (<reason>)`,
+  never the email) at a level the default configuration shows.
+- **The access log no longer records the provider's one-time code and state**
+  on the way back from sign-in.
+- **Panel pages answer `HEAD`** as they answer `GET`; uptime checks saw 405.
+
+### Added — reading
+- **Record bodies render as Markdown** — headings, lists, tables, code, links,
+  and `[[path]]` links into the graph. Nothing in a body runs: raw HTML shows as
+  text, only http(s)/mailto links are kept, images are not fetched, DOMPurify
+  cleans the result. marked 18.0.13 and DOMPurify 3.4.15 ship in the package.
+- **Search results in their own column** beside the record, closed with ×, and
+  a spinner while a query runs.
+- **The record panel can be widened** by dragging its edge (remembered).
+- **The space's own node stands out** on the graph.
+- **The sign-in picture is a small live memory** you can pull about.
+
 ## [0.13.0] — 2026-09-18
 
 A web panel for people. Until now memgres had two audiences, agents (MCP) and

@@ -392,5 +392,6 @@
  "every.emptyHelp": "As a superadmin you can open any space on this server: “All spaces…” in the sidebar.",
  "every.truncated": "Only the first {n} are listed — search to narrow it down.",
  "res.searching": "Searching…",
- "res.close": "Close results"
+ "res.close": "Close results",
+ "auth.denied_email_unverified": "Your sign-in provider hasn’t confirmed your email address (or didn’t share it). Confirm it there — usually with a code sent to that address — and sign in again. If it looks confirmed, ask your administrator."
 }
