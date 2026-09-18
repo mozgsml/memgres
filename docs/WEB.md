@@ -10,9 +10,9 @@ The panel **reads memory only**. Writing stays with agents (MCP) and the REST
 API. What it does change is who may reach memory: the members of a space, and —
 for administrators — the accounts themselves.
 
-It is served by `memgres-server` from the same image as everything else. Fonts
-and the graph library ship inside the package: the panel needs no internet
-access at runtime.
+It is served by `memgres-server` from the same image as everything else. Fonts,
+the graph library (d3) and the Markdown renderer (marked, DOMPurify) ship inside
+the package with their licences: the panel needs no internet access at runtime.
 
 ## Turning it on
 
@@ -81,9 +81,15 @@ token that does not exist.
   opens as a graph (records as hexagons, sized by how many links they have) or
   as a tree. Select a record to fade everything unrelated; switch to the local
   view to see only its neighbours up to three steps away, with the path back to
-  the root. Search uses the server's recall, lexical or semantic as configured.
-  A record shows its history: who changed it and when, each name opening that
-  person's page.
+  the root. Search uses the server's recall, lexical or semantic as configured;
+  its results open in their own column beside the record, so opening one keeps
+  the list, and the column closes with ×.
+  A record's body is rendered as Markdown — headings, lists, tables, code,
+  links, and `[[path]]` links that open the record they name. Nothing in a body
+  runs: raw HTML is shown as text, only `http(s)`/`mailto` links are kept, images
+  are not fetched. A record shows its history: who changed it and when, each name
+  opening that person's page. The record panel is as wide as you drag its edge
+  (double-click the edge to reset); the width is remembered in the browser.
 - **Tokens** (Account → Tokens). A token for each device or client, with:
   - access `read` or `write` — never `admin`: an admin-ceiling token can mint
     more tokens, so a leaked one could not be contained by revoking it;

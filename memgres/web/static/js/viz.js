@@ -95,20 +95,27 @@ registerVisualizer({
       for (const e of wiki) { e.el = S("path", { class: "wiki" }); gL.append(e.el); }
       for (const d of [...nodes].sort((a, b) => (a.id === "") - (b.id === "") || a.r - b.r)) {
         const n = d.n, hub = d.id === "";
-        const g = S("g", { class: "node", tabindex: "0", role: "button", "data-id": d.id,
+        const g = S("g", { class: hub ? "node hubnode" : "node", tabindex: "0", role: "button", "data-id": d.id,
           "aria-label": hub ? api.space.name : n.record ? (n.record.title || n.id) : n.id });
         d.halo = S("path", { class: "halo", d: hexPath(d.r + 6) });
         const bg = S("path", { class: "bg", d: hexPath(d.r) });
         d.ring = S("path", { class: "ring" + (hub ? " hub" : n.record ? "" : " bare"), d: hexPath(d.r) });
         g.append(d.halo, bg, d.ring);
+        if (hub) {
+          // the space itself: a second outline around the root, so it reads as the
+          // place the rest hangs from rather than one more record
+          d.outer = S("path", { class: "hub-ring", d: hexPath(d.r + 10) });
+          g.insertBefore(d.outer, bg);
+        }
         const lines = hub ? labelLines(api.space.name, 12) : labelLines(n.label, perLine(d.r));
-        const fs = hub ? 15 : FS, lh = fs * 1.2, top = hub ? -9 : 0;
+        const fs = hub ? 17 : FS, lh = fs * 1.2, top = hub ? -9 : 0;
         d.texts = lines.map((ln, i) => {
           const tx = S("text", { "font-size": fs, "font-weight": hub ? 600 : 500, y: (top + (i - (lines.length - 1) / 2) * lh).toFixed(1) });
           tx.textContent = ln; g.append(tx); return tx;
         });
         if (hub) {
-          const sub = S("text", { class: "sub", "font-size": 10.5, y: 16 });
+          const below = top + ((lines.length - 1) / 2) * lh + fs * 0.95;
+          const sub = S("text", { class: "sub", "font-size": 10.5, y: below.toFixed(1) });
           sub.textContent = api.t("mem.records", { n: api.count(n) });
           g.append(sub);
         }
@@ -136,10 +143,12 @@ registerVisualizer({
       for (const d of nodes) {
         const c = api.colorOf(d.id);
         d.ring.setAttribute("stroke", c); d.ring.setAttribute("fill", c); d.halo.setAttribute("stroke", c);
+        if (d.outer) d.outer.setAttribute("stroke", c);
         for (const tx of d.texts) tx.setAttribute("fill", c);
         let o = 1;
         if (q) o = d.id === "" || api.matches(d.n) ? 1 : 0.14;
         else if (near) o = near.has(d.id) ? 1 : api.isContext(d.id) ? 0.4 : d.n.root && d.n.root === selRoot ? 0.5 : 0.16;
+        if (d.id === "") o = Math.max(o, 0.9);      // the space stays in view whatever is selected
         d.el.style.opacity = o;
         d.el.classList.toggle("sel", d.id === s);
       }

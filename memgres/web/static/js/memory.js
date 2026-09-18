@@ -3,6 +3,7 @@
 
 import { get, post, ApiError } from "./api.js";
 import { ago, fmtDate, nf, t } from "./i18n.js";
+import { renderMarkdown } from "./md.js";
 import { VISUALIZERS } from "./viz.js";
 import { $, $$, autoSlots, esc, fnv, hexIcon, PALETTE, PALETTE_KEYS, reducedMotion, store, toast } from "./ui.js";
 
@@ -172,6 +173,8 @@ function buildArea(root) {
         </div>
         <div class="keys-pop" id="keys-pop" hidden></div>
       </div>
+      <aside class="results" id="results" aria-live="polite" hidden></aside>
+      <div class="splitter" id="splitter" role="separator" aria-orientation="vertical" tabindex="0"></div>
       <aside class="inspector" id="inspector" aria-live="polite"></aside>
     </div>
   </div>`;
@@ -214,12 +217,18 @@ function buildArea(root) {
   });
   $("#inspector", root).addEventListener("click", (e) => {
     const go = e.target.closest("[data-go]");
-    if (go) { select(go.dataset.go, { centre: true, clearSearch: true }); return; }
+    if (go) { select(go.dataset.go, { centre: true }); return; }
     const cp = e.target.closest("[data-copy]");
     if (cp) (navigator.clipboard?.writeText(cp.dataset.copy) || Promise.reject()).then(() => toast(t("toast.copied", { v: cp.dataset.copy })), () => toast(cp.dataset.copy));
   });
 
   $("#inspector", root).addEventListener("click", onInspectorAction);
+  $("#results", root).addEventListener("click", (e) => {
+    if (e.target.closest("[data-close]")) { const q = $("#q", root); q.value = ""; runSearch(""); q.focus(); return; }
+    const go = e.target.closest("[data-go]");
+    if (go) select(go.dataset.go, { centre: true });
+  });
+  wireSplitter(root);
   wireSidebar();
   document.addEventListener("keydown", onKey);
 }
@@ -350,7 +359,8 @@ async function openSpace(space) {
   $("#q", m.root).disabled = false;
   m.space = space;
   store.set("memgres.space", space.id);
-  m.selected = null; m.query = ""; m.hits = null; m.scope = "all";
+  m.selected = null; m.query = ""; m.hits = null; m.results = null; m.scope = "all";
+  setSearching(false); renderResults();
   $("#q", m.root).value = "";
   renderSpaceList();
   $("#spacetitle", m.root).innerHTML = `${hexIcon(spaceColor(space), false, 20)}<h1>${esc(space.name)}</h1><small>${esc(t("mem.records", { n: space.records }))}</small>${space.visiting ? `<span class="perm-badge role" title="${esc(t("every.groupWhy"))}">${esc(t("every.badge"))}</span>` : `<span class="perm-badge">${esc(t("perm." + space.permission))}</span>`}`;
@@ -533,17 +543,99 @@ function select(id, opts = {}) {
 async function runSearch(q) {
   m.query = q;
   const seq = ++m.searchSeq;
-  if (!q) { m.hits = null; m.results = null; sync("focus"); inspect(); return; }
+  if (!q) { m.hits = null; m.results = null; setSearching(false); renderResults(); sync("focus"); return; }
+  setSearching(true);
+  renderResults();
   try {
     const { hits } = await get(`/spaces/${encodeURIComponent(m.space.id)}/search?q=${encodeURIComponent(q)}`);
     if (seq !== m.searchSeq) return;          // a newer query already answered
     m.results = hits;
     m.hits = new Set(hits.map((h) => h.id));
     if (m.scope === "local") { m.scope = "all"; sync("data"); } else sync("focus");
-    inspect();
   } catch {
     if (seq === m.searchSeq) toast(t("err.network"));
+  } finally {
+    if (seq === m.searchSeq) { setSearching(false); renderResults(); }
   }
+}
+
+function setSearching(on) {
+  m.searching = on;
+  $(".search", m.root).classList.toggle("busy", on);
+}
+
+// Results sit in their own column beside the record, so opening one keeps the list.
+function renderResults() {
+  const box = $("#results", m.root);
+  const on = !!m.query;
+  const changed = box.hidden === on;
+  box.hidden = !on;
+  $(".workspace", m.root).classList.toggle("with-results", on);
+  // the map just got narrower or wider: fit it to its new room once the grid has moved
+  if (changed) requestAnimationFrame(() => m.ctl?.fit?.());
+  if (!on) return;
+  const results = m.results || [];
+  const waiting = m.searching && !m.results;
+  const head = `<div class="res-head"><div><div class="eyebrow">${esc(t("keys.search"))}</div>
+      <b>${esc(waiting ? t("res.searching") : t("insp.search", { n: results.length, q: m.query }))}</b></div>
+      <button class="ghost" data-close aria-label="${esc(t("res.close"))}" title="${esc(t("res.close"))}">
+        <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div>`;
+  if (waiting) {
+    box.innerHTML = head + `<div class="res-wait"><span class="spinner" aria-hidden="true"></span>${esc(t("res.searching"))}</div>`;
+    return;
+  }
+  box.innerHTML = head + (results.length ? `<div class="list${m.searching ? " stale" : ""}">${results.map((h) => {
+    const id = m.byRecord.get(h.id);
+    return id ? `<button data-go="${esc(id)}" aria-current="${m.selected === id}">${hexIcon(colorOf(id), false, 12)}<span>${esc(h.title || h.path)}</span><small>${esc(h.path || "")}</small></button>
+      ${h.snippet ? `<p class="snippet">${esc(plainSnippet(h.snippet))}</p>` : ""}` : "";
+  }).join("")}</div>` : `<p class="note">${esc(t("insp.noHits"))}</p>`);
+}
+
+// a snippet is a slice of Markdown: show the words, not the marks
+function plainSnippet(text) {
+  return String(text)
+    .replace(/\[\[([^\]|#\n]+)(?:#[^\]|\n]*)?(?:\|([^\]\n]*))?\]\]/g, (w, target, label) => (label || target).trim())
+    .replace(/\[([^\]\n]*)\]\([^)\n]*\)/g, "$1")
+    .replace(/\*{1,3}|`+|^#{1,6}\s+|^>\s?/gm, "")
+    .replace(/\|/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+}
+
+// The record panel's width, dragged by the edge between it and the map.
+function wireSplitter(root) {
+  const bar = $("#splitter", root), ws = $(".workspace", root);
+  const MIN = 280, KEY = "memgres.inspector";
+  const apply = (w) => {
+    const room = ws.getBoundingClientRect().width - 320 - ($("#results", root).hidden ? 0 : 310);
+    const v = Math.round(Math.max(MIN, Math.min(w, Math.max(MIN, room))));
+    ws.style.setProperty("--insp-w", v + "px");
+    return v;
+  };
+  const saved = Number(store.get(KEY));
+  if (saved) requestAnimationFrame(() => apply(saved));
+  let drag = null;
+  bar.addEventListener("pointerdown", (e) => {
+    drag = { x: e.clientX, w: $("#inspector", root).getBoundingClientRect().width };
+    bar.setPointerCapture(e.pointerId); bar.classList.add("on"); e.preventDefault();
+  });
+  bar.addEventListener("pointermove", (e) => { if (drag) apply(drag.w + (drag.x - e.clientX)); });
+  const end = () => {
+    if (!drag) return;
+    drag = null; bar.classList.remove("on");
+    store.set(KEY, String(Math.round($("#inspector", root).getBoundingClientRect().width)));
+    m.ctl?.fit?.();
+  };
+  bar.addEventListener("pointerup", end);
+  bar.addEventListener("pointercancel", end);
+  bar.addEventListener("dblclick", () => { ws.style.removeProperty("--insp-w"); store.set(KEY, ""); });
+  bar.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const w = apply($("#inspector", root).getBoundingClientRect().width + (e.key === "ArrowLeft" ? 24 : -24));
+    store.set(KEY, String(w));
+  });
 }
 
 // ─── tooltip ─────────────────────────────────────────────────────────────────
@@ -576,30 +668,18 @@ const listOf = (ids) => ids.length ? `<div class="list">${ids.map((id) => {
 const stats = (pairs) => `<div class="stats">${pairs.map(([k, v]) => `<div class="stat"><small>${esc(t(k))}</small><b>${nf(v)}</b></div>`).join("")}</div>`;
 const colorName = (hex) => t("pal." + PALETTE_KEYS[PALETTE.indexOf(hex)]);
 
-function bodyHtml(body) {
-  return esc(body)
-    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
-    .replace(/\[\[([^\]|#\n]+)(?:#[^\]|\n]*)?(?:\|([^\]\n]*))?\]\]/g, (whole, target, label) => {
-      const path = target.trim();
-      const shown = label ? label.trim() : path;
-      return m.T.has(path) ? `<button class="wl" data-go="${esc(path)}" style="color:${colorOf(path)}">${shown}</button>` : `<span class="wl dangling" title="${esc(t("insp.dangling"))}">${shown}</span>`;
-    });
+// a [[path]] inside a body: a button to the record if it exists, else a dimmed name
+function wikiLink(target, label) {
+  const path = target.trim();
+  return m.T.has(path) ? `<button class="wl" data-go="${esc(path)}" style="color:${colorOf(path)}">${esc(label)}</button>`
+    : `<span class="wl dangling" title="${esc(t("insp.dangling"))}">${esc(label)}</span>`;
 }
 
 let inspectSeq = 0;
 async function inspect() {
   const box = $("#inspector", m.root);
   if (!m.graph) return;
-  if (m.hits) {
-    const results = m.results || [];
-    box.innerHTML = `<div class="eyebrow">${esc(t("keys.search"))}</div><h2>${esc(t("insp.search", { n: results.length, q: m.query }))}</h2>
-      ${results.length ? `<div class="list">${results.map((h) => {
-        const id = m.byRecord.get(h.id);
-        return id ? `<button data-go="${esc(id)}">${hexIcon(colorOf(id), false, 12)}<span>${esc(h.title || h.path)}</span><small>${esc(h.path || "")}</small></button>
-          ${h.snippet ? `<p class="snippet">${esc(String(h.snippet).slice(0, 240))}</p>` : ""}` : "";
-      }).join("")}</div>` : `<p class="note">${esc(t("insp.noHits"))}</p>`}`;
-    return;
-  }
+  if (m.query) renderResults();          // keep the open result marked in the list
   const n = m.selected === null ? null : m.T.get(m.selected);
   const sc = spaceColor(m.space);
   if (!n || n.id === "") {
@@ -645,7 +725,7 @@ async function inspect() {
   const dangling = out.filter((l) => !l.resolved && !l.scheme);
   box.innerHTML = head + `
     ${stats([["insp.links", outIds.length + inIds.length], ["insp.opened", r.usage?.gets ?? 0], ["insp.found", r.usage?.recalled ?? 0]])}
-    <div class="body">${bodyHtml(r.body)}</div>
+    <div class="body md">${renderMarkdown(r.body, { link: wikiLink })}</div>
     <div><p class="h3">${esc(t("insp.linksTo"))}</p>${listOf(outIds)}${dangling.length ? `<p class="note">${esc(t("insp.danglingList", { list: dangling.map((l) => l.target).join(", ") }))}</p>` : ""}</div>
     <div><p class="h3">${esc(t("insp.linkedFrom"))}</p>${listOf(inIds)}</div>
     <div><p class="h3">${esc(t("insp.color"))}</p><div class="colorline"><span class="txt">${hexIcon(c, false, 14)} ${t("color.auto", { name: esc(colorName(c)), root: esc(n.root) })}</span></div></div>
