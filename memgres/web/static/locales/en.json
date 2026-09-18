@@ -389,5 +389,6 @@
  "every.forget": "Remove {name} from the sidebar",
  "every.badge": "superadmin",
  "every.noOwn": "You are not a member of any space yet.",
- "every.emptyHelp": "As a superadmin you can open any space on this server: “All spaces…” in the sidebar."
+ "every.emptyHelp": "As a superadmin you can open any space on this server: “All spaces…” in the sidebar.",
+ "every.truncated": "Only the first {n} are listed — search to narrow it down."
 }

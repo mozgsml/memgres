@@ -127,6 +127,7 @@ $("#me").addEventListener("click", (e) => {
     if (!ev.target.closest("[data-signout]")) return;
     closeMenu();
     try { await del("/session"); } catch { /* already gone */ }
+    state.modules.forgetSession?.();
     state.session = null;
     setCsrf(null);
     navigate("/signin");
@@ -188,7 +189,7 @@ async function boot() {
   // later areas load themselves; a missing one leaves the shell usable
   await Promise.all([
     import("./tokens.js").then((m) => { state.modules.tokens = m.renderTokens; }).catch(() => {}),
-    import("./memory.js").then((m) => { state.modules.memory = m.renderMemory; state.modules.sidebarSpaces = m.sidebarSpaces; }).catch(() => {}),
+    import("./memory.js").then((m) => { state.modules.memory = m.renderMemory; state.modules.sidebarSpaces = m.sidebarSpaces; state.modules.forgetSession = m.forgetSession; }).catch(() => {}),
     import("./signins.js").then((m) => { state.modules.signins = m.renderSignins; }).catch(() => {}),
     import("./admin.js").then((m) => { state.modules.admin = m.renderAdmin; }).catch(() => {}),
     import("./space.js").then((m) => { state.modules.space = m.renderSpace; }).catch(() => {}),

@@ -135,8 +135,8 @@ sidebar still lists only the spaces they own or were added to. Under the list,
 records, searchable by name or owner. Opening one — or following a link to one —
 puts it in a separate group, **Opened as superadmin**, drawn with a dashed
 outline and marked in the space's title: it is not theirs, and nothing on the
-server records that they looked. The group lasts until they sign out (or they
-remove a space from it with ×). Nothing becomes a membership. A user manager has
+server records that they looked. The group lasts until they sign out — signing
+out clears it from the browser too — or until they remove a space with ×. Nothing becomes a membership. A user manager has
 no such list: that role administers accounts, not what is inside spaces.
 
 There is no list of spaces a person cannot open. Someone who follows a space's

@@ -40,7 +40,10 @@ def spaces(conn, user_id: str) -> list:
              "records": counts.get(r["id"], 0), "waiting": waiting.get(r["id"], 0)} for r in rows]
 
 
-def every_space(conn, q: str = "") -> list:
+MAX_EVERY_SPACE = 1000
+
+
+def every_space(conn, q: str = "") -> dict:
     """Every namespace on the deployment, for a superadmin choosing one to open:
     name, owner, how many records and members. Metadata only."""
     q = (q or "").strip()[:200]
@@ -54,16 +57,22 @@ def every_space(conn, q: str = "") -> list:
             "       COALESCE(NULLIF(u.full_name, ''), NULLIF(u.name, ''), u.email), "
             "       (SELECT count(*) FROM namespace_member m WHERE m.namespace_id = n.id) "
             f"FROM namespace n JOIN app_user u ON u.id = n.owner_user_id {where} "
-            "ORDER BY lower(n.name), n.id LIMIT 1000", params)
+            "ORDER BY lower(n.name), n.id LIMIT %(limit)s", {**params, "limit": MAX_EVERY_SPACE + 1})
         rows = cur.fetchall()
+        truncated = len(rows) > MAX_EVERY_SPACE
+        rows = rows[:MAX_EVERY_SPACE]
         ids = [r[0] for r in rows]
         counts = {}
         if ids:
             w, prm = build_filters(ids, None, None)
             cur.execute(f"SELECT namespace, count(*) FROM memory WHERE {w} GROUP BY namespace", prm)
             counts = {str(ns): n for ns, n in cur.fetchall()}
-    return [{"id": i, "name": n, "description": d, "owner": {"id": oid, "name": oname},
-             "members": mc + 1, "records": counts.get(i, 0)} for i, n, d, oid, oname, mc in rows]
+    # past the cap the answer says so, the way the graph does: a list that
+    # looks complete must be complete
+    return {"spaces": [{"id": i, "name": n, "description": d, "owner": {"id": oid, "name": oname},
+                        "members": mc + 1, "records": counts.get(i, 0)}
+                       for i, n, d, oid, oname, mc in rows],
+            "truncated": truncated}
 
 
 def one_space(conn, principal, space_id: str) -> dict:
@@ -75,7 +84,11 @@ def one_space(conn, principal, space_id: str) -> dict:
     where, params = build_filters([nsid], None, None)
     with conn.cursor() as cur:
         cur.execute("SELECT name, description, owner_user_id::text FROM namespace WHERE id = %s", (nsid,))
-        name, desc, owner = cur.fetchone()
+        row = cur.fetchone()
+        if row is None:
+            # a superadmin's role reaches any id, including one naming nothing
+            raise identity.SpaceNotFound("no such namespace")
+        name, desc, owner = row
         cur.execute(f"SELECT count(*) FROM memory WHERE {where}", params)
         records = cur.fetchone()[0]
     return {"id": nsid, "name": name, "description": desc, "records": records,
@@ -159,7 +172,7 @@ def mount(app, cfg, pool, panel, make_store) -> None:
             # a user manager administers accounts, not what is inside spaces
             raise HTTPException(403, "superadmins only")
         with pool.connection() as conn:
-            return {"spaces": every_space(conn, q)}
+            return every_space(conn, q)
 
     @app.get("/ui/api/spaces/{space_id}/graph")
     def space_graph(space_id: str, request: Request):

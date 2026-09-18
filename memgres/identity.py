@@ -537,6 +537,18 @@ def _collect(out: List[Tuple[str, str]], seen: set, resolved: Tuple[str, str]) -
         out.append((nsid, perm))
 
 
+def _own_words(conn, user_id: str) -> List[str]:
+    """The names this caller chose: its own namespaces and its aliases.
+
+    What a keyword may collide with. A namespace SHARED with you was named by
+    somebody else, and letting that name decide what your `all` or `*` means
+    would hand a stranger a switch on your words — add you to a namespace
+    called `all`, and your `all` stops working. An alias you set is your word,
+    so it counts."""
+    return [s["name"] for s in list_spaces(conn, user_id) if s["mine"]] + \
+        list(list_aliases(conn, user_id).values())
+
+
 def _no_such_name(names: Sequence[str], keyword: str) -> None:
     """Refuse a set keyword that is ALSO the name of a namespace in play.
 
@@ -550,7 +562,9 @@ def _no_such_name(names: Sequence[str], keyword: str) -> None:
 
 def _all_reachable(conn, principal: Principal,
                    keyword: str = ALL_SPACES) -> List[Tuple[str, str]]:
-    """Every namespace the caller reaches, capped by the token ceiling."""
+    """Every namespace the caller belongs to — owns or was added to — capped by
+    the token ceiling. For a superadmin this is NOT everything its role can
+    read; that is `*`."""
     if principal.user_id is None:
         # An env break-glass root has no membership rows to enumerate, and a
         # provisional open-mode token owns nothing yet. Neither can say "all".
@@ -565,7 +579,7 @@ def _all_reachable(conn, principal: Principal,
     reachable = list_spaces(conn, principal.user_id)
     if not reachable:
         raise SpaceNotFound("you can reach no namespaces yet")
-    _no_such_name([s["name"] for s in reachable], keyword)
+    _no_such_name(_own_words(conn, principal.user_id), keyword)
     return [(s["id"], perm_min(s["permission"], ceiling)) for s in reachable]
 
 
@@ -578,7 +592,8 @@ def _every_namespace(conn, principal: Principal) -> List[Tuple[str, str]]:
     time, so it adds no authority — only a way to spend it in one call instead
     of N.
     """
-    # The name check comes FIRST, and against the caller's OWN reachable set.
+    # The name check comes FIRST, and against the caller's OWN words (see
+    # `_own_words`: namespaces it owns and its aliases).
     # Two reasons, both learned the hard way:
     #   * a caller who owns a namespace literally named `*` most likely means
     #     that one, and telling them the keyword is superadmin-only would be an
@@ -591,12 +606,11 @@ def _every_namespace(conn, principal: Principal) -> List[Tuple[str, str]]:
     #     uuids. A stranger's choice of name must not reach into what this
     #     caller's words mean.
     if principal.user_id is not None:
-        _no_such_name([s["name"] for s in list_spaces(conn, principal.user_id)],
-                      EVERY_SPACE)
+        _no_such_name(_own_words(conn, principal.user_id), EVERY_SPACE)
     if not principal.is_admin:
         raise AuthError(
             f"`space='{EVERY_SPACE}'` means every namespace in this deployment "
-            f"and is superadmin-only — use '{ALL_SPACES}' for the ones you reach")
+            f"and is superadmin-only — use '{ALL_SPACES}' for the ones you belong to")
     if principal.scope_namespace_id is not None:
         # The pin is a property of THIS credential and outranks the role: a
         # token deliberately narrowed to one namespace does not widen back.

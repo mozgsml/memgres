@@ -108,7 +108,7 @@ two combine. Over HTTP they are repeated query parameters:
 
 ```bash
 curl -s "$BASE/recall?q=pricing&space=work&space=notes"   # two of yours
-curl -s "$BASE/recall?q=pricing&space=all"                 # everything you reach
+curl -s "$BASE/recall?q=pricing&space=all"                 # every namespace you belong to
 curl -s "$BASE/recall?q=pricing&space=work&space_id=<uuid>"  # yours + a shared one
 curl -s "$BASE/recall?q=pricing&space=*"                   # superadmin: everything
 ```
@@ -140,11 +140,13 @@ There is deliberately no other keyword. Namespace names are free text and the
 obvious candidates (`mine`, `own`) are names people use — the first draft of
 this shadowed a namespace literally called `mine` in the test suite. `*`
 survives that objection, and the collision is still checked rather than assumed
-away: if a namespace **you reach** is named `*`, the keyword is refused as
-ambiguous and you address that one by id. The check is deliberately scoped to
-what you reach — checking every name in the deployment let any tenant disable
-the keyword for the superadmin by naming a namespace `*`, and a stranger's
-choice of name must not reach into what your words mean.
+away: if a namespace **you own** — or an alias you set — is named `*` or `all`,
+the keyword is refused as ambiguous and you address that one by id. The check is
+deliberately scoped to the names you chose. Checking every name in the
+deployment let any tenant disable `*` for the superadmin by naming a namespace
+`*`; checking the namespaces shared with you let anyone who shared one called
+`all` switch off your `all`. A stranger's choice of name must not reach into
+what your words mean.
 
 **If you reach more than one namespace, you must name one** — for a search as
 much as for a write. Searching one of them and answering "nothing found" is

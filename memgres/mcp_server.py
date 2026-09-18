@@ -552,7 +552,7 @@ def build_server(cfg: Optional[Config] = None):
         choosing what to read in full with `memory_get`.
 
         WHERE to search: `space` takes a namespace name, a list of names, or
-        `"all"` for every namespace you reach; `space_id` takes ids (the only way
+        `"all"` for every namespace you belong to (own or were added to); `space_id` takes ids (the only way
         to name a namespace shared WITH you). Omit both and your single namespace
         is used — but if you reach several, naming one is REQUIRED, because
         searching just one of them would return "nothing found" and read like an

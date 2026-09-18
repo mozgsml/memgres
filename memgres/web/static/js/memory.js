@@ -57,7 +57,20 @@ const visitKey = () => `${m.session?.user?.id}|${m.session?.expires_at}`;
 function loadVisiting() {
   let saved = null;
   try { saved = JSON.parse(store.get("memgres.visiting") || "null"); } catch { /* ignore */ }
-  m.visiting = isSuper() && saved && saved.key === visitKey() && Array.isArray(saved.spaces) ? saved.spaces : [];
+  const ours = isSuper() && saved && saved.key === visitKey() && Array.isArray(saved.spaces);
+  m.visiting = ours ? saved.spaces : [];
+  // a list left by an earlier session (one that expired rather than signed out) goes now
+  if (saved && !ours) store.set("memgres.visiting", "");
+}
+
+// Signing out forgets what this browser was showing: the spaces opened by role,
+// and the cached sidebar, so the next person in this tab starts clean.
+export function forgetSession() {
+  store.set("memgres.visiting", "");
+  Object.assign(m, { spaces: [], visiting: [], space: null, graph: null, loaded: false, session: null,
+    selected: null, hits: null, results: null, query: "" });
+  $("#spacelist").innerHTML = "";
+  $("#mbar-space").innerHTML = "";
 }
 
 function saveVisiting() {
@@ -106,8 +119,8 @@ function openEverySpace() {
   let seq = 0, timer = null;
   const load = async () => {
     const my = ++seq, q = $("#as-q", veil).value.trim();
-    let rows;
-    try { rows = (await get(`/admin/spaces?q=${encodeURIComponent(q)}`)).spaces; } catch {
+    let rows, truncated;
+    try { ({ spaces: rows, truncated } = await get(`/admin/spaces?q=${encodeURIComponent(q)}`)); } catch {
       if (my === seq) $("#as-list", veil).innerHTML = `<p class="note">${esc(t("err.network"))}</p>`;
       return;
     }
@@ -118,7 +131,8 @@ function openEverySpace() {
       return `<button class="item pick" data-open="${esc(s.id)}">${hexIcon(c, !mine.has(s.id), 16)}
         <div class="grow"><b class="mono">${esc(s.name)}</b><small>${esc(t("every.row", { owner: s.owner.name || "—", members: s.members, records: t("mem.records", { n: s.records }) }))}</small></div>
         ${mine.has(s.id) ? `<span class="perm read">${esc(t("every.yours"))}</span>` : ""}</button>`;
-    }).join("") : `<p class="note">${esc(t("every.none"))}</p>`;
+    }).join("") + (truncated ? `<p class="note" style="color:var(--admin)">${esc(t("every.truncated", { n: rows.length }))}</p>` : "")
+      : `<p class="note">${esc(t("every.none"))}</p>`;
   };
   $("#as-q", veil).addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(load, 220); });
   $("#as-q", veil).focus();

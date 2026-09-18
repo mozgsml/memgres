@@ -368,3 +368,23 @@ def test_only_a_superadmin_is_told_about_the_wide_word(env):
         plain = ident.resolve(setup, cfg, tok)
     assert "'*'" in admin.whoami(setup, boss)["search_hint"]
     assert "search_hint" not in admin.whoami(setup, plain)
+
+
+def test_a_namespace_someone_shares_with_you_cannot_switch_off_your_all(env):
+    """A shared namespace was named by somebody else; its name must not decide
+    what your keyword means."""
+    setup, s = env
+    uid, tok, ids = _owner(setup, "me", "work")
+    _, other, other_ids = _owner(setup, "prankster", "all")
+    ident.add_member(setup, other_ids[0], uid, "read")
+    s.write(tok, body="apple\n", space="work")
+    s.write(other, body="apple\n", space_id=other_ids[0])
+    assert len(s.recall(tok, "apple", space="all")) == 2
+
+
+def test_an_alias_you_chose_is_your_word(env):
+    setup, s = env
+    uid, tok, ids = _owner(setup, "me", "work", "notes")
+    ident.create_alias(setup, uid, "all", ids[1])
+    with pytest.raises(SpaceAmbiguous):
+        s.recall(tok, "apple", space="all")

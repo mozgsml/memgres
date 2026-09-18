@@ -197,3 +197,17 @@ def test_nobody_else_gets_the_list_or_a_space_they_are_not_in(box):
     assert client.get("/ui/api/admin/spaces").status_code == 403
     assert client.get(f"/ui/api/spaces/{ids['hr']}").status_code == 404
     assert client.get(f"/ui/api/spaces/{ids['sales']}").json()["member"] is True
+
+
+def test_a_superadmin_asking_for_a_space_that_does_not_exist_gets_not_found(box):
+    client, cfg, _ = box
+    _superadmin(client, cfg)
+    assert client.get("/ui/api/spaces/7b0c3a1e-0000-4000-8000-000000000000").status_code == 404
+
+
+def test_the_list_of_every_space_says_when_it_is_cut(box, monkeypatch):
+    client, cfg, _ = box
+    _superadmin(client, cfg)
+    monkeypatch.setattr(memory, "MAX_EVERY_SPACE", 1)
+    got = client.get("/ui/api/admin/spaces").json()
+    assert len(got["spaces"]) == 1 and got["truncated"] is True
