@@ -4,11 +4,11 @@
 import { get, post, ApiError } from "./api.js";
 import { ago, fmtDate, nf, t } from "./i18n.js";
 import { VISUALIZERS } from "./viz.js";
-import { $, $$, autoSlots, esc, hexIcon, PALETTE, PALETTE_KEYS, reducedMotion, store, toast } from "./ui.js";
+import { $, $$, autoSlots, esc, fnv, hexIcon, PALETTE, PALETTE_KEYS, reducedMotion, store, toast } from "./ui.js";
 
 const LARGE = 60;          // above this many records the whole graph gets busy: suggest the local view
 const m = {
-  spaces: [], space: null, graph: null,
+  spaces: [], visiting: [], space: null, graph: null,
   T: new Map(), links: [], deg: new Map(), rootAuto: {}, spaceAuto: {}, byRecord: new Map(),
   selected: null, query: "", hits: null, scope: "all", depth: 1, vizId: store.get("memgres.viz") || "graph",
   ctl: null, ctxIds: new Set(), dismissed: new Set(), root: null, navigate: null, searchSeq: 0,
@@ -23,11 +23,13 @@ export async function renderMemory(root, ctx) {
   applyAreaText();
   const reload = ctx.forceReload;
   if (!m.loaded || reload) { await loadSpaces(); if (reload) m.graph = null; }
+  loadVisiting();
   const asked = new URLSearchParams(location.search).get("space");
+  if (asked && !known(asked) && isSuper()) await visit(asked);
   renderSpaceList();
-  if (asked && !m.spaces.some((s) => s.id === asked)) { showNoAccess(asked); return; }
+  if (asked && !known(asked)) { showNoAccess(asked); return; }
   const wanted = asked || store.get("memgres.space");
-  const target = m.spaces.find((s) => s.id === wanted) || [...m.spaces].sort(byRecords)[0];
+  const target = known(wanted) || [...m.spaces].sort(byRecords)[0];
   if (!target) { showEmpty(); return; }
   if (!m.space || m.space.id !== target.id || !m.graph) await openSpace(target);
   else { mountViz(); inspect(); }
@@ -36,12 +38,92 @@ export async function renderMemory(root, ctx) {
 // The sidebar's list of spaces, on every page — not only while memory is open.
 export async function sidebarSpaces(ctx) {
   m.navigate = ctx.navigate;
+  m.session = ctx.session;
+  loadVisiting();
   wireSidebar();
   if (!m.loaded || ctx.forceReload) { try { await loadSpaces(); } catch { return; } m.graph = null; }
   renderSpaceList();
 }
 
 const byRecords = (a, b) => b.records - a.records || a.name.localeCompare(b.name);
+
+// ─── spaces a superadmin opened by its role ──────────────────────────────────
+// Not a membership and nothing on the server: a list in this browser that
+// belongs to this panel session, so the next sign-in starts with only your own.
+const isSuper = () => m.session?.role === "superadmin";
+const known = (id) => id && (m.spaces.find((s) => s.id === id) || m.visiting.find((s) => s.id === id));
+const visitKey = () => `${m.session?.user?.id}|${m.session?.expires_at}`;
+
+function loadVisiting() {
+  let saved = null;
+  try { saved = JSON.parse(store.get("memgres.visiting") || "null"); } catch { /* ignore */ }
+  m.visiting = isSuper() && saved && saved.key === visitKey() && Array.isArray(saved.spaces) ? saved.spaces : [];
+}
+
+function saveVisiting() {
+  store.set("memgres.visiting", JSON.stringify({ key: visitKey(), spaces: m.visiting }));
+}
+
+async function visit(id) {
+  let meta;
+  try { meta = await get(`/spaces/${encodeURIComponent(id)}`); } catch { return null; }
+  if (meta.member) { m.loaded = false; await loadSpaces(); return known(id); }
+  const entry = { ...meta, visiting: true };
+  m.visiting = [entry, ...m.visiting.filter((s) => s.id !== id)].slice(0, 20);
+  saveVisiting();
+  return entry;
+}
+
+function forget(id) {
+  m.visiting = m.visiting.filter((s) => s.id !== id);
+  saveVisiting();
+  if (m.space?.id === id) { m.space = null; m.graph = null; m.navigate("/memory", { replace: true }); }
+  else renderSpaceList();
+}
+
+function openEverySpace() {
+  const veil = document.createElement("div");
+  veil.className = "veil";
+  veil.innerHTML = `<div class="dialog" role="dialog" aria-modal="true" aria-labelledby="as-title">
+    <h3 id="as-title">${esc(t("every.title"))}</h3>
+    <div class="filter" style="max-width:none"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.6" fill="none" stroke="#707aa0" stroke-width="1.6"/><path d="m10.4 10.4 3.4 3.4" stroke="#707aa0" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <input id="as-q" type="search" autocomplete="off" placeholder="${esc(t("every.search"))}" aria-label="${esc(t("every.search"))}"></div>
+    <div class="stack every-list" id="as-list"><p class="note">…</p></div>
+    <p class="note">${esc(t("every.note"))}</p>
+    <div class="row" style="justify-content:flex-end"><button type="button" class="btn quiet" data-x>${esc(t("common.cancel"))}</button></div>
+  </div>`;
+  document.body.append(veil);
+  const close = () => veil.remove();
+  veil.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+  veil.addEventListener("click", (e) => {
+    if (e.target === veil || e.target.closest("[data-x]")) return close();
+    const b = e.target.closest("[data-open]");
+    if (!b) return;
+    close();
+    $("#shell").classList.remove("drawer");
+    m.navigate(`/memory?space=${encodeURIComponent(b.dataset.open)}`);
+  });
+  let seq = 0, timer = null;
+  const load = async () => {
+    const my = ++seq, q = $("#as-q", veil).value.trim();
+    let rows;
+    try { rows = (await get(`/admin/spaces?q=${encodeURIComponent(q)}`)).spaces; } catch {
+      if (my === seq) $("#as-list", veil).innerHTML = `<p class="note">${esc(t("err.network"))}</p>`;
+      return;
+    }
+    if (my !== seq) return;
+    const mine = new Set(m.spaces.map((s) => s.id));
+    $("#as-list", veil).innerHTML = rows.length ? rows.map((s) => {
+      const c = PALETTE[fnv(s.name) % PALETTE.length];
+      return `<button class="item pick" data-open="${esc(s.id)}">${hexIcon(c, !mine.has(s.id), 16)}
+        <div class="grow"><b class="mono">${esc(s.name)}</b><small>${esc(t("every.row", { owner: s.owner.name || "—", members: s.members, records: t("mem.records", { n: s.records }) }))}</small></div>
+        ${mine.has(s.id) ? `<span class="perm read">${esc(t("every.yours"))}</span>` : ""}</button>`;
+    }).join("") : `<p class="note">${esc(t("every.none"))}</p>`;
+  };
+  $("#as-q", veil).addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(load, 220); });
+  $("#as-q", veil).focus();
+  load();
+}
 
 function buildArea(root) {
   root.dataset.built = "1";
@@ -138,6 +220,11 @@ function wireSidebar() {
     $("#shell").classList.remove("drawer");
     m.navigate(`/memory?space=${encodeURIComponent(b.dataset.space)}`);
   });
+  $("#spacelist").addEventListener("click", (e) => {
+    const x = e.target.closest("[data-forget]");
+    if (x) { e.preventDefault(); e.stopPropagation(); forget(x.dataset.forget); return; }
+    if (e.target.closest("[data-every]")) openEverySpace();
+  }, true);
   $("#space-filter").addEventListener("input", renderSpaceList);
 }
 
@@ -175,7 +262,7 @@ async function loadSpaces() {
   m.spaceAuto = autoSlots(m.spaces.map((s) => s.name));
 }
 
-const spaceColor = (s) => PALETTE[m.spaceAuto[s.name] ?? 0];
+const spaceColor = (s) => s.visiting ? PALETTE[fnv(s.name) % PALETTE.length] : PALETTE[m.spaceAuto[s.name] ?? 0];
 
 function renderSpaceList() {
   const q = $("#space-filter").value.trim().toLowerCase();
@@ -183,8 +270,13 @@ function renderSpaceList() {
   $("#space-filter-wrap").hidden = list.length <= 8;
   $("#spaces-total").textContent = nf(list.length);
   const shown = list.filter((s) => !q || s.name.toLowerCase().includes(q));
-  $("#spacelist").innerHTML = shown.map((s) => `<a class="spaceitem" role="listitem" href="/memory?space=${encodeURIComponent(s.id)}" data-space="${esc(s.id)}" style="--c:${spaceColor(s)}" aria-current="${m.space?.id === s.id}" title="${esc(s.name)}">${hexIcon(spaceColor(s), false, 16)}<span class="nm">${esc(s.name)}</span>${s.waiting ? `<span class="wait-dot" title="${esc(t("sp.waitingN", { n: s.waiting }))}">${nf(s.waiting)}</span>` : `<span class="ct">${nf(s.records)}</span>`}</a>`).join("")
-    || `<p class="side-empty">${esc(list.length ? t("side.noSpaces", { q }) : t("mem.noSpaces"))}</p>`;
+  const own = shown.map((s) => `<a class="spaceitem" role="listitem" href="/memory?space=${encodeURIComponent(s.id)}" data-space="${esc(s.id)}" style="--c:${spaceColor(s)}" aria-current="${m.space?.id === s.id}" title="${esc(s.name)}">${hexIcon(spaceColor(s), false, 16)}<span class="nm">${esc(s.name)}</span>${s.waiting ? `<span class="wait-dot" title="${esc(t("sp.waitingN", { n: s.waiting }))}">${nf(s.waiting)}</span>` : `<span class="ct">${nf(s.records)}</span>`}</a>`).join("")
+    || `<p class="side-empty">${esc(list.length ? t("side.noSpaces", { q }) : isSuper() ? t("every.noOwn") : t("mem.noSpaces"))}</p>`;
+  const visiting = (m.visiting || []).filter((s) => !q || s.name.toLowerCase().includes(q));
+  const role = visiting.length ? `<div class="sec-h visiting-h" title="${esc(t("every.groupWhy"))}"><span>${esc(t("every.group"))}</span></div>` + visiting.map((s) =>
+    `<a class="spaceitem visiting" role="listitem" href="/memory?space=${encodeURIComponent(s.id)}" data-space="${esc(s.id)}" style="--c:${spaceColor(s)}" aria-current="${m.space?.id === s.id}" title="${esc(t("every.itemWhy", { name: s.name }))}">${hexIcon(spaceColor(s), true, 16)}<span class="nm">${esc(s.name)}</span><button class="forget" data-forget="${esc(s.id)}" aria-label="${esc(t("every.forget", { name: s.name }))}">×</button></a>`).join("") : "";
+  const every = isSuper() ? `<button class="every-link" data-every>${esc(t("every.link"))}</button>` : "";
+  $("#spacelist").innerHTML = own + role + every;
   if (m.space) $("#mbar-space").innerHTML = `${hexIcon(spaceColor(m.space), false, 14)}${esc(m.space.name)}`;
 }
 
@@ -236,7 +328,7 @@ function showEmpty() {
   $("#q", m.root).disabled = true;
   $("#spacetitle", m.root).innerHTML = "";
   $("#viz-host", m.root).innerHTML = `<p class="viz-empty">${esc(t("mem.noSpaces"))}</p>`;
-  $("#inspector", m.root).innerHTML = `<p class="note">${esc(t("mem.noSpacesHelp"))}</p>`;
+  $("#inspector", m.root).innerHTML = `<p class="note">${esc(t(isSuper() ? "every.emptyHelp" : "mem.noSpacesHelp"))}</p>`;
 }
 
 async function openSpace(space) {
@@ -247,7 +339,7 @@ async function openSpace(space) {
   m.selected = null; m.query = ""; m.hits = null; m.scope = "all";
   $("#q", m.root).value = "";
   renderSpaceList();
-  $("#spacetitle", m.root).innerHTML = `${hexIcon(spaceColor(space), false, 20)}<h1>${esc(space.name)}</h1><small>${esc(t("mem.records", { n: space.records }))}</small><span class="perm-badge">${esc(t("perm." + space.permission))}</span>`;
+  $("#spacetitle", m.root).innerHTML = `${hexIcon(spaceColor(space), false, 20)}<h1>${esc(space.name)}</h1><small>${esc(t("mem.records", { n: space.records }))}</small>${space.visiting ? `<span class="perm-badge role" title="${esc(t("every.groupWhy"))}">${esc(t("every.badge"))}</span>` : `<span class="perm-badge">${esc(t("perm." + space.permission))}</span>`}`;
   $("#viz-host", m.root).innerHTML = `<p class="viz-empty">${esc(t("mem.loading"))}</p>`;
   try {
     m.graph = await get(`/spaces/${encodeURIComponent(space.id)}/graph`);
@@ -507,7 +599,7 @@ async function inspect() {
       <div class="row">
         ${m.space.permission === "admin" ? `<a class="btn" href="/space?id=${encodeURIComponent(m.space.id)}">${esc(t("insp.members"))}${m.space.waiting ? ` <span class="badge">${nf(m.space.waiting)}</span>` : ""}</a>` : ""}
         <button class="btn quiet" data-sp="link">${esc(t("insp.copyLink"))}</button>
-        ${m.space.mine ? "" : `<button class="btn quiet" data-sp="leave">${esc(t("sp.leave"))}</button>`}
+        ${m.space.mine || m.space.visiting ? "" : `<button class="btn quiet" data-sp="leave">${esc(t("sp.leave"))}</button>`}
       </div>
       <p class="note">${esc(t("insp.spaceNote"))}</p>`;
     return;

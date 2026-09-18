@@ -40,6 +40,50 @@ def spaces(conn, user_id: str) -> list:
              "records": counts.get(r["id"], 0), "waiting": waiting.get(r["id"], 0)} for r in rows]
 
 
+def every_space(conn, q: str = "") -> list:
+    """Every namespace on the deployment, for a superadmin choosing one to open:
+    name, owner, how many records and members. Metadata only."""
+    q = (q or "").strip()[:200]
+    where, params = "", {}
+    if q:
+        where = "WHERE n.name ILIKE %(q)s OR u.name ILIKE %(q)s OR u.full_name ILIKE %(q)s"
+        params["q"] = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT n.id::text, n.name, n.description, u.id::text, "
+            "       COALESCE(NULLIF(u.full_name, ''), NULLIF(u.name, ''), u.email), "
+            "       (SELECT count(*) FROM namespace_member m WHERE m.namespace_id = n.id) "
+            f"FROM namespace n JOIN app_user u ON u.id = n.owner_user_id {where} "
+            "ORDER BY lower(n.name), n.id LIMIT 1000", params)
+        rows = cur.fetchall()
+        ids = [r[0] for r in rows]
+        counts = {}
+        if ids:
+            w, prm = build_filters(ids, None, None)
+            cur.execute(f"SELECT namespace, count(*) FROM memory WHERE {w} GROUP BY namespace", prm)
+            counts = {str(ns): n for ns, n in cur.fetchall()}
+    return [{"id": i, "name": n, "description": d, "owner": {"id": oid, "name": oname},
+             "members": mc + 1, "records": counts.get(i, 0)} for i, n, d, oid, oname, mc in rows]
+
+
+def one_space(conn, principal, space_id: str) -> dict:
+    """What the sidebar needs to show a space the caller opened by id — for a
+    superadmin, one it reaches by its role rather than as a member."""
+    with conn.transaction():
+        nsid, _perm = identity.resolve_space(conn, principal, space_id=space_id)
+    membership = identity.reaches(conn, principal.user_id, nsid) if principal.user_id else None
+    where, params = build_filters([nsid], None, None)
+    with conn.cursor() as cur:
+        cur.execute("SELECT name, description, owner_user_id::text FROM namespace WHERE id = %s", (nsid,))
+        name, desc, owner = cur.fetchone()
+        cur.execute(f"SELECT count(*) FROM memory WHERE {where}", params)
+        records = cur.fetchone()[0]
+    return {"id": nsid, "name": name, "description": desc, "records": records,
+            # not a member: the role reaches it, and a superadmin administers any space
+            "permission": membership or "admin", "member": membership is not None,
+            "mine": owner == principal.user_id, "alias": None, "waiting": 0}
+
+
 def graph(conn, principal, space_id: str) -> dict:
     """Every live record of one space — path, title, tags, when it changed —
     and the links between them. No bodies: the shape, not the content."""
@@ -99,6 +143,23 @@ def mount(app, cfg, pool, panel, make_store) -> None:
         s, _ = _reader(request)
         with pool.connection() as conn:
             return {"spaces": spaces(conn, s.user_id)}
+
+    @app.get("/ui/api/spaces/{space_id}")
+    def space_meta(space_id: str, request: Request):
+        """One space by id. A member gets what the sidebar shows; a superadmin
+        gets any space — its role reads every one; anyone else: not found."""
+        _, p = _reader(request)
+        with pool.connection() as conn:
+            return _guard(lambda: one_space(conn, p, identity._as_uuid(space_id)))
+
+    @app.get("/ui/api/admin/spaces")
+    def all_spaces(request: Request, q: str = ""):
+        s = panel["session"](request)
+        if s.role != "superadmin":
+            # a user manager administers accounts, not what is inside spaces
+            raise HTTPException(403, "superadmins only")
+        with pool.connection() as conn:
+            return {"spaces": every_space(conn, q)}
 
     @app.get("/ui/api/spaces/{space_id}/graph")
     def space_graph(space_id: str, request: Request):

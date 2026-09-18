@@ -419,3 +419,16 @@ a.person:hover { color: var(--focus); box-shadow: inset 0 -1px 0 var(--focus); }
   .act-split { grid-template-columns: 1fr; }
   .bar { grid-template-columns: minmax(0, 100px) minmax(0, 1fr) auto; }
 }
+
+/* spaces a superadmin opened by its role, not as a member */
+.visiting-h { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); color: var(--admin); }
+.spaceitem.visiting { grid-template-columns: 18px minmax(0, 1fr) auto; }
+.spaceitem.visiting .nm { color: var(--muted); font-style: italic; }
+.spaceitem.visiting[aria-current="true"] .nm { color: var(--bright); }
+.spaceitem .forget { border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 15px; line-height: 1; padding: 0 2px; border-radius: 5px; }
+.spaceitem .forget:hover { color: var(--bright); background: var(--panel); }
+.every-link { margin: 8px 8px 4px; justify-self: start; border: 0; background: none; padding: 2px 0; color: var(--admin); cursor: pointer; font-size: 12.5px; text-decoration: underline; text-underline-offset: 3px; text-decoration-color: rgba(255,162,76,.4); }
+.every-link:hover { text-decoration-color: var(--admin); }
+.perm-badge.role { color: var(--admin); box-shadow: inset 0 0 0 1px rgba(255,162,76,.45); }
+.every-list { max-height: min(60vh, 520px); overflow: auto; }
+.shell.collapsed .visiting-h, .shell.collapsed .every-link, .shell.collapsed .spaceitem .forget { display: none; }

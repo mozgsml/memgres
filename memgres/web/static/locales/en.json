@@ -375,5 +375,19 @@
  "sp.transferConfirmKeep": "Hand {space} to {name}? You stay as an admin.",
  "sp.transferred": "{name} now owns the space",
  "sp.lapsed": "won’t apply",
- "sp.lapsedWhy": "The person who sent it no longer runs this space. Cancel it and invite again."
+ "sp.lapsedWhy": "The person who sent it no longer runs this space. Cancel it and invite again.",
+ "every.link": "All spaces…",
+ "every.title": "All spaces on this server",
+ "every.search": "Space or owner",
+ "every.row": "owner {owner} · {members} people · {records}",
+ "every.yours": "yours",
+ "every.none": "No space matches.",
+ "every.note": "You can open any space by your superadmin role, without becoming a member. It appears in the sidebar under your own until you sign out.",
+ "every.group": "Opened as superadmin",
+ "every.groupWhy": "You are not a member of these spaces: your superadmin role lets you read them. They stay here until you sign out.",
+ "every.itemWhy": "{name} — not your space; opened by your superadmin role",
+ "every.forget": "Remove {name} from the sidebar",
+ "every.badge": "superadmin",
+ "every.noOwn": "You are not a member of any space yet.",
+ "every.emptyHelp": "As a superadmin you can open any space on this server: “All spaces…” in the sidebar."
 }

@@ -168,3 +168,32 @@ def test_a_scoped_member_reads_a_shared_space(box):
     names = {s["name"]: s["permission"] for s in client.get("/ui/api/spaces").json()["spaces"]}
     assert names == {"sales": "admin", "hr": "read"}
     assert client.get(f"/ui/api/spaces/{ids['hr']}/graph").json()["total"] == 1
+
+
+# ─── a superadmin opens any space ────────────────────────────────────────────
+def _superadmin(client, cfg):
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        uid = identity.create_user(conn, name="boss", role="superadmin")
+    _as(client, cfg, uid)
+    return uid
+
+
+def test_a_superadmin_lists_and_opens_any_space_it_is_not_in(box):
+    client, cfg, ids = box
+    _superadmin(client, cfg)
+    assert client.get("/ui/api/spaces").json()["spaces"] == []          # its own: none
+    listed = {s["name"]: s for s in client.get("/ui/api/admin/spaces").json()["spaces"]}
+    assert set(listed) == {"sales", "hr"} and listed["sales"]["records"] == 3
+    assert [s["name"] for s in client.get("/ui/api/admin/spaces?q=hr").json()["spaces"]] == ["hr"]
+    meta = client.get(f"/ui/api/spaces/{ids['hr']}").json()
+    assert meta["member"] is False and meta["name"] == "hr"
+    assert client.get(f"/ui/api/spaces/{ids['hr']}/graph").json()["total"] == 1
+    assert client.get(f"/ui/api/spaces/{ids['hr']}/search?q=vacation").json()["hits"]
+
+
+def test_nobody_else_gets_the_list_or_a_space_they_are_not_in(box):
+    client, cfg, ids = box
+    _as(client, cfg, ids["mark"])
+    assert client.get("/ui/api/admin/spaces").status_code == 403
+    assert client.get(f"/ui/api/spaces/{ids['hr']}").status_code == 404
+    assert client.get(f"/ui/api/spaces/{ids['sales']}").json()["member"] is True
