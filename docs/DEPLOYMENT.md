@@ -50,6 +50,25 @@ For ~100+ clients, separate the tiers — see `deploy/docker-compose.yml`:
 Why this scales where per-client stdio doesn't: N clients share one pool and a
 fixed worker pool, instead of N processes each polling the DB and embedding.
 
+### The web panel
+
+The panel is part of `memgres-server` (`MEMGRES_WEB_ENABLED=true`), so it runs
+wherever the API tier runs — as a replica like any other. Sessions live in
+Postgres, so any replica serves any browser. Three things to know when it faces
+people ([docs/WEB.md](WEB.md) has the rest):
+
+- `MEMGRES_PUBLIC_URL` is required: it is the only origin state-changing calls
+  are accepted from and the base of the OIDC redirect URI.
+- Behind a reverse proxy, set `MEMGRES_FORWARDED_ALLOW_IPS` to the proxy's
+  address, or every visitor looks like the proxy.
+- Sign-in throttles are per process. With several replicas — and in any case on
+  a public address — rate-limit `/ui/api/session/token` and `/ui/auth/` at the
+  proxy as well.
+
+MCP and the panel are different processes (`memgres-mcp` and `memgres-server`).
+Behind one host name, route `/mcp` to the MCP port and everything else to the
+API/panel port.
+
 ## Sizing & knobs
 
 | Concern | Knob |

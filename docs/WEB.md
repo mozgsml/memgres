@@ -1,8 +1,10 @@
 # The web panel
 
 A browser view of memory for people: sign in, look through the spaces you can
-reach as a graph or a tree, search, open a record and see what links to it —
-and issue tokens for your own AI clients without asking an administrator.
+reach as a graph or a tree, search, open a record and see what links to it and
+who wrote it — issue tokens for your own AI clients, and run your spaces'
+members, without asking an administrator. Administrators get the sign-in queue
+and a directory of people.
 
 The panel **reads memory only**. Writing stays with agents (MCP) and the REST
 API. What it does change is who may reach memory: the members of a space, and —
@@ -80,6 +82,8 @@ token that does not exist.
   as a tree. Select a record to fade everything unrelated; switch to the local
   view to see only its neighbours up to three steps away, with the path back to
   the root. Search uses the server's recall, lexical or semantic as configured.
+  A record shows its history: who changed it and when, each name opening that
+  person's page.
 - **Tokens** (Account → Tokens). A token for each device or client, with:
   - access `read` or `write` — never `admin`: an admin-ceiling token can mint
     more tokens, so a leaked one could not be contained by revoking it;
@@ -136,8 +140,9 @@ records, searchable by name or owner. Opening one — or following a link to one
 puts it in a separate group, **Opened as superadmin**, drawn with a dashed
 outline and marked in the space's title: it is not theirs, and nothing on the
 server records that they looked. The group lasts until they sign out — signing
-out clears it from the browser too — or until they remove a space with ×. Nothing becomes a membership. A user manager has
-no such list: that role administers accounts, not what is inside spaces.
+out clears it from the browser too — or until they remove a space with ×.
+Nothing becomes a membership. A user manager has no such list: that role
+administers accounts, not what is inside spaces.
 
 There is no list of spaces a person cannot open. Someone who follows a space's
 link without access sees *You can't open this space* — the same for a space that
@@ -218,6 +223,9 @@ switched off.
 - Rate-limit `/ui/api/session/token` and `/ui/auth/` at the proxy.
 - Serve the panel on its own host name (or at least not next to other
   applications on the same origin): cookies and CSP are per origin.
+- MCP is a different process (`memgres-mcp`, port 8765). To serve both on one
+  host name, route `/mcp` to it and everything else to the panel — and set
+  `MEMGRES_MCP_PUBLIC_URL` to that `/mcp` address so the token dialog shows it.
 
 ## Languages
 

@@ -263,7 +263,8 @@ Tools:
   `space_id`; the id-addressed ones also take `at` (a path);
 - `memory_whoami` — what THIS credential may do, as capabilities. Effective, not
   aspirational: a superadmin holding a scoped or read-only token is told it
-  cannot provision with it, because it cannot;
+  cannot provision with it, because it cannot. A superadmin with an unscoped
+  credential also gets a `search_hint`: `all` is its own namespaces, `*` all;
 - `memory_list_spaces` — your reachable namespaces (id, name, permission, alias);
 - `memory_create_space` / `memory_set_alias` / `memory_drop_alias` — make one,
   and give it a name of your own;
@@ -306,11 +307,17 @@ rather than hidden. The list is computed when the client lists, so rights
 changed mid-session appear the next time it does; the call path re-authorizes
 every time regardless. `MEMGRES_MCP_TOOL_VISIBILITY=off` lists everything.
 
-A web panel gets the same answer in its own shape: `whoami` returns the
-capabilities, and the panel renders its controls from them — one computation,
-two interfaces.
+The web panel ([docs/WEB.md](WEB.md)) chooses what to show from the session's
+role and the space's permission, and every change it makes goes through the same
+service layer (`memgres.admin`) — so, as here, what it shows is display and what
+it does is authorized on the call.
 
 ## Sharing a namespace (request-access)
+
+In the web panel this is a link: someone who opens a space they cannot reach is
+offered "Ask for access", and the space's administrators decide on its Members &
+access page — which also adds people by email ([docs/WEB.md](WEB.md#members-of-a-space)).
+Over the API:
 
 Someone wants into a namespace they don't own:
 

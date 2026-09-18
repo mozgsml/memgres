@@ -34,6 +34,12 @@ services:
       MEMGRES_DATABASE_URL: postgresql://memgres:memgres@db:5432/memgres
       # only used when MEMGRES_VECTOR_BACKEND=qdrant (start with --profile qdrant)
       QDRANT_URL: http://qdrant:6333
+      # the web panel (docs/WEB.md) — served by this same service at / :
+      # MEMGRES_KEY_MODE: managed
+      # MEMGRES_WEB_ENABLED: "true"
+      # MEMGRES_PUBLIC_URL: https://memory.example.com
+      # MEMGRES_MCP_PUBLIC_URL: https://memory.example.com/mcp
+      # MEMGRES_OIDC_CONFIG: /etc/memgres/providers.toml   # sign-in providers, docs/OIDC.md
     env_file:
       - path: .env          # optional: your MEMGRES_* overrides
         required: false
