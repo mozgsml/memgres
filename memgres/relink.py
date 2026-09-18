@@ -20,6 +20,12 @@ _log = logging.getLogger("memgres.relink")
 
 BATCH = 500
 
+# One rebuild at a time across processes. Two servers starting together (the MCP
+# door and the REST/panel door) both found the flag clear and rebuilt at once,
+# and one of them died on the other's rows. A session-level advisory lock: held
+# for the rebuild, gone with the connection if the process is.
+LOCK_KEY = 0x6D656D67_6C6E6B   # "memglnk"
+
 
 class _NoEmbedder:
     """Stands in for an embedder so `Store` does not build the real one. The
@@ -55,11 +61,32 @@ def rebuild(conn, cfg, *, force: bool = False) -> int:
     the flag false — so the server came up serving a link graph that was perfectly
     empty while saying it had built one. Owning the commit here means the work is
     durable when this returns, whatever the caller does next."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_KEY,))
+        mine = cur.fetchone()[0]
+    if not mine:
+        conn.commit()
+        _log.info("the link index is being rebuilt by another process; not starting a second pass")
+        return 0
+    try:
+        return _rebuild(conn, cfg, force=force)
+    finally:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
+            conn.commit()
+        except Exception:          # a broken connection releases the lock by closing
+            pass
+
+
+def _rebuild(conn, cfg, *, force: bool) -> int:
     from .store import Store
     with conn.cursor() as cur:
+        # read under the lock: another process may have just finished
         cur.execute("SELECT links_built FROM memgres_meta")
         row = cur.fetchone()
         if row and row[0] and not force:
+            conn.commit()
             return 0
 
     # `_sync_links` touches neither embeddings nor vectors; passing a

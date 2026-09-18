@@ -5,6 +5,20 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.13.2] — 2026-09-18
+
+### Fixed
+- **The link graph is no longer rebuilt at every start.** Migration `0023` was
+  meant to ask for one rebuild after the parser fix, but migrations run at every
+  start and it cleared the "built" flag each time — since 0.12.0 every server
+  start re-derived every link. With the panel, two servers start together (MCP
+  and REST), both rebuilt at once, and one failed with a duplicate key (the
+  graph itself stayed correct: both derive the same edges). The flag is now
+  cleared once, marked by `memgres_meta.relinked_after_0023`; and a rebuild
+  takes a database advisory lock, so a second process skips instead of racing.
+- **The search results header stays in view** — the query and × no longer
+  scroll away with a long list.
+
 ## [0.13.1] — 2026-09-18
 
 What the first days of the panel on a real deployment turned up, plus the

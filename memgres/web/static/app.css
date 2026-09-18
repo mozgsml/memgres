@@ -487,3 +487,5 @@ a.person:hover { color: var(--focus); box-shadow: inset 0 -1px 0 var(--focus); }
 .node.hubnode .halo { opacity: .12; stroke-width: 18; }
 .node.hubnode.sel .halo { opacity: .22; }
 @media (prefers-reduced-motion: reduce) { .spinner, .search.busy::before { animation-duration: 2.4s; } }
+/* the results header — the query and × — stays put while the list scrolls under it */
+.results > .res-head { position: sticky; top: -14px; z-index: 2; margin: -14px -14px 0; padding: 14px 14px 10px; background: var(--panel); border-radius: 14px 14px 0 0; box-shadow: 0 1px 0 var(--line-soft); }

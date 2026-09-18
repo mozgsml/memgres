@@ -778,3 +778,31 @@ def test_an_expired_referrer_is_left_alone(monkeypatch):
         body, seq = cur.fetchone()
     assert body == "see [[ops.a]]" and seq == 1
     conn.close()
+
+
+def test_starting_again_does_not_clear_the_flag(store):
+    """Migrations run at every start. The one that asked for a rebuild after the
+    parser fix used to clear the flag every time, so every start rebuilt the
+    whole graph — and two servers starting together raced on it."""
+    from memgres.relink import rebuild
+    store.write(body="see [[ops.deploy]]", path="notes.a")
+    rebuild(store._conn, store.cfg, force=True)
+    with psycopg.connect(DSN) as conn:
+        migrate(conn, store.cfg)
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("SELECT links_built FROM memgres_meta")
+            assert cur.fetchone()[0] is True
+
+
+def test_a_second_process_does_not_rebuild_alongside_the_first(store):
+    from memgres.relink import LOCK_KEY, rebuild
+    store.write(body="see [[ops.deploy]]", path="notes.a")
+    with store._conn.cursor() as cur:
+        cur.execute("UPDATE memgres_meta SET links_built = false")
+    store._conn.commit()
+    with psycopg.connect(DSN, autocommit=True) as other:
+        other.execute("SELECT pg_advisory_lock(%s)", (LOCK_KEY,))       # "another server is rebuilding"
+        assert rebuild(store._conn, store.cfg) == 0                      # skips, no error
+        other.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
+    assert rebuild(store._conn, store.cfg) == 1                          # and runs once it is free
