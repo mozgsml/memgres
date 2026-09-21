@@ -7,6 +7,16 @@ patch = fixes).
 
 ## [Unreleased]
 
+### Changed
+- **Asking for a space of your own no longer hands you one you already had.**
+  `memory_create_space` (and `POST /spaces`, and the panel's button) refused
+  nothing when the name was taken: it returned the existing space, with the
+  `description` and `instruction` you passed silently dropped, which is
+  indistinguishable from having created it. It now refuses and names that
+  space, so a retry after a dropped connection still gets an answer. The
+  administrative door keeps the old behaviour on purpose — a provisioning
+  script must be re-runnable.
+
 ### Added — the panel takes people on
 - **Administrators create a person** (Admin → People → New person), without
   waiting for a sign-in: name, email, department, position. The account starts

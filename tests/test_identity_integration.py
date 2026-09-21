@@ -590,3 +590,24 @@ def test_a_shared_namespace_counts_as_reachable(conn):
 
     nsid, perm = ident.resolve_space(conn, p, for_write=True)
     assert nsid == ns and perm == "write"               # membership, not admin
+
+
+def test_the_self_service_door_refuses_a_name_you_already_own(conn):
+    """`create_namespace` is an idempotent upsert so provisioning scripts can be
+    re-run; asking for a space of your own is not that. Being handed the space
+    you already had — with the description you passed silently dropped — reads
+    as success, which is the failure this refusal prevents."""
+    uid = ident.create_user(conn, can_create_namespace=True)
+    secret, _ = ident.issue_token(conn, uid, permission="write")
+    p = ident.resolve(conn, cfg(conn), secret)
+    nsid = ident.create_own_namespace(conn, p, "notes", description="first")
+
+    with pytest.raises(ident.SpaceAmbiguous, match=nsid):
+        ident.create_own_namespace(conn, p, "notes", description="second")
+    # nothing changed: no second space, and the first kept its description
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, description FROM namespace WHERE owner_user_id=%s", (uid,))
+        assert [(str(i), d) for i, d in cur.fetchall()] == [(nsid, "first")]
+
+    # the provisioning door is unchanged — it still hands back the same space
+    assert ident.create_namespace(conn, uid, "notes") == nsid

@@ -718,7 +718,11 @@ def build_server(cfg: Optional[Config] = None):
         """Create a namespace of your own. Nothing creates one implicitly, so a
         mistyped `space` is an error rather than a new empty space your write
         silently lands in. `description` says what belongs here and `instruction`
-        tells an agent how to use it. Needs the right to create namespaces."""
+        tells an agent how to use it. Needs the right to create namespaces.
+
+        A name you already own is refused, and the error names that space: this
+        never hands you an existing namespace as if it were new. To change what
+        an existing one says, edit it instead of creating it again."""
         with pool.connection() as conn, conn.transaction():
             nsid = identity.create_own_namespace(
                 conn, _principal(conn, _token(ctx)), name,

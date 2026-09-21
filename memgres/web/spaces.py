@@ -279,16 +279,9 @@ def create_own(conn, p, *, name: str, description: str) -> dict:
     description = (description or "").strip()[:500]
     if p.user_id is None:
         raise Refused(409, "the administrator token has no account to own a space")
-    # `identity.create_namespace` is an upsert: the same name gives the same
-    # space back. That is right for a provisioning script and wrong for a button
-    # — someone would click Create and be shown a space they already had.
-    with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM namespace WHERE owner_user_id = %s AND name = %s", (p.user_id, name))
-        if cur.fetchone():
-            raise Refused(409, "you already have a space with this name")
     try:
         nsid = identity.create_own_namespace(conn, p, name, description=description)
-    except identity.SpaceAmbiguous as e:      # the name is taken, or the cap is reached
+    except identity.SpaceAmbiguous as e:      # a name you already own, or the cap
         raise Refused(409, str(e)) from None
     except identity.AuthError as e:
         raise Refused(403, str(e)) from None

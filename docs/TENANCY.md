@@ -76,7 +76,11 @@ Every read/write API takes optional `space` and `space_id`. **Nothing is created
 by being addressed**: a name that matches nothing is an error, so a typo is a
 mistake rather than a new, empty, plausible-looking space your write lands in.
 Ask for one with `POST /spaces` (`memory_create_space`), which needs the right to
-create namespaces.
+create namespaces. A name you already own is **refused**, and the error names
+that space: asking to create is never answered with something that already
+existed. The administrative door (`POST /admin/namespaces`, the CLI) is the
+exception — there the same name hands back the same space on purpose, so a
+provisioning script can be re-run.
 
 ### When a name means two things
 

@@ -1006,6 +1006,10 @@ def create_own_namespace(conn, principal: Principal, name: str, *,
     had worked. Creation is now something you ask for, which makes a typo an
     error rather than a place — and gives the `can_create_namespace` right a
     single point to be enforced at.
+
+    Unlike :func:`create_namespace`, which the provisioning doors call and which
+    hands back an existing space of the same name so a script can be re-run,
+    this door REFUSES that name: whoever called it asked for a new space.
     """
     if principal.user_id is None:
         if not principal.provisional:
@@ -1027,6 +1031,21 @@ def create_own_namespace(conn, principal: Principal, name: str, *,
     if not can_create_namespace(conn, principal):
         raise AuthError("you may not create namespaces — ask an admin to create "
                         "one for you or share theirs")
+    # `create_namespace` is an idempotent upsert, which is right for the
+    # provisioning doors (a script must be re-runnable) and wrong for this one.
+    # Here the caller is an agent or a person who said "create", and being
+    # handed a space they already had — with `description` and `instruction`
+    # silently NOT applied, because the upsert does nothing on conflict — looks
+    # exactly like success. The refusal names the space, so a retry after a
+    # dropped connection is answered rather than left to guess.
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM namespace WHERE owner_user_id=%s AND name=%s",
+                    (principal.user_id, name))
+        row = cur.fetchone()
+    if row is not None:
+        raise SpaceAmbiguous(
+            f"you already own a namespace called '{name}' ({row[0]}) — write to "
+            f"it, or pick another name")
     # the alias collision and the per-account cap are enforced in
     # `create_namespace`, so every door gets them
     return create_namespace(conn, principal.user_id, name,
