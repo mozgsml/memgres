@@ -5,7 +5,11 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
-## [Unreleased]
+## [0.14.0] — 2026-09-21
+
+The panel stops being read-only about *people*: administrators take accounts on,
+hand out tokens and the right to own a space, and whoever has that right makes
+one from the sidebar. One behaviour change in the core came out of it.
 
 ### Changed
 - **Asking for a space of your own no longer hands you one you already had.**
