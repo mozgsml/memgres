@@ -24,6 +24,9 @@ patch = fixes).
 - **A person's page shows their latest edits**, each one opening the record —
   but only the records the viewer may read, so the page never leaks the shape of
   a space they cannot reach. Their activity chart counts the same way.
+- **A token an administrator mints for someone counts against that person's
+  cap** of 50 live tokens, as their own tokens do — found by the security
+  review of this batch, which reported no high-severity finding.
 - **Connecting a client is explained beside the tokens**: three steps and tabs
   for Claude Code, Cursor, Codex and OpenCode, filled in with this server's MCP
   address.

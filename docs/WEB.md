@@ -106,7 +106,10 @@ token that does not exist.
   the sidebar. They own what they make and decide who else gets in; the panel
   itself still only reads memory, so the space starts empty and fills up through
   an agent's token. Without the right the button is absent and the endpoint
-  refuses — administrators have it always.
+  refuses — administrators have it always. Granting it hands over one more
+  thing worth knowing: the owner of a space adds people to it by email, and the
+  member list then shows whether that address has an account here — throttled,
+  but an oracle all the same.
 - **Sign-in methods** (Account). Link another provider, or unlink one — not the
   last.
 - **Language** (Account → Profile, and on the sign-in page). Otherwise the
@@ -195,7 +198,13 @@ Administrators (`user_manager`, `superadmin`) also see **Admin**:
 
 What someone wrote — the chart and the recent edits on their page — is shown
 only where the viewer can read too: a superadmin reads every space, everyone
-else, a user manager included, only the spaces they are in.
+else, a user manager included, only the spaces they are in. That is a rule about
+what the page displays, not a wall around the role: an administrator who may
+issue a token *for* someone can then read whatever that someone reads — see
+[docs/TENANCY.md](TENANCY.md) on what a user manager amounts to. The secret of
+a token minted here is shown in the panel even where `MEMGRES_TOKEN_SINK` is
+set: the sink keeps secrets out of agent transcripts, and this reader is a
+person looking at a dialog that says "copy it now".
 
 The control plane's rules apply unchanged: a `user_manager` cannot act on — or
 see the tokens and sign-in methods of — an administrator's account, only a

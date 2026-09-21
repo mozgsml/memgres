@@ -402,7 +402,7 @@
  "people.issueTokenFor": "A token for {name}",
  "people.issueTokenNote": "For a person who has not signed in yet or a service that only uses tokens. You will see the secret once — hand it over yourself. People who sign in can make their own tokens.",
  "people.canCreate": "Can create own spaces",
- "people.canCreateNote": "Lets this person make spaces of their own (over MCP or the API). Existing spaces are not affected.",
+ "people.canCreateNote": "Lets this person make spaces of their own (over MCP, the API or the panel). They own what they make: they can add people to it by email, which confirms whether an address has an account here. Existing spaces are not affected.",
  "people.allowed": "allowed",
  "people.notAllowed": "not allowed",
  "people.canCreateOn": "{name} can now create spaces",

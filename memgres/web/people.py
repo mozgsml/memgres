@@ -12,8 +12,10 @@ Who sees what:
 * **what someone wrote** — the activity chart and the list of recent edits —
   is only ever shown where the VIEWER can read too: a superadmin reads every
   space, everyone else (a user_manager included) only the spaces they are in.
-  An administrator looking after accounts does not thereby get a window into
-  spaces they cannot open;
+  so the PAGE never displays records from a space the viewer cannot open.
+  That is a rule about this page, not a containment guarantee about the role:
+  an administrator who can mint a token FOR someone can read what that someone
+  reads, which docs/TENANCY.md states outright;
 * **anyone else** — not found. There is no directory for ordinary users.
 
 Activity is writes only, taken from memory history: what someone created,
@@ -358,8 +360,15 @@ def issue_for(conn, p, user_id: str, *, label: str, permission: str,
     (read or write, always expiring, optionally one of their spaces), minted by
     an administrator for an account that cannot do it itself: a service, or
     someone who has not signed in yet. The secret is shown once, to the
-    administrator, who hands it over."""
-    from .tokens import EXPIRY_CHOICES, MAX_LABEL, PERMISSIONS
+    administrator, who hands it over — the same exemption from
+    ``MEMGRES_TOKEN_SINK`` the self-service door takes, and for the same reason:
+    the sink keeps secrets out of *agent* transcripts, and the reader here is a
+    human looking at a dialog that says "copy it now".
+
+    The cap on live tokens is the account's, not the issuer's: an administrator
+    minting for someone cannot fill the table past what that person could fill
+    it to themselves."""
+    from .tokens import EXPIRY_CHOICES, MAX_LABEL, MAX_LIVE_TOKENS, PERMISSIONS
     user_id = _uuid(user_id)
     label = (label or "").strip()
     if len(label) > MAX_LABEL:
@@ -376,6 +385,11 @@ def issue_for(conn, p, user_id: str, *, label: str, permission: str,
         cur.execute("SELECT 1 FROM app_user WHERE id = %s", (user_id,))
         if cur.fetchone() is None:
             raise Refused(404, "not found")
+        cur.execute("SELECT count(*) FROM token WHERE user_id = %s AND revoked_at IS NULL "
+                    "AND (expires_at IS NULL OR expires_at > now())", (user_id,))
+        if cur.fetchone()[0] >= MAX_LIVE_TOKENS:
+            raise Refused(409, f"that account already has {MAX_LIVE_TOKENS} active tokens — "
+                               "revoke some it no longer uses")
     out = _guard(lambda: admin.issue_token(conn, p, user_id=user_id, namespace_id=namespace_id or None,
                                            permission=permission, label=label, expires_days=expires_days,
                                            defer_delivery=True))

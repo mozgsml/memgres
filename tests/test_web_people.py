@@ -645,3 +645,17 @@ def test_an_administrator_always_may_make_a_space(box):
     h = _as(client, cfg, ids["mgr"])
     assert client.get("/ui/api/session").json()["can"]["create_space"] is True
     assert client.post("/ui/api/spaces", json={"name": "handbook"}, headers=h).status_code == 201
+
+
+def test_an_administrator_cannot_mint_past_the_accounts_token_cap(box, monkeypatch):
+    # the cap is the account's, so an administrator minting for someone fills
+    # the table no further than that person could themselves
+    import memgres.web.tokens as wt
+    monkeypatch.setattr(wt, "MAX_LIVE_TOKENS", 2)
+    client, cfg, _, ids = box
+    h = _as(client, cfg, ids["mgr"])
+    body = {"permission": "read", "expires_days": 30}
+    for _ in range(2):
+        assert client.post(f"/ui/api/admin/people/{ids['ivan']}/tokens", json=body, headers=h).status_code == 201
+    r = client.post(f"/ui/api/admin/people/{ids['ivan']}/tokens", json=body, headers=h)
+    assert r.status_code == 409 and "2 active tokens" in r.text
