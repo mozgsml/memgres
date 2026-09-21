@@ -616,3 +616,32 @@ def test_an_administrator_issues_a_token_for_someone(box):
     # and a user manager cannot mint one for an administrator
     assert client.post(f"/ui/api/admin/people/{ids['boss']}/tokens",
                        json={"permission": "read", "expires_days": 30}, headers=h).status_code == 403
+
+
+# ─── a space of one's own ────────────────────────────────────────────────────
+def test_only_someone_granted_the_right_makes_a_space(box):
+    client, cfg, _, ids = box
+    h = _as(client, cfg, ids["ivan"])
+    assert client.get("/ui/api/session").json()["can"]["create_space"] is False
+    assert client.post("/ui/api/spaces", json={"name": "ivans"}, headers=h).status_code == 403
+
+    admin_h = _as(client, cfg, ids["mgr"])
+    client.post(f"/ui/api/admin/people/{ids['ivan']}/can-create-spaces", json={"allowed": True}, headers=admin_h)
+
+    h = _as(client, cfg, ids["ivan"])
+    assert client.get("/ui/api/session").json()["can"]["create_space"] is True
+    r = client.post("/ui/api/spaces", json={"name": "ivans", "description": "mine"}, headers=h)
+    assert r.status_code == 201, r.text
+    got = client.get("/ui/api/spaces").json()["spaces"]
+    assert [(s["name"], s["permission"], s["mine"]) for s in got] == [("ivans", "admin", True)]
+    # the panel still only reads memory: the new space is empty and stays that way here
+    assert client.get(f"/ui/api/spaces/{r.json()['id']}/graph").json()["total"] == 0
+    assert client.post("/ui/api/spaces", json={"name": "ivans"}, headers=h).status_code == 409   # same name
+    assert client.post("/ui/api/spaces", json={"name": "  "}, headers=h).status_code == 422
+
+
+def test_an_administrator_always_may_make_a_space(box):
+    client, cfg, _, ids = box
+    h = _as(client, cfg, ids["mgr"])
+    assert client.get("/ui/api/session").json()["can"]["create_space"] is True
+    assert client.post("/ui/api/spaces", json={"name": "handbook"}, headers=h).status_code == 201

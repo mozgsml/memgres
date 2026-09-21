@@ -508,3 +508,5 @@ a.person:hover { color: var(--focus); box-shadow: inset 0 -1px 0 var(--focus); }
 .howto .snips { margin: 8px 0 6px; }
 .howto pre.code { margin-top: 6px; }
 @media (max-width: 760px) { .rrow { grid-template-columns: minmax(0, 1fr) auto; } .rrow .op { display: none; } }
+.every-link.make { color: var(--focus); text-decoration-color: rgba(79,214,242,.4); }
+.every-link.make:hover { text-decoration-color: var(--focus); }

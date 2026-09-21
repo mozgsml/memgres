@@ -149,8 +149,11 @@ def mount(app, cfg, pool, make_store, *, oidc_fetch=None) -> None:
 
     def _session_view(s) -> dict:
         pending = 0
+        can_create = False
         with pool.connection() as conn:
             me = sessions.profile(conn, s.user_id)
+            if s.user_id is not None:
+                can_create = identity.can_create_namespace(conn, sessions.control_principal(s))
             if s.role in identity.ADMIN_ROLES:
                 with conn.cursor() as cur:
                     cur.execute("SELECT count(*) FROM signin_request WHERE status = 'pending'")
@@ -168,6 +171,8 @@ def mount(app, cfg, pool, make_store, *, oidc_fetch=None) -> None:
                 "memory": s.user_id is not None,
                 "tokens": s.user_id is not None,
                 "admin": s.role in identity.ADMIN_ROLES,
+                # the right to make a space of one's own, as the control plane reads it
+                "create_space": s.user_id is not None and can_create,
             },
             "locales": list(LOCALES),
             # where agents connect, for the token dialogs (the panel cannot work it out)

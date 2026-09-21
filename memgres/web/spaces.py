@@ -7,7 +7,9 @@ second copy of them:
 * members, invitations and requests of a space — its administrators (the owner,
   an ``admin`` member, a superadmin);
 * handing the space to someone else — the owner or a superadmin;
-* asking to join, or leaving — the person themselves.
+* asking to join, or leaving — the person themselves;
+* making a space of your own — anyone the deployment granted that right
+  (``can_create_namespace``, a switch on the person's page).
 
 **An invitation opens a space, never the server.** Inviting an address that
 already has an account adds that account at once. Otherwise the invitation waits
@@ -265,6 +267,36 @@ def transfer(conn, p, space_id: str, user_id: str, *, keep_me: bool) -> dict:
         raise Refused(409, str(e)) from None
 
 
+def create_own(conn, p, *, name: str, description: str) -> dict:
+    """A space of one's own. The right is the control plane's
+    (``can_create_namespace``); everything else — the name's shape, the cap on
+    how many one account may own — is enforced where namespaces are created."""
+    name = (name or "").strip()
+    if not name:
+        raise Refused(422, "a space needs a name")
+    if len(name) > 100:
+        raise Refused(422, "the name is longer than 100 characters")
+    description = (description or "").strip()[:500]
+    if p.user_id is None:
+        raise Refused(409, "the administrator token has no account to own a space")
+    # `identity.create_namespace` is an upsert: the same name gives the same
+    # space back. That is right for a provisioning script and wrong for a button
+    # — someone would click Create and be shown a space they already had.
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM namespace WHERE owner_user_id = %s AND name = %s", (p.user_id, name))
+        if cur.fetchone():
+            raise Refused(409, "you already have a space with this name")
+    try:
+        nsid = identity.create_own_namespace(conn, p, name, description=description)
+    except identity.SpaceAmbiguous as e:      # the name is taken, or the cap is reached
+        raise Refused(409, str(e)) from None
+    except identity.AuthError as e:
+        raise Refused(403, str(e)) from None
+    except ValueError as e:
+        raise Refused(422, str(e)) from None
+    return {"id": nsid, "name": name}
+
+
 # ─── asking to join ──────────────────────────────────────────────────────────
 def my_request(conn, user_id: str, space_id: str) -> dict:
     """The caller's own request for a space, if any — answered from the caller's
@@ -398,6 +430,12 @@ def mount(app, cfg, pool, panel) -> None:
                 return fn(conn)
             except Refused as e:
                 raise HTTPException(e.status, str(e))
+
+    @app.post("/ui/api/spaces", status_code=201)
+    def make_space(request: Request, name: str = Body(..., embed=True),
+                   description: str = Body("", embed=True)):
+        s = panel["changing"](request)
+        return _run(lambda conn: create_own(conn, control_principal(s), name=name, description=description))
 
     @app.get("/ui/api/spaces/{space_id}/members")
     def members(space_id: str, request: Request):

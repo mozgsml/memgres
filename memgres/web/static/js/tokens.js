@@ -8,7 +8,8 @@ import { $, $$, esc, toast } from "./ui.js";
 const EXAMPLE_URL = "https://memgres.example/mcp";
 
 // How each client is told about the server. Formats as each project documents
-// them (Claude Code: `claude mcp add`; Cursor: mcp.json; OpenCode: opencode.json).
+// them: Claude Code `claude mcp add`, Cursor mcp.json, Codex config.toml (its
+// token comes from an environment variable), OpenCode opencode.json.
 const CLIENTS = {
   "Claude Code": {
     where: "clients.claude",
@@ -17,6 +18,11 @@ const CLIENTS = {
   Cursor: {
     where: "clients.cursor",
     text: (url, k) => `{\n  "mcpServers": {\n    "memgres": {\n      "url": "${url}",\n      "headers": { "Authorization": "Bearer ${k}" }\n    }\n  }\n}`,
+  },
+  Codex: {
+    where: "clients.codex",
+    // Codex reads the token from an environment variable named in the config
+    text: (url, k) => `# ~/.codex/config.toml\n[mcp_servers.memgres]\nurl = "${url}"\nbearer_token_env_var = "MEMGRES_TOKEN"\n\n# in your shell profile:\n# export MEMGRES_TOKEN="${k}"`,
   },
   OpenCode: {
     where: "clients.opencode",

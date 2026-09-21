@@ -5,6 +5,29 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [Unreleased]
+
+### Added — the panel takes people on
+- **Administrators create a person** (Admin → People → New person), without
+  waiting for a sign-in: name, email, department, position. The account starts
+  with no spaces and no rights; their first sign-in with a matching verified
+  email lands on it.
+- **Administrators issue a token for someone** from that person's page — `read`
+  or `write`, an expiry, optionally one space the person already reaches. The
+  secret is shown once, to be handed over; an administrator's token can only be
+  minted by a superadmin.
+- **The right to own spaces is a switch** on the person's page, and whoever has
+  it gets **New space…** at the foot of the memory sidebar: they name a space,
+  own it and decide who else gets in. Administrators have the right always.
+- **The directory is paged and searchable** — 25 people at a time, with the
+  range shown, instead of the first hundred and nothing else.
+- **A person's page shows their latest edits**, each one opening the record —
+  but only the records the viewer may read, so the page never leaks the shape of
+  a space they cannot reach. Their activity chart counts the same way.
+- **Connecting a client is explained beside the tokens**: three steps and tabs
+  for Claude Code, Cursor, Codex and OpenCode, filled in with this server's MCP
+  address.
+
 ## [0.13.2] — 2026-09-18
 
 ### Fixed

@@ -424,5 +424,14 @@
  "clients.claude": "In a terminal (applies to all your projects; drop --scope user to add it to the current project only):",
  "clients.cursor": "In ~/.cursor/mcp.json (all projects) or .cursor/mcp.json in a project:",
  "clients.opencode": "In ~/.config/opencode/opencode.json (all projects) or opencode.json in a project:",
- "tok.allTheirSpaces": "All their spaces"
+ "tok.allTheirSpaces": "All their spaces",
+ "sp.make": "New space…",
+ "sp.makeName": "Name",
+ "sp.makeNamePh": "sales-playbook",
+ "sp.makeDesc": "What goes in it (optional)",
+ "sp.makeDescPh": "How we sell: stages, objections, prices",
+ "sp.makeGo": "Create",
+ "sp.makeNote": "You own it and decide who else gets in. Agents write into it with a token of yours; the panel only reads.",
+ "sp.made": "Space “{name}” created",
+ "clients.codex": "In ~/.codex/config.toml. Codex takes the token from an environment variable, so export it in your shell profile too:"
 }

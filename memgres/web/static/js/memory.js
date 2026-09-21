@@ -98,6 +98,46 @@ function forget(id) {
   else renderSpaceList();
 }
 
+// A space of your own — for whoever the deployment granted that right.
+function makeSpaceDialog() {
+  const veil = document.createElement("div");
+  veil.className = "veil";
+  veil.innerHTML = `<form class="dialog" role="dialog" aria-modal="true" aria-labelledby="ms-title">
+    <h3 id="ms-title">${esc(t("sp.make"))}</h3>
+    <div class="field"><label for="ms-name">${esc(t("sp.makeName"))}</label>
+      <input id="ms-name" maxlength="100" required placeholder="${esc(t("sp.makeNamePh"))}"></div>
+    <div class="field"><label for="ms-desc">${esc(t("sp.makeDesc"))}</label>
+      <input id="ms-desc" maxlength="500" placeholder="${esc(t("sp.makeDescPh"))}"></div>
+    <p class="note">${esc(t("sp.makeNote"))}</p>
+    <p class="err" id="ms-err" role="alert" hidden></p>
+    <div class="row" style="justify-content:flex-end"><button type="button" class="btn quiet" data-x>${esc(t("common.cancel"))}</button>
+      <button type="submit" class="btn primary">${esc(t("sp.makeGo"))}</button></div>
+  </form>`;
+  document.body.append(veil);
+  const close = () => veil.remove();
+  veil.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+  veil.addEventListener("click", (e) => { if (e.target === veil || e.target.closest("[data-x]")) close(); });
+  $("#ms-name", veil).focus();
+  $("form", veil).addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const submit = $("button[type=submit]", veil);
+    submit.disabled = true;
+    try {
+      const made = await post("/spaces", { name: $("#ms-name", veil).value.trim(), description: $("#ms-desc", veil).value.trim() });
+      close();
+      toast(t("sp.made", { name: made.name }));
+      m.loaded = false;
+      $("#shell").classList.remove("drawer");
+      m.navigate(`/memory?space=${encodeURIComponent(made.id)}`);
+    } catch (ex) {
+      const err = $("#ms-err", veil);
+      err.textContent = ex instanceof ApiError && ex.detail ? String(ex.detail) : t("err.save");
+      err.hidden = false;
+      submit.disabled = false;
+    }
+  });
+}
+
 function openEverySpace() {
   const veil = document.createElement("div");
   veil.className = "veil";
@@ -250,6 +290,7 @@ function wireSidebar() {
     const x = e.target.closest("[data-forget]");
     if (x) { e.preventDefault(); e.stopPropagation(); forget(x.dataset.forget); return; }
     if (e.target.closest("[data-every]")) openEverySpace();
+    if (e.target.closest("[data-make]")) makeSpaceDialog();
   }, true);
   $("#space-filter").addEventListener("input", renderSpaceList);
 }
@@ -302,7 +343,8 @@ function renderSpaceList() {
   const role = visiting.length ? `<div class="sec-h visiting-h" title="${esc(t("every.groupWhy"))}"><span>${esc(t("every.group"))}</span></div>` + visiting.map((s) =>
     `<a class="spaceitem visiting" role="listitem" href="/memory?space=${encodeURIComponent(s.id)}" data-space="${esc(s.id)}" style="--c:${spaceColor(s)}" aria-current="${m.space?.id === s.id}" title="${esc(t("every.itemWhy", { name: s.name }))}">${hexIcon(spaceColor(s), true, 16)}<span class="nm">${esc(s.name)}</span><button class="forget" data-forget="${esc(s.id)}" aria-label="${esc(t("every.forget", { name: s.name }))}">×</button></a>`).join("") : "";
   const every = isSuper() ? `<button class="every-link" data-every>${esc(t("every.link"))}</button>` : "";
-  $("#spacelist").innerHTML = own + role + every;
+  const make = m.session?.can?.create_space ? `<button class="every-link make" data-make>${esc(t("sp.make"))}</button>` : "";
+  $("#spacelist").innerHTML = own + role + make + every;
   if (m.space) $("#mbar-space").innerHTML = `${hexIcon(spaceColor(m.space), false, 14)}${esc(m.space.name)}`;
 }
 

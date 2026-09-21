@@ -98,9 +98,15 @@ token that does not exist.
   - at most 50 live tokens per account.
 
   The secret is shown once, with ready configs for Claude Code (`claude mcp
-  add`), Cursor and OpenCode, and the Tokens page explains connecting a client
-  step by step with this server's MCP address. A token never reaches further
-  than its account.
+  add`), Cursor, Codex and OpenCode, and the Tokens page explains connecting a
+  client step by step with this server's MCP address. A token never reaches
+  further than its account.
+- **A space of their own**, if the deployment granted them that right (the
+  switch on their page, `can_create_namespace`): **New space…** at the foot of
+  the sidebar. They own what they make and decide who else gets in; the panel
+  itself still only reads memory, so the space starts empty and fills up through
+  an agent's token. Without the right the button is absent and the endpoint
+  refuses — administrators have it always.
 - **Sign-in methods** (Account). Link another provider, or unlink one — not the
   last.
 - **Language** (Account → Profile, and on the sign-in page). Otherwise the
