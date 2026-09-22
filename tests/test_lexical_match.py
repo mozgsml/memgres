@@ -131,7 +131,7 @@ def test_auto_is_hybrid_wherever_an_embedder_exists(monkeypatch):
             seen["vector"] = True
             return []
 
-    monkeypatch.setattr(search, "_lexical", fake_lexical)
+    monkeypatch.setattr(search, "lexical_search", fake_lexical)
     cfg = SimpleNamespace(rrf_k=60, rrf_w_semantic=1.0, rrf_w_lexical=1.0,
                           rrf_w_lexical_literal=1.0)
 

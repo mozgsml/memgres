@@ -49,7 +49,7 @@ def _tsquery(cfg, match: Optional[str], query: str):
 TITLE_WEIGHT = 2.0
 
 
-def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
+def lexical_search(conn, cfg, ns, query, k, tags, path_prefix,
              match: Optional[str] = None, tags_match: str = "all") -> List[Hit]:
     """Rank by the query against BOTH the body and the curated title.
 
@@ -92,7 +92,7 @@ def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
 # query text costs nothing; asking Postgres (`ts_debug`) would be a second round
 # trip for the same answer. Dotted forms must carry a letter, so that "5.7" or a
 # version number in prose does not make an ordinary sentence look like a literal.
-_LITERAL = re.compile(r"""
+LITERAL_RE = re.compile(r"""
       \b\d{1,3}(?:\.\d{1,3}){3}\b                     # 192.168.1.121
     | \b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}   # a uuid
     | \b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b                # MEMGRES_TOKEN_SINK
@@ -116,10 +116,10 @@ LITERAL_SCAN_CHARS = 500
 
 def looks_literal(query: str) -> bool:
     """Is the caller after an exact string rather than a meaning?"""
-    return bool(_LITERAL.search((query or "")[:LITERAL_SCAN_CHARS]))
+    return bool(LITERAL_RE.search((query or "")[:LITERAL_SCAN_CHARS]))
 
 
-def _rrf(lists: Sequence[List[Hit]], k: int, *, rrf_k: int = RRF_K,
+def fuse(lists: Sequence[List[Hit]], k: int, *, rrf_k: int = RRF_K,
          weights: Optional[Sequence[float]] = None) -> List[Hit]:
     """Reciprocal Rank Fusion: each ranking votes for a memory by its POSITION,
     and the votes add up.
@@ -257,7 +257,7 @@ def recall(conn, cfg, embedder, ns, query: str, *, k: int = 10,
         # other's blind spot. It costs one more query against the same database.
         mode = "hybrid" if backend else "lexical"
     if mode == "lexical":
-        hits = _lexical(conn, cfg, ns, query, k, tags, path_prefix, match,
+        hits = lexical_search(conn, cfg, ns, query, k, tags, path_prefix, match,
                         tags_match)
     elif mode == "semantic":
         if backend is None:
@@ -269,13 +269,13 @@ def recall(conn, cfg, embedder, ns, query: str, *, k: int = 10,
         if backend is None:
             raise RuntimeError(
                 "semantic recall needs an embedder (MEMGRES_EMBED_PROVIDER)")
-        lex = _lexical(conn, cfg, ns, query, k, tags, path_prefix, match,
+        lex = lexical_search(conn, cfg, ns, query, k, tags, path_prefix, match,
                        tags_match)
         sem = backend.search(conn, cfg, embedder.embed_query(query), k, ns,
                              tags, path_prefix, tags_match)
         w_lex = (cfg.rrf_w_lexical_literal if looks_literal(query)
                  else cfg.rrf_w_lexical)
-        hits = _rrf([sem, lex], k, rrf_k=cfg.rrf_k,
+        hits = fuse([sem, lex], k, rrf_k=cfg.rrf_k,
                     weights=[cfg.rrf_w_semantic, w_lex])
     else:
         raise ValueError(
@@ -294,3 +294,11 @@ def recall(conn, cfg, embedder, ns, query: str, *, k: int = 10,
         return hits
     return attach_snippets(conn, cfg, ns, query, hits,
                            snippet=snippet, full_body=full_body)
+
+
+# `eval.py` measures exactly these, so they are part of the package's surface
+# rather than private detail. The old names stay as aliases: they appear in
+# tests and in anything that pinned them before this rename.
+_lexical = lexical_search
+_rrf = fuse
+_LITERAL = LITERAL_RE

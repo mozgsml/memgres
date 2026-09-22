@@ -50,7 +50,7 @@ import re
 import sys
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .search import _lexical, _rrf, looks_literal
+from .search import fuse, lexical_search, looks_literal
 
 # A case is (kind, query, expected memory id).
 Case = Tuple[str, str, str]
@@ -95,7 +95,7 @@ def _literal_cases(conn, ns: Sequence[str], n: int, rng: random.Random,
     ``per_memory`` survive from any one memory, or a single long changelog would
     supply half the cases and the measurement would describe that memory rather
     than the corpus."""
-    from .search import _LITERAL
+    from .search import LITERAL_RE
 
     with conn.cursor() as cur:
         cur.execute("SELECT id, body FROM memory WHERE namespace = ANY(%s::text[]) "
@@ -103,7 +103,7 @@ def _literal_cases(conn, ns: Sequence[str], n: int, rng: random.Random,
         rows = cur.fetchall()
     where: Dict[str, set] = {}
     for mid, body in rows:
-        for m in _LITERAL.finditer(body or ""):
+        for m in LITERAL_RE.finditer(body or ""):
             tok = m.group(0).strip(".,;:()[]{}\"'")
             if len(tok) < 7 or _SKIP.match(tok):
                 continue
@@ -178,6 +178,12 @@ def _file_cases(conn, ns: Sequence[str], path: str) -> List[Case]:
             if not line or line.startswith("#"):
                 continue
             row = json.loads(line)
+            # A file may carry the kind each case came from (--dump-cases writes
+            # it): keeping it is what makes an A/B readable, since the per-kind
+            # columns are where a change shows its shape. Without it every case
+            # lands in one bucket and a treatment that only helps one kind looks
+            # like a small general gain.
+            kind = str(row.get("kind") or "file")
             want = str(row["expect"])
             if "-" not in want or " " in want:      # not a uuid: treat as a path
                 with conn.cursor() as cur:
@@ -188,14 +194,14 @@ def _file_cases(conn, ns: Sequence[str], path: str) -> List[Case]:
                     print(f"  ! no memory at path {want!r} — skipped", file=sys.stderr)
                     continue
                 want = str(got[0])
-            out.append(("file", row["query"], want))
+            out.append((kind, row["query"], want))
     return out
 
 
 # ─── running them ────────────────────────────────────────────────────────────
 def _rankings(conn, cfg, embedder, backend, ns, query: str):
     """The two rankings for one query, fetched once and reused by every setting."""
-    lex = _lexical(conn, cfg, ns, query, FETCH, None, None, None, "all")
+    lex = lexical_search(conn, cfg, ns, query, FETCH, None, None, None, "all")
     sem = (backend.search(conn, cfg, embedder.embed_query(query), FETCH, ns,
                           None, None, "all") if backend else [])
     return lex, sem
@@ -210,7 +216,7 @@ def _rank_of(hits, want: str) -> Optional[int]:
 
 def _fuse(lex, sem, cfg, query: str, k: int):
     w_lex = cfg.rrf_w_lexical_literal if looks_literal(query) else cfg.rrf_w_lexical
-    return _rrf([sem, lex], k, rrf_k=cfg.rrf_k,
+    return fuse([sem, lex], k, rrf_k=cfg.rrf_k,
                 weights=[cfg.rrf_w_semantic, w_lex])
 
 

@@ -19,7 +19,7 @@ from memgres import eval as ev                                    # noqa: E402
 from memgres.config import load                                   # noqa: E402
 from memgres.embeddings import Embedder                           # noqa: E402
 from memgres.schema import migrate                                # noqa: E402
-from memgres.search import _rrf, looks_literal                    # noqa: E402
+from memgres.search import fuse as _rrf, looks_literal                    # noqa: E402
 from memgres.store import Store                                   # noqa: E402
 from memgres.vector.base import Hit                               # noqa: E402
 

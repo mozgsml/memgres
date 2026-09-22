@@ -362,3 +362,53 @@ def test_a_withheld_right_survives_a_restart(box):
 
     assert _call(as_(tok), "memory_whoami")["capabilities"]["can_create_namespace"] is False, \
         "a restart re-granted a right the deployment withheld"
+
+
+# ─── self-service: the same policy on every door ─────────────────────────────
+def test_the_self_service_policy_is_the_same_over_mcp_as_in_the_panel(box):
+    """The cap, the mandatory expiry and the refusal of an admin ceiling used to
+    live in the panel's token page, so an account holding an admin token walked
+    around all three over MCP. A cap one door enforces is not a cap."""
+    from memgres import admin
+
+    as_, root = box
+    mcp = as_(root)
+    uid = _call(mcp, "memory_admin_create_user", name="ivan")["id"]
+    admin_tok = _call(mcp, "memory_admin_issue_token", user_id=uid,
+                      permission="admin")["token"]
+    mine = as_(admin_tok)
+
+    # an admin ceiling is an administrative act, not a self-service one
+    with pytest.raises(Exception, match="read or write"):
+        _call(mine, "memory_issue_token", permission="admin")
+
+    # and a token you mint for yourself always expires
+    made = _call(mine, "memory_issue_token", permission="read", label="agent")
+    assert made["expires_at"] is not None
+    with pytest.raises(Exception, match="between 1 and 365"):
+        _call(mine, "memory_issue_token", permission="read", expires_days=4000)
+
+    # the cap is the account's, wherever it is asked for
+    admin_saved = admin.SELF_MAX_LIVE_TOKENS
+    admin.SELF_MAX_LIVE_TOKENS = 3
+    try:
+        with pytest.raises(Exception, match="active tokens"):
+            for _ in range(5):
+                _call(mine, "memory_issue_token", permission="read")
+    finally:
+        admin.SELF_MAX_LIVE_TOKENS = admin_saved
+
+
+def test_naming_a_space_while_minting_a_token_does_not_create_one(box):
+    """It used to, walking past the right that governs creation everywhere
+    else — a user refused a namespace could mint one through the token tool."""
+    as_, root = box
+    mcp = as_(root)
+    uid = _call(mcp, "memory_admin_create_user", name="petra")["id"]
+    tok = _call(mcp, "memory_admin_issue_token", user_id=uid, permission="admin")["token"]
+    mine = as_(tok)
+
+    with pytest.raises(Exception, match="no namespace named"):
+        _call(mine, "memory_issue_token", space="invented", permission="read")
+    assert _call(mcp, "memory_admin_list_namespaces") == [] or all(
+        n["name"] != "invented" for n in _call(mcp, "memory_admin_list_namespaces"))

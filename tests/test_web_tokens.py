@@ -164,7 +164,9 @@ def test_the_root_session_holds_no_tokens(box):
 
 def test_a_cap_on_live_tokens(box, monkeypatch):
     client, root, cfg = box
-    monkeypatch.setattr(tokens, "MAX_LIVE_TOKENS", 3)
+    # the cap lives in the service layer now, so every door obeys the same one
+    from memgres import admin
+    monkeypatch.setattr(admin, "SELF_MAX_LIVE_TOKENS", 3)
     h = _signed_in_as(client, cfg, _account(client, root, "mark"))
     for _ in range(3):
         assert client.post("/ui/api/tokens", json={"expires_days": 30}, headers=h).status_code == 201

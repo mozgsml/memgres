@@ -1,12 +1,16 @@
 """Control-plane service layer: who may provision what, decided in one place.
 
 `identity` holds the database primitives (create a user, mint a token, add a
-member). It deliberately does no authorization — `set_role`'s own docstring
-tells callers to guard lockout themselves. Until now each transport supplied
-those rules on its own: the HTTP layer grew `require_manage_users` /
+member) plus authentication and space resolution. The honest line between the
+two is not "identity does no authorization" — `create_own_namespace` and
+`resolve_space` both take a Principal and refuse — but this: **`admin` owns
+control-plane policy, `identity` owns authentication and the data-plane rules
+about spaces.** Until this module existed each transport supplied the
+control-plane rules on its own: the HTTP layer grew `require_manage_users` /
 `require_superadmin`, the MCP layer grew `_admin_uid`, and the two drifted. A
 rule written at one door and forgotten at the other is not a style problem: it
-is how the token-escalation hole reached a release.
+is how the token-escalation hole reached a release. (`_admin_uid` is gone now —
+the self-service tier at the foot of this file is where it went.)
 
 So this module is to the control plane what `store` is to the data plane — the
 one place both doors call. Transports keep only what is genuinely theirs:
@@ -26,7 +30,7 @@ leaves nobody in charge, and `identity`'s own `AuthError` / `SpaceNotFound` /
 """
 
 import datetime as dt
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from . import identity
 from .identity import Principal
@@ -39,6 +43,18 @@ class Forbidden(PermissionError):
     failed (missing, malformed, revoked, expired). The distinction matters at
     the door: one is 401 "prove who you are", the other 403 "you did, and the
     answer is still no".
+    """
+
+
+class Refused(ValueError):
+    """Permitted in principle, but outside what the policy allows.
+
+    A third answer, distinct from both of its neighbours: `Forbidden` says this
+    principal may not do this at all, `Refused` says anyone asking for THIS
+    would be turned down — a label too long, an expiry beyond the ceiling, more
+    live tokens than an account may hold. A `ValueError` so every door that
+    already maps bad input to 422 keeps doing the right thing without knowing
+    about this class.
     """
 
 
@@ -663,7 +679,149 @@ def list_tokens(conn, p: Principal, *, user_id: str) -> List[dict]:
     return identity.list_tokens(conn, user_id)
 
 
-# ─── access requests: ask to join a namespace, an admin decides ──────────────
+# ─── self-service: what an account may do FOR ITSELF ─────────────────────────
+# Everything above answers "may this principal act on someone else". This tier
+# answers "may this principal act on itself", and it exists because the answer
+# was being given in three places — the MCP tools, the panel's token page, and
+# the panel's people page — with three different policies. The panel capped live
+# tokens and demanded an expiry; MCP did neither and allowed an admin ceiling.
+# A cap that one door enforces is not a cap, which is the same shape of drift
+# `_require_full_credential` above was written about.
+#
+# The policy lives here as named constants so a surface can be stricter by
+# passing arguments (the panel offers four expiry choices) but cannot be looser.
+
+SELF_PERMISSIONS = ("read", "write")
+"""A token you mint for yourself never carries the admin ceiling.
+
+An admin-ceiling token can mint and revoke tokens, so handing one to an agent —
+or to a browser click — makes every other limit on that agent decorative. Widen
+this only through the administrative door (`issue_token`), which takes a
+principal who may manage users and says whose token it is.
+"""
+
+SELF_MAX_LIVE_TOKENS = 50      # so a scripted caller cannot fill the table
+SELF_MAX_EXPIRY_DAYS = 365     # "no expiry" is not a self-service option
+SELF_MAX_LABEL = 100
+
+
+def _self_account(conn, p: Principal, action: str) -> str:
+    """The account acting on itself, or a refusal.
+
+    Token management is an account-level act, so it needs a credential that has
+    not been weakened: a read-only or namespace-scoped token must not be able to
+    mint itself a stronger one. This is the rule the MCP tools already applied
+    through their own helper; the point of the shared tier is that it now also
+    holds for the panel and for anything added later.
+    """
+    if p.user_id is None:
+        raise Forbidden(f"{action} needs an account — this credential has none")
+    _require_full_credential(p, action)
+    return p.user_id
+
+
+def issue_own_token(conn, p: Principal, *, label: str = "",
+                    permission: str = "write",
+                    namespace_id: Optional[str] = None,
+                    space: Optional[str] = None,
+                    expires_days: int = 90,
+                    allowed_expiries: Optional[Sequence[int]] = None,
+                    sink_dir: str = "", defer_delivery: bool = False) -> dict:
+    """Mint a token for the caller's own account.
+
+    `space` names one of the caller's namespaces by name, `namespace_id` by id;
+    either way the token can only be pinned to a namespace the account already
+    reaches — scoping is not granting. Naming a namespace here once CREATED it,
+    walking past the right that governs creation everywhere else; it now refuses
+    instead, and `memory_create_space` is the door for that.
+
+    `allowed_expiries` lets a surface offer a menu (the panel does) without
+    being able to widen what this tier permits.
+    """
+    uid = _self_account(conn, p, "issuing a token")
+    label = (label or "").strip()
+    if len(label) > SELF_MAX_LABEL:
+        raise Refused(f"the label is longer than {SELF_MAX_LABEL} characters")
+    if permission not in SELF_PERMISSIONS:
+        raise Refused("a token you issue yourself may grant read or write — "
+                      "an admin ceiling is an administrative act")
+    if allowed_expiries is not None and expires_days not in allowed_expiries:
+        raise Refused("expiry must be one of "
+                      + ", ".join(map(str, allowed_expiries)) + " days")
+    try:
+        expires_days = int(expires_days)
+    except (TypeError, ValueError):
+        raise Refused("expiry must be a number of days") from None
+    if not 1 <= expires_days <= SELF_MAX_EXPIRY_DAYS:
+        raise Refused(f"expiry must be between 1 and {SELF_MAX_EXPIRY_DAYS} days — "
+                      "a token you mint for yourself always expires")
+
+    nsid = _self_namespace(conn, uid, namespace_id=namespace_id, space=space)
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM token WHERE user_id = %s AND revoked_at IS NULL "
+                    "AND (expires_at IS NULL OR expires_at > now())", (uid,))
+        if cur.fetchone()[0] >= SELF_MAX_LIVE_TOKENS:
+            raise Refused(f"you already have {SELF_MAX_LIVE_TOKENS} active tokens — "
+                          "revoke some you no longer use")
+    expires_at = (dt.datetime.now(dt.timezone.utc)
+                  + dt.timedelta(days=expires_days))
+    secret, tid = identity.issue_token(conn, uid, namespace_id=nsid,
+                                       permission=permission, label=label,
+                                       expires_at=expires_at)
+    out = {"id": tid, "permission": permission, "namespace_id": nsid,
+           "expires_at": expires_at}
+    if defer_delivery:
+        out["secret"] = secret
+        return out
+    out.update(deliver_secret(secret, tid, sink_dir))
+    return out
+
+
+def _self_namespace(conn, uid: str, *, namespace_id: Optional[str],
+                    space: Optional[str]) -> Optional[str]:
+    """Resolve the namespace a self-issued token is pinned to, or None for all.
+
+    The same answer for "exists but not yours" and "does not exist": a token
+    tool must not become a way to enumerate other people's namespaces.
+    """
+    if namespace_id:
+        try:
+            namespace_id = identity._as_uuid(namespace_id)
+        except ValueError:
+            raise Refused("no such space") from None
+        if identity.reaches(conn, uid, namespace_id) is None:
+            raise Refused("no such space")
+        return namespace_id
+    if space:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM namespace WHERE owner_user_id=%s AND name=%s",
+                        (uid, space))
+            row = cur.fetchone()
+        if row is None:
+            raise Refused(f"you own no namespace named '{space}' — create it "
+                          "first, or ask for one to be shared with you")
+        return str(row[0])
+    return None
+
+
+def list_own_tokens(conn, p: Principal) -> List[dict]:
+    """The caller's own tokens, metadata only — never a secret."""
+    return identity.list_tokens(conn, _self_account(conn, p, "listing your tokens"))
+
+
+def revoke_own_token(conn, p: Principal, *, token_id: str) -> bool:
+    """Revoke one of the caller's own tokens. Someone else's token, or none at
+    all, answers the same: not found — ownership is not a thing to probe for."""
+    uid = _self_account(conn, p, "revoking a token")
+    try:
+        token_id = identity._as_uuid(token_id)
+    except ValueError:
+        return False
+    if identity.token_owner(conn, token_id) != uid:
+        return False
+    identity.revoke_token(conn, token_id)
+    return True
+
 
 # ─── adopting data left behind by single mode ───────────────────────────────
 # In `single` mode every memory is stored under the namespace `''`. Switching to

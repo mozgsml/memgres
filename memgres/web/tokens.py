@@ -21,12 +21,15 @@ now".
 import datetime as dt
 from typing import Optional
 
-from .. import identity
+from .. import admin, identity
 
+# The panel's menu. The policy itself lives in `admin` (SELF_*) so every door
+# obeys it; what stays here is the narrower CHOICE a browser offers — four
+# expiries rather than any number of days up to the ceiling.
 EXPIRY_CHOICES = (30, 90, 180, 365)
-PERMISSIONS = ("read", "write")
-MAX_LABEL = 100
-MAX_LIVE_TOKENS = 50
+PERMISSIONS = admin.SELF_PERMISSIONS
+MAX_LABEL = admin.SELF_MAX_LABEL
+MAX_LIVE_TOKENS = admin.SELF_MAX_LIVE_TOKENS
 
 
 class TokenRefused(ValueError):
@@ -60,35 +63,23 @@ def list_own(conn, user_id: str) -> list:
     return out
 
 
-def issue_own(conn, user_id: str, *, label: str, permission: str,
+def issue_own(conn, principal, *, label: str, permission: str,
               namespace_id: Optional[str], expires_days: int) -> dict:
-    label = (label or "").strip()
-    if len(label) > MAX_LABEL:
-        raise TokenRefused(f"the label is longer than {MAX_LABEL} characters")
-    if permission not in PERMISSIONS:
-        raise TokenRefused("access must be read or write")
-    if expires_days not in EXPIRY_CHOICES:
-        raise TokenRefused(f"expiry must be one of {', '.join(map(str, EXPIRY_CHOICES))} days")
-    if namespace_id:
-        try:
-            namespace_id = identity._as_uuid(namespace_id)
-        except ValueError:
-            raise TokenRefused("no such space") from None
-        if identity.reaches(conn, user_id, namespace_id) is None:
-            # the same answer for "exists but not yours" and "does not exist"
-            raise TokenRefused("no such space")
-    with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM token WHERE user_id = %s AND revoked_at IS NULL "
-                    "AND (expires_at IS NULL OR expires_at > now())", (user_id,))
-        if cur.fetchone()[0] >= MAX_LIVE_TOKENS:
-            raise TokenRefused(f"you already have {MAX_LIVE_TOKENS} active tokens — "
-                               "revoke some you no longer use")
-    expires_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=expires_days)
-    secret, tid = identity.issue_token(conn, user_id, namespace_id=namespace_id or None,
-                                       permission=permission, label=label,
-                                       expires_at=expires_at)
-    return {"id": tid, "token": secret, "permission": permission,
-            "namespace_id": namespace_id or None, "expires_at": expires_at}
+    """A token for the person's own clients, through the shared self-service
+    tier — so the cap, the mandatory expiry and the refusal of an admin ceiling
+    are the deployment's rules rather than this page's."""
+    try:
+        out = admin.issue_own_token(
+            conn, principal, label=label, permission=permission,
+            namespace_id=namespace_id, expires_days=expires_days,
+            allowed_expiries=EXPIRY_CHOICES, defer_delivery=True)
+    except admin.Refused as e:
+        raise TokenRefused(str(e)) from None
+    except admin.Forbidden as e:
+        raise TokenRefused(str(e)) from None
+    return {"id": out["id"], "token": out.pop("secret"),
+            "permission": out["permission"], "namespace_id": out["namespace_id"],
+            "expires_at": out["expires_at"]}
 
 
 def revoke_own(conn, user_id: str, token_id: str) -> bool:
@@ -107,6 +98,8 @@ def revoke_own(conn, user_id: str, token_id: str) -> bool:
 def mount(app, cfg, pool, panel) -> None:
     from fastapi import Body, HTTPException, Request
 
+    from .sessions import control_principal
+
     def _own_account(s):
         if s.user_id is None:
             raise HTTPException(409, "the administrator token has no account to hold tokens")
@@ -124,10 +117,14 @@ def mount(app, cfg, pool, panel) -> None:
                   permission: str = Body("write", embed=True),
                   namespace_id: Optional[str] = Body(None, embed=True),
                   expires_days: int = Body(90, embed=True)):
-        uid = _own_account(panel["changing"](request))
+        sess = panel["changing"](request)
+        _own_account(sess)
         with pool.connection() as conn, conn.transaction():
             try:
-                return issue_own(conn, uid, label=label, permission=permission,
+                # the CONTROL principal: minting a token is a control-plane act,
+                # and the session's read ceiling is for reading memory
+                return issue_own(conn, control_principal(sess), label=label,
+                                 permission=permission,
                                  namespace_id=namespace_id, expires_days=expires_days)
             except TokenRefused as e:
                 raise HTTPException(422, str(e))

@@ -21,6 +21,25 @@ patch = fixes).
   lexical when there is no embedder. Ask for `semantic` explicitly to ignore
   wording on purpose.
 
+### Changed — one policy for what an account may do for itself
+- **Issuing, listing and revoking your own tokens moved into the service
+  layer** (`admin.issue_own_token` and friends), and the three doors that each
+  had their own rules now call it. The panel demanded an expiry, capped an
+  account at 50 live tokens and refused an admin ceiling; the MCP tools did
+  none of those, so an account holding an admin token walked around all three.
+  A cap that one door enforces is not a cap.
+- **A token you mint for yourself now always expires** (up to 365 days) and
+  **cannot carry the admin ceiling** — that stays an administrative act, through
+  the door that says whose token it is. A surface may be stricter by passing
+  arguments (the panel still offers its four expiry choices) but cannot be
+  looser.
+- `memory_issue_token` no longer creates a namespace when given a name that
+  does not exist; `memory_create_space` is the door for that, and the old
+  behaviour walked past the right that governs creation everywhere else.
+- `search.lexical_search`, `search.fuse` and `search.LITERAL_RE` are public
+  names now — `memgres-eval` measures exactly those, and a private import is one
+  rename away from a broken CLI with no signal. The old spellings still work.
+
 ### Fixed — found by the security review of this batch
 - **A crafted query could burn a CPU for minutes.** The literal detector added
   above runs on caller text on the default recall path, and its dotted-host

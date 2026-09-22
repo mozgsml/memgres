@@ -74,6 +74,11 @@ SCHEMA_VERSION = 26
 #   v21 (0020): dropped 0019's foreign key from databases that already ran it →
 #     additive, floor stays 16. Nothing reads the constraint; removing it only
 #     stops a counted read from locking the memory row it counts.
+#   v22 (0021): added the enrollment_key table → additive, floor stays 16.
+#   v23 (0022): added app_user.disabled → additive, floor stays 16. An older
+#     client ignores the column, so a disabled account still authenticates
+#     against it — which is why the check lives in `identity.resolve`, not only
+#     in the door that sets the flag.
 #   v24 (0023): cleared links_built so the link backfill runs again after the
 #     link PARSER was fixed (hyphens in paths were dropped, indented code was
 #     parsed) → additive, floor stays 16. It rebuilds a derived index from text
@@ -81,6 +86,9 @@ SCHEMA_VERSION = 26
 #   v25 (0024): added web_session, app_user_identity and app_user.ui_language for
 #     the web panel → additive, floor stays 16. An older client ignores all three;
 #     it simply has no panel.
+#   v26 (0025): added search_log → additive, floor stays 16. An older client
+#     never writes it and never reads it; the sweeper that expires its rows is
+#     keyed on MEMGRES_SEARCH_LOG_DAYS, not on the client version.
 SCHEMA_BREAKING_VERSION = 16
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are

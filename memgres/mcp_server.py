@@ -417,19 +417,6 @@ def build_server(cfg: Optional[Config] = None):
             raise identity.AuthError("this token has no owning user")
         return p.user_id
 
-    def _admin_uid(conn, token: Optional[str]) -> str:
-        """Like _uid but for token management (issue/revoke/list). These are
-        account-level admin actions, so they require an UNSCOPED admin-ceiling
-        token — a read-only or namespace-scoped token must not mint/kill tokens
-        or escalate its own scope/permission."""
-        p = identity.resolve(conn, cfg, token)
-        if p.user_id is None:
-            raise identity.AuthError("this token has no owning user")
-        if p.permission != "admin" or p.scope_namespace_id is not None:
-            raise identity.AuthError(
-                "token management requires an unscoped admin-ceiling token")
-        return p.user_id
-
     def _principal(conn, token: Optional[str]):
         """Authenticate the caller for a control-plane tool.
 
@@ -807,11 +794,16 @@ def build_server(cfg: Optional[Config] = None):
     @tool()
     def memory_issue_token(permission: str = "write", space: Optional[str] = None,
                            space_id: Optional[str] = None, label: str = "",
-                           expires_days: Optional[int] = None,
+                           expires_days: int = 90,
                            ctx: Context = None) -> dict:
-        """Mint a new token for your account (rotate / delegate / time-box).
-        `permission` is its ceiling (read|write|admin); `space`/`space_id` scope
-        it to one namespace (omit for all yours).
+        """Mint a new token for your own account (rotate / delegate / time-box).
+        `permission` is its ceiling — `read` or `write`; an admin ceiling is an
+        administrative act, not a self-service one, because a token that can
+        mint tokens makes every limit on the agent holding it decorative.
+        `space`/`space_id` pin it to one namespace you already reach (omit for
+        all of yours); naming a namespace here does not create one.
+        `expires_days` is capped at 365 — a token you mint for yourself always
+        expires — and an account may hold 50 live tokens at a time.
 
         ⚠️ UNSAFE unless this deployment sets a token sink: without one the
         secret comes back IN THIS REPLY, which puts it in the conversation
@@ -820,44 +812,11 @@ def build_server(cfg: Optional[Config] = None):
         short `expires_days` and rotate it once its owner has it. With a sink
         configured the reply carries only the path of the 0600 file on the
         server and the secret never enters the conversation."""
-        import datetime as dt
-        exp = None
-        if expires_days:
-            exp = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=expires_days)
         with pool.connection() as conn, conn.transaction():
-            tok = _token(ctx)
-            uid = _admin_uid(conn, tok)
-            nsid = space_id
-            if nsid is not None:
-                # can only scope a new token to a namespace the caller can reach
-                with conn.cursor() as cur:
-                    if identity._reach(cur, uid, nsid) is None:
-                        raise identity.AuthError(
-                            "cannot scope a token to an unreachable namespace")
-            elif space is not None:
-                # Naming a namespace here used to CREATE it unconditionally,
-                # which walked straight past the right that governs creation
-                # everywhere else — so a user refused a namespace on the write
-                # path could mint one through the token tool and write there.
-                with conn.cursor() as cur:
-                    cur.execute("SELECT id FROM namespace "
-                                "WHERE owner_user_id=%s AND name=%s", (uid, space))
-                    row = cur.fetchone()
-                if row is not None:
-                    nsid = str(row[0])
-                else:
-                    principal = identity.resolve(conn, cfg, tok)
-                    if not identity.can_create_namespace(conn, principal):
-                        raise identity.AuthError(
-                            f"you own no namespace named '{space}' and may not "
-                            "create one — ask an admin to create it or share it")
-                    nsid = identity.create_namespace(conn, uid, space)
-            secret, tid = identity.issue_token(
-                conn, uid, namespace_id=nsid, permission=permission,
-                label=label, expires_at=exp)
-        out = admin.deliver_secret(secret, tid, cfg.token_sink)
-        out.update({"permission": permission, "namespace_id": nsid})
-        return out
+            return admin.issue_own_token(
+                conn, _principal(conn, _token(ctx)), label=label,
+                permission=permission, namespace_id=space_id, space=space,
+                expires_days=expires_days, sink_dir=cfg.token_sink)
 
     @tool()
     def memory_request_access(space_id: str, permission: str = "read",
@@ -878,7 +837,7 @@ def build_server(cfg: Optional[Config] = None):
     def memory_list_tokens(ctx: Context = None) -> List[dict]:
         """List your tokens (metadata only — never the secret)."""
         with pool.connection() as conn, conn.transaction():
-            out = identity.list_tokens(conn, _admin_uid(conn, _token(ctx)))
+            out = admin.list_own_tokens(conn, _principal(conn, _token(ctx)))
         return _iso(out, *_TOKEN_TIMES)
 
     @tool()
@@ -886,11 +845,10 @@ def build_server(cfg: Optional[Config] = None):
                             ctx: Context = None) -> dict:
         """Revoke one of your tokens by id (kills it immediately)."""
         with pool.connection() as conn, conn.transaction():
-            uid = _admin_uid(conn, _token(ctx))
-            owned = {t["id"] for t in identity.list_tokens(conn, uid)}
-            if token_id not in owned:
+            if not admin.revoke_own_token(conn, _principal(conn, _token(ctx)),
+                                          token_id=token_id):
                 raise identity.AuthError("not your token")
-            return {"revoked": identity.revoke_token(conn, token_id)}
+            return {"revoked": True}
 
     @tool()
     def memory_whoami(ctx: Context = None) -> dict:
