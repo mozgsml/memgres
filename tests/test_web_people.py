@@ -680,6 +680,13 @@ def test_a_person_is_last_seen_when_anything_of_theirs_was_used(box):
 
     again = client.get(f"/ui/api/admin/people?q=ivan", headers=h).json()["people"][0]
     assert again["last_seen_at"] is not None
+
+    # and browsing the panel counts too — without it someone who reads every day
+    # but has not signed in for a month reads as a month idle
+    _as(client, cfg, ids["olga"])
+    client.get("/ui/api/session")
+    mine = client.get(f"/ui/api/admin/people?q=olga", headers=_as(client, cfg, ids["mgr"])).json()
+    assert mine["people"][0]["last_seen_at"] is not None
     prof = client.get(f"/ui/api/people/{ids['ivan']}", headers=h).json()
     assert prof["person"]["last_seen_at"] == again["last_seen_at"]
 

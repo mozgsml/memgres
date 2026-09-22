@@ -211,10 +211,14 @@ def profile(conn, viewer, target_id: str, *, providers: dict) -> dict:
 
 
 # When an account was last *used* — by the person or by anything acting on
-# their behalf. Three signals the server already keeps, none of them new
-# tracking: a sign-in to the panel, a write, and a token being presented (which
-# `identity.resolve` stamps on every authenticated call, so an agent reading all
-# night keeps its owner's account warm).
+# their behalf. Four signals the server already keeps, none of them new
+# tracking: a sign-in, a panel session being touched (`web_session.last_seen_at`,
+# throttled), a write, and a token being presented (which `identity.resolve`
+# stamps on every authenticated call, so an agent reading all night keeps its
+# owner's account warm).
+#
+# The session half matters more than it looks: without it someone who reads the
+# panel every day but has not signed in for a month reads as a month idle.
 #
 # Deliberately NOT "last read by this person": reads are not attributed per
 # account anywhere in memgres, by design — that would mean writing a row for
@@ -223,6 +227,7 @@ def profile(conn, viewer, target_id: str, *, providers: dict) -> dict:
 # must always have an answer.
 LAST_SEEN = """(SELECT max(t) FROM (VALUES
         ((SELECT max(last_login_at) FROM app_user_identity i WHERE i.user_id = u.id)),
+        ((SELECT max(last_seen_at) FROM web_session w WHERE w.user_id = u.id)),
         ((SELECT max(created_at) FROM memory_history h WHERE h.author_user_id = u.id)),
         ((SELECT max(last_used_at) FROM token tk WHERE tk.user_id = u.id))
     ) AS s(t))"""

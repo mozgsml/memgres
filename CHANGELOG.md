@@ -27,7 +27,7 @@ patch = fixes).
   someone importing the package in Python — the Docker + MCP deployment the
   docs recommend could not run it at all.
 - **"Last seen" for a person**, in the directory and on their page: the latest
-  of a sign-in, a write, and a token of theirs being presented. Reads are still
+  of a sign-in, a panel visit, a write, and a token of theirs being presented. Reads are still
   not attributed per account — that would be a row per recall — so this is built
   from what the server already keeps, and an agent working all night counts as
   its owner being active.
