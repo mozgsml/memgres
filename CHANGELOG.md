@@ -120,6 +120,14 @@ patch = fixes).
   other setting and cost nothing elsewhere. The change that looked equally
   obvious beforehand — damping the lexical vote on prose — measured worse and
   was dropped.
+- **`MEMGRES_CHUNK_CONTEXT`** prefixes each chunk with its memory's path and
+  title before embedding — the cheap end of contextual retrieval. It ships
+  **off**: measured on a frozen 160-case set with the index rebuilt each way, it
+  is slightly WORSE on the queries it cannot game (literal MRR .857 → .832) and
+  better only on title queries, which it wins by putting the title into the text
+  being searched. Our chunks are 400 characters and the prefix is up to a
+  quarter of that; the published technique uses chunks several times longer and
+  a per-chunk sentence written by an LLM. See docs/RECALL.md.
 - **An optional search log** (`MEMGRES_SEARCH_LOG`, off by default, swept after
   `MEMGRES_SEARCH_LOG_DAYS`): what was searched for, what came back, and what
   the caller opened next. `memgres-eval --from-log N` turns those pairs into

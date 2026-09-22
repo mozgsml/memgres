@@ -195,3 +195,33 @@ loudly as a perfect one, made every column worse. The junk it removes is
 apparently outweighed by the true hits it demotes — on this corpus. Which is the
 argument for the tool: intuitions about ranking are cheap and usually wrong, and
 your corpus may not behave like this one.
+
+## A second worked example: a good idea that did not survive measurement
+
+`MEMGRES_CHUNK_CONTEXT` prefixes every chunk with its memory's path and title
+before embedding — the cheap end of the technique Anthropic published as
+*contextual retrieval*, which reports large gains. On this corpus, measured on
+one frozen set of 160 cases with the index rebuilt each way:
+
+| | off | on |
+|---|---|---|
+| semantic, literal queries | 0.413 | **0.392** |
+| hybrid, literal queries | 0.857 | **0.832** |
+| hybrid, hit@10 | 0.963 | 0.956 |
+| hybrid, title queries | 0.956 | 1.000 |
+
+The title column goes up because the treatment puts the title INTO the text
+being embedded — a title query then matches tautologically, which measures
+nothing. On the half of the set it cannot game, it is slightly worse.
+
+A plausible mechanism, and the reason this is not a refutation of the original
+result: memgres chunks are 400 characters, and a path plus a title is 60–100 of
+them — up to a quarter of every vector spent on the same words. Anthropic's
+chunks are several hundred *tokens*, two to three times longer, and their
+context is a sentence an LLM writes about that specific chunk rather than a
+fixed prefix. The technique may well pay at those proportions.
+
+So it ships **off**, with the measurement written down. If you run larger
+chunks, measure it on your own corpus before believing either result — and
+weight the verdict on logged queries rather than on generated ones, for exactly
+the reason the title column shows.
