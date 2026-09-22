@@ -62,18 +62,22 @@ def index_memory(conn, cfg, embedder, backend, memory_id: str, body: str,
     caller owns commit/rollback (the write path folds this into its own tx; the
     worker commits per row)."""
     src = src_hash or content_hash(body)
-    if cfg.chunk_context:
-        # Fold the recipe into the stamp. Without this, flipping the setting
-        # leaves prefixed and unprefixed vectors in one index and the
-        # `chunk_src_hash == src` short-circuit below never notices — the silent
-        # kind of wrong this codebase refuses elsewhere (schema.py::_stamp).
-        # A re-embed is still the way to adopt it corpus-wide; this makes sure a
-        # rewritten memory is re-indexed under the recipe now in force.
-        src = content_hash(src + "\x00chunk_context")
+    # TWO hashes, and conflating them wedges the queue. `src` identifies the
+    # BODY: `_clear_pending` clears the flag only where `content_hash` still
+    # equals it, so it must stay the body's hash. `stamp` identifies the body AND
+    # the recipe used to chunk it, and that is what the chunk store records —
+    # without the recipe in it, flipping `chunk_context` leaves prefixed and
+    # unprefixed vectors in one index and the short-circuit below never notices
+    # (the silent kind of wrong `schema.py::_stamp` exists to prevent).
+    #
+    # Folding the recipe into `src` instead made `_clear_pending` match nothing,
+    # so every drain re-embedded the same rows forever: a re-embed reported
+    # 243 000 memories embedded with 198 still pending.
+    stamp = content_hash(src + "\x00chunk_context") if cfg.chunk_context else src
     if backend is None or embedder is None:
         _clear_pending(conn, memory_id, src)   # no vectors; don't leave it pending
         return False
-    if backend.chunk_src_hash(conn, memory_id, ns) == src:
+    if backend.chunk_src_hash(conn, memory_id, ns) == stamp:
         _clear_pending(conn, memory_id, src)   # already current for this body
         return False
     spans = segment(body, cfg.chunk_chars, cfg.chunk_overlap)
@@ -81,7 +85,7 @@ def index_memory(conn, cfg, embedder, backend, memory_id: str, body: str,
         lead = _context_lead(conn, cfg, memory_id, ns)
         vecs = embedder.embed_documents([lead + body[s:e] for (s, e) in spans])
         chunks = [(i, s, e, v) for i, ((s, e), v) in enumerate(zip(spans, vecs))]
-        backend.index_chunks(conn, memory_id, ns, src, chunks)
+        backend.index_chunks(conn, memory_id, ns, stamp, chunks)
     else:
         backend.delete_chunks(conn, memory_id, ns)   # empty body → no chunks
     _clear_pending(conn, memory_id, src)

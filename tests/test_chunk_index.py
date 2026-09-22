@@ -378,3 +378,36 @@ def test_pg_tags_match_reaches_the_backend(pg_store):
 
 def test_qdrant_tags_match_reaches_the_backend(qdrant_store):
     _tags_match_reaches_the_backend(qdrant_store)
+
+
+def _context_prefix_clears_the_flag(store, monkeypatch):
+    """`MEMGRES_CHUNK_CONTEXT` changes the text that gets embedded, so the chunk
+    store records body+recipe — but `embed_pending` is cleared by matching the
+    BODY's hash. Conflating the two made the flag unclearable: every drain
+    re-embedded the same rows forever, reporting hundreds of thousands embedded
+    with the queue exactly as long as before."""
+    monkeypatch.setenv("MEMGRES_CHUNK_CONTEXT", "true")
+    cfg = load()
+    s = Store(cfg, embedder=_Keyword(), conn=store._conn)
+    m = s.write(body="apple " * 60, title="Apples", path="fruit.apples")
+
+    with s._conn.cursor() as cur:
+        cur.execute("SELECT embed_pending FROM memory WHERE id = %s", (m.id,))
+        assert cur.fetchone()[0] is False          # indexing cleared it
+
+    from memgres.indexing import drain
+    assert drain(s._conn, cfg, s.embedder, s._vectors, limit=5) == 0   # nothing re-claimed
+
+    # and the recipe is IN the stamp: turning it off makes the stored chunks stale
+    monkeypatch.setenv("MEMGRES_CHUNK_CONTEXT", "false")
+    plain = load()
+    from memgres.indexing import index_memory
+    with s._conn.cursor() as cur:
+        cur.execute("SELECT namespace FROM memory WHERE id = %s", (m.id,))
+        ns = cur.fetchone()[0]
+    assert index_memory(s._conn, plain, s.embedder, s._vectors, m.id,
+                        "apple " * 60, ns) is True
+
+
+def test_pg_context_prefix_clears_the_flag(pg_store, monkeypatch):
+    _context_prefix_clears_the_flag(pg_store, monkeypatch)
