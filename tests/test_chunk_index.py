@@ -356,8 +356,8 @@ if __name__ == "__main__":
 
 # ─── match_tags must reach the vector paths, not just the lexical one ────────
 def _tags_match_reaches_the_backend(store):
-    """`mode="auto"` resolves to semantic whenever an embedder is configured, so
-    the vector path is the DEFAULT one for any semantic deployment. If
+    """`mode="auto"` resolves to hybrid whenever an embedder is configured, so
+    the vector path runs in the DEFAULT recall of any semantic deployment. If
     `tags_match` is not threaded into `grouped_chunk_search`, `any` silently
     returns the `all` answer — fewer rows, no error."""
     both = store.write(body="apple apple", tags=["a", "b"])

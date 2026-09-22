@@ -534,7 +534,10 @@ def build_server(cfg: Optional[Config] = None):
                       space: Spaces = None, space_id: Spaces = None,
                       ctx: Context = None) -> List[dict]:
         """Search memories — bodies AND curated titles, with a title match
-        weighted higher. `mode`: lexical | semantic | hybrid | auto. `match`
+        weighted higher. `mode`: lexical | semantic | hybrid | auto — the
+        default `auto` is hybrid wherever an embedder is configured (meaning and
+        exact wording both count), else lexical. Reach for `semantic` only to
+        ignore wording deliberately. `match`
         governs lexical word combination — defaults to OR-any (any query word
         matches, forgiving recall); set 'all' to require every word (narrow).
         Optionally scope to a tag set (`tags` — `match_tags="all"`, the default,

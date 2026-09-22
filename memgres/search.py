@@ -2,8 +2,9 @@
 
 All three share the same filters — namespace, tags (``@>`` contains-all), tree
 subtree (``path <@ prefix``), and not-expired — so you can scope any query to a
-branch of the tree or a set of tags. ``mode='auto'`` picks semantic when a
-vector backend is present (an embedder is configured), else lexical.
+branch of the tree or a set of tags. ``mode='auto'`` picks hybrid when a
+vector backend is present (an embedder is configured), else lexical — see
+``recall`` for why hybrid rather than semantic.
 
 Semantic ranking lives behind a :class:`~memgres.vector.VectorBackend` (pgvector
 in-row, or Qdrant out-of-band); this module never branches on which one. Hybrid
@@ -197,7 +198,14 @@ def recall(conn, cfg, embedder, ns, query: str, *, k: int = 10,
            full_body: Optional[bool] = None, bodies: bool = True,
            tags_match: str = "all") -> List[Hit]:
     if mode == "auto":
-        mode = "semantic" if backend else "lexical"
+        # Hybrid, not semantic: a vector alone fumbles the thing people most
+        # often come back for — an exact literal (an IP, a hostname, a config
+        # key, an identifier). Those carry no meaning to compress, so every
+        # similar-looking string sits about as close, and the right record lands
+        # somewhere in the top ten instead of first. Lexical nails them and
+        # fumbles the paraphrase; RRF takes both lists, so each covers the
+        # other's blind spot. It costs one more query against the same database.
+        mode = "hybrid" if backend else "lexical"
     if mode == "lexical":
         hits = _lexical(conn, cfg, ns, query, k, tags, path_prefix, match,
                         tags_match)

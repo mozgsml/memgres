@@ -105,3 +105,37 @@ def test_empty_query_does_not_crash(monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_auto_is_hybrid_wherever_an_embedder_exists(monkeypatch):
+    """The default has to carry exact literals — an IP, a config key — because
+    that is what people come back for, and a vector alone ranks them by vague
+    resemblance. `auto` therefore means hybrid, and only falls to lexical when
+    there is no embedder at all."""
+    from memgres import search
+
+    seen = {}
+
+    def fake_lexical(conn, cfg, ns, query, k, *a, **kw):
+        seen["lexical"] = True
+        return []
+
+    class FakeEmbedder:
+        def embed_query(self, *a, **kw):
+            return [0.0]
+
+    class FakeBackend:
+        def search(self, *a, **kw):
+            seen["vector"] = True
+            return []
+
+    monkeypatch.setattr(search, "_lexical", fake_lexical)
+
+    search.recall(None, None, FakeEmbedder(), None, "ip 10.0.0.1",
+                  backend=FakeBackend(), bodies=False)
+    assert seen == {"lexical": True, "vector": True}       # both lists: hybrid
+
+    seen.clear()
+    search.recall(None, None, FakeEmbedder(), None, "ip 10.0.0.1",
+                  backend=None, bodies=False)
+    assert seen == {"lexical": True}                       # no embedder: lexical

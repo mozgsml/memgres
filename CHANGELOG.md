@@ -5,6 +5,22 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [Unreleased]
+
+### Changed
+- **The default recall mode is now hybrid, not semantic.** `mode="auto"` — what
+  every caller gets unless it says otherwise — resolved to pure vector search
+  wherever an embedder was configured, and a vector is weakest at exactly what
+  people come back for: an exact literal. An IP, a hostname, a config key or an
+  identifier carries no meaning to compress, so every similar-looking string
+  sits about as close and the right memory lands mid-list. Measured on a real
+  corpus: searching `192.168.1.121` put the one memory containing it 2nd,
+  `MEMGRES_TOKEN_SINK` put its decision record 4th; hybrid put both 1st and left
+  a paraphrase query (where lexical alone finds nothing) unchanged in 1st. The
+  cost is one more query against the same database, and `auto` still falls to
+  lexical when there is no embedder. Ask for `semantic` explicitly to ignore
+  wording on purpose.
+
 ## [0.14.0] — 2026-09-21
 
 The panel stops being read-only about *people*: administrators take accounts on,
