@@ -62,6 +62,14 @@ def index_memory(conn, cfg, embedder, backend, memory_id: str, body: str,
     caller owns commit/rollback (the write path folds this into its own tx; the
     worker commits per row)."""
     src = src_hash or content_hash(body)
+    if cfg.chunk_context:
+        # Fold the recipe into the stamp. Without this, flipping the setting
+        # leaves prefixed and unprefixed vectors in one index and the
+        # `chunk_src_hash == src` short-circuit below never notices — the silent
+        # kind of wrong this codebase refuses elsewhere (schema.py::_stamp).
+        # A re-embed is still the way to adopt it corpus-wide; this makes sure a
+        # rewritten memory is re-indexed under the recipe now in force.
+        src = content_hash(src + "\x00chunk_context")
     if backend is None or embedder is None:
         _clear_pending(conn, memory_id, src)   # no vectors; don't leave it pending
         return False

@@ -138,8 +138,12 @@ class RetentionSweeper(PeriodicWorker):
         — a deployment that keeps memories forever still should not keep a
         record of every question anyone asked. Best-effort, like the log itself.
         """
-        days = getattr(self.cfg, "search_log_days", 0)
-        if not self.cfg.search_log or days <= 0:
+        # NOT gated on `search_log` being on: the documented workflow is to turn
+        # it on, gather cases, and turn it back off — and gating the sweep on the
+        # toggle would mean every query gathered that way is then kept forever.
+        # The DELETE is a no-op where nothing was ever logged.
+        days = self.cfg.search_log_days
+        if days <= 0:
             return 0
         try:
             conn = self._conn_ok()
@@ -158,6 +162,27 @@ class RetentionSweeper(PeriodicWorker):
         self.sweep_once()
 
 
+def _log_has_rows(connect: Callable[[], "object"]) -> bool:
+    """Is there anything left in the search log? Asked once, at startup, and any
+    failure answers "no" — this decides whether to start a housekeeping thread,
+    and a housekeeping question must never keep a server from coming up."""
+    try:
+        conn = connect()
+    except Exception:                                           # pragma: no cover
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT EXISTS (SELECT 1 FROM search_log)")
+            return bool(cur.fetchone()[0])
+    except Exception:                                           # pragma: no cover
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:                                       # pragma: no cover
+            pass
+
+
 def maybe_start_sweeper(cfg, connect: Callable[[], "object"],
                         embedder=None, backend=None) -> Optional[RetentionSweeper]:
     """Start a :class:`RetentionSweeper` when the deployment actually has a
@@ -173,8 +198,12 @@ def maybe_start_sweeper(cfg, connect: Callable[[], "object"],
     is redundant, so a deployment that runs a dedicated sweeper can silence the
     rest."""
     # A deployment can keep memories forever and still expire the search log,
-    # so either policy is reason enough to run the thread.
-    sweeps_log = cfg.search_log and cfg.search_log_days > 0
+    # so either policy is reason enough to run the thread. The log side asks a
+    # question rather than reading the toggle: the documented workflow is to
+    # turn logging ON, gather cases, and turn it OFF again, and rows gathered
+    # that way still have to expire. So: is the log on, or is there anything
+    # left in it? A deployment that never logged starts no thread.
+    sweeps_log = cfg.search_log_days > 0 and (cfg.search_log or _log_has_rows(connect))
     if (cfg.retention_days <= 0 and not sweeps_log) or not cfg.retention_sweep:
         return None
     return RetentionSweeper(cfg, connect, embedder, backend).start()

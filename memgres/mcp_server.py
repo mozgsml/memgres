@@ -684,7 +684,8 @@ def build_server(cfg: Optional[Config] = None):
         whole chain."""
         with pool.connection() as conn:
             return _store(conn).history(_token(ctx), id, at=at,
-                                        limit=limit or None, before_seq=before_seq,
+                                        limit=max(0, limit) or None,
+                                        before_seq=before_seq,
                                         space=space, space_id=space_id)
 
     @tool()

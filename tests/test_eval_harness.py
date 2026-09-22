@@ -252,3 +252,67 @@ def test_a_broken_log_never_breaks_a_search(store, monkeypatch):
     with s._conn.cursor() as cur:
         cur.execute("DROP TABLE search_log")
     assert s.recall(None, "apple")          # the answer still comes back
+
+
+# ─── the literal detector runs on caller text, so its cost must be bounded ───
+def test_the_literal_detector_cannot_be_made_slow():
+    """It decides the fusion weights on the DEFAULT recall path, from a string
+    the caller chose. The first version's dotted-host alternative could split a
+    hyphenated run O(n²) ways and then fail at the dot — cubic, measured at 20.8
+    seconds for 2400 characters of "ab-", which a read-only token was enough to
+    spend. Nothing else caps query length, so the bound lives here."""
+    import time
+
+    from memgres.search import LITERAL_SCAN_CHARS
+
+    for n in (1200, 2400, 9600, 50_000):
+        q = "ab-" * (n // 3)
+        began = time.perf_counter()
+        looks_literal(q)
+        assert time.perf_counter() - began < 0.25, f"{n} chars took too long"
+
+    # the bound is a prefix scan, not a truncation of meaning: a literal that
+    # matters is at the front of what someone typed
+    assert looks_literal("x" * LITERAL_SCAN_CHARS + " 10.0.0.1") is False
+    assert looks_literal("10.0.0.1 " + "x" * LITERAL_SCAN_CHARS) is True
+
+
+def test_erasing_a_memory_erases_it_from_the_search_log(store, monkeypatch):
+    """"Erasure is real" has to cover the log, which holds the more telling
+    half: not just the id, but the query that found it and who asked."""
+    monkeypatch.setenv("MEMGRES_SEARCH_LOG", "true")
+    s = Store(load(), embedder=_Keyword(), conn=store._conn)
+    a = s.write(body="apple " * 40, title="Apples", path="a")
+    s.write(body="banana " * 40, title="Bananas", path="b")
+    s.recall(None, "apple")
+    s.get(None, id=a.id)
+
+    with s._conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM search_log WHERE memory_id = %s "
+                    "OR %s = ANY(results)", (a.id, a.id))
+        assert cur.fetchone()[0] == 2                 # the get, and the recall
+
+    assert s.forget(None, id=a.id) is True
+
+    with s._conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM search_log WHERE memory_id = %s "
+                    "OR %s = ANY(results)", (a.id, a.id))
+        assert cur.fetchone()[0] == 0                 # gone from both places
+        # the recall itself is still there — the question someone asked is not
+        # the memory, and only this memory's id was taken out of its results
+        cur.execute("SELECT kind, results FROM search_log")
+        rows = cur.fetchall()
+        assert [r[0] for r in rows] == ["recall"]
+        assert str(a.id) not in [str(x) for x in (rows[0][1] or [])]
+
+
+def test_a_paging_cursor_cannot_be_turned_into_a_crash(store):
+    m = store.write(body="one", title="t", path="p")
+    store.write(id=m.id, body="two", title="t")
+    # out of Postgres' integer range, and a nonsense limit: refused by clamping,
+    # not by an `integer out of range` coming back as a 500
+    # clamped, not crashed: a cursor past every revision means "before all of
+    # them", and a nonsense limit becomes the nearest sane one
+    assert len(store.history(None, id=m.id, before_seq=10 ** 20)) == 2
+    assert len(store.history(None, id=m.id, limit=-5)) == 1
+    assert len(store.history(None, id=m.id, limit=10 ** 9)) == 2

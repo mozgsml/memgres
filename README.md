@@ -191,7 +191,7 @@ Everything is env, all optional (defaults suit a single-user embed). Full list i
 | `MEMGRES_SEARCH_LOG` / `_DAYS` | `false` / `30` | record what was searched for and what was opened next, so `memgres-eval` can measure against real queries (docs/RECALL.md). Off by default: a query is content |
 | `MEMGRES_RRF_K` | `60` | hybrid fusion damping: larger = being ranked well by *both* searches counts for more than topping one of them |
 | `MEMGRES_RRF_W_SEMANTIC` / `_W_LEXICAL` | `1.0` / `1.0` | how loudly each ranking votes in the fusion |
-| `MEMGRES_RRF_W_LEXICAL_LITERAL` | `1.0` | the lexical weight when the query carries a literal (an IP, a host, a path, `AN_ENV_KEY`) — the case where exact matching is the trustworthy one |
+| `MEMGRES_RRF_W_LEXICAL_LITERAL` | `2.0` | the lexical weight when the query carries a literal (an IP, a host, a path, `AN_ENV_KEY`) — the case where exact matching is the trustworthy one |
 | `MEMGRES_SNIPPET` | `true` | extract a best-match slice per hit (`MEMGRES_SNIPPET_*` tune size/semantic); `false` returns whole bodies |
 | `MEMGRES_FULL_BODY` | `false` | force the whole body on every hit (off = auto: short whole, long sliced); `full_body` per call overrides |
 | `MEMGRES_FULL_BODY_MAX_CHARS` | `500` | a body this short is returned whole (`kind="full"`) instead of sliced |

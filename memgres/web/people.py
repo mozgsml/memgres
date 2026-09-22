@@ -441,7 +441,7 @@ def record_blame(store, principal, space_id: str, record_id: str) -> dict:
 
 # ─── HTTP ────────────────────────────────────────────────────────────────────
 def mount(app, cfg, pool, panel, providers, make_store) -> None:
-    from fastapi import Body, HTTPException, Request
+    from fastapi import Body, HTTPException, Query, Request
 
     from .sessions import control_principal
 
@@ -548,7 +548,7 @@ def mount(app, cfg, pool, panel, providers, make_store) -> None:
 
     @app.get("/ui/api/spaces/{space_id}/records/{record_id}/history")
     def history(space_id: str, record_id: str, request: Request,
-                before_seq: Optional[int] = None):
+                before_seq: Optional[int] = Query(None, ge=0, le=2 ** 31 - 1)):
         from ..identity import AuthError, SpaceNotFound
         from ..store import NotFound
         s = panel["session"](request)

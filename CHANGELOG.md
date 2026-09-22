@@ -21,6 +21,28 @@ patch = fixes).
   lexical when there is no embedder. Ask for `semantic` explicitly to ignore
   wording on purpose.
 
+### Fixed — found by the security review of this batch
+- **A crafted query could burn a CPU for minutes.** The literal detector added
+  above runs on caller text on the default recall path, and its dotted-host
+  pattern was ambiguous enough to backtrack cubically: 2400 characters of
+  `"ab-"` took 20.8 seconds, 9600 would take half an hour, and a read-only token
+  was enough to spend a worker thread that way. The pattern is now unambiguous
+  and the scan is bounded to the first 500 characters — the same input now takes
+  3 ms.
+- **Erasure covers the search log.** `forget` and the retention sweep deleted
+  the memory, its history and its usage counters but left the log holding its id
+  — and the query that found it, against the account that asked. Both now clear
+  it in the same transaction.
+- **Log retention no longer depends on the log being on.** The documented
+  workflow is to turn it on, gather cases and turn it off again; the sweep was
+  gated on the toggle, so everything gathered that way would have been kept
+  forever. A deployment that never logged still starts no sweeper.
+- **A paging cursor can no longer be turned into a 500** — `before_seq` and
+  `limit` are clamped rather than handed to Postgres to reject.
+- **Changing `MEMGRES_CHUNK_CONTEXT` is no longer silent**: it is folded into
+  the chunk stamp, so a rewritten memory re-indexes under the recipe in force
+  instead of leaving two kinds of vector in one index.
+
 ### Added — reading a record's past
 - **Blame in the panel** (*Who wrote this* on a record): the body split into
   runs, each banded with its author's colour and labelled with who last changed

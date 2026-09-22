@@ -98,13 +98,25 @@ _LITERAL = re.compile(r"""
     | \b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b                # MEMGRES_TOKEN_SINK
     | \b[a-zA-Z]\w*(?:_\w+)+\b                        # create_own_namespace
     | /[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+             # /var/www/memgres
-    | \b[\w-]*[A-Za-z][\w-]*(?:\.[\w-]+)+\b          # okx.agentstools.dev
+    | \b(?=[\w-]*[A-Za-z])[\w-]+(?:\.[\w-]+)+\b      # okx.agentstools.dev
 """, re.X)
+
+# How much of a query decides its kind. Two reasons, and the second is the
+# serious one. A literal that matters is at the front of what someone typed; and
+# this runs on caller-supplied text on the DEFAULT recall path, so its cost must
+# not depend on how long that text is. The dotted-host alternative above used to
+# read `[\w-]*[A-Za-z][\w-]*`, which can split a hyphenated run O(n²) ways and
+# then fail at the dot — cubic overall, measured at 20.8 s for a 2400-character
+# query of "ab-" repeated, and half an hour by 9600. A read-only token was enough
+# to spend a worker thread that way, and nothing else caps query length. The
+# lookahead removes the ambiguity (one way to match), and this bound removes the
+# class: whatever the regex does, it does to at most 500 characters.
+LITERAL_SCAN_CHARS = 500
 
 
 def looks_literal(query: str) -> bool:
     """Is the caller after an exact string rather than a meaning?"""
-    return bool(_LITERAL.search(query or ""))
+    return bool(_LITERAL.search((query or "")[:LITERAL_SCAN_CHARS]))
 
 
 def _rrf(lists: Sequence[List[Hit]], k: int, *, rrf_k: int = RRF_K,

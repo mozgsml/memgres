@@ -1655,7 +1655,11 @@ class Store:
         user_id = token_id = None
         if self._identity_on:
             try:
-                p = self._principal(token)
+                # `token` here is normally the Principal the caller's own
+                # authorization already resolved; re-resolving a bearer secret
+                # would cost a second lookup and a second `last_used_at` write
+                # on every read.
+                p = token if isinstance(token, identity.Principal) else self._principal(token)
                 user_id, token_id = p.user_id, getattr(p, "token_id", None)
             except Exception:                                   # pragma: no cover
                 pass
@@ -1671,6 +1675,23 @@ class Store:
                      memory_id, ms))
         except Exception as e:                                  # pragma: no cover
             _log.warning("search log write failed (ignored): %s", e)
+
+    @staticmethod
+    def _forget_in_log(cur, ids: Sequence[str]) -> None:
+        """Take a deleted memory out of the search log, in the same transaction.
+
+        "Erasure is real, history goes with the row" (docs/TENANCY.md) has to
+        cover this too — and the log is the more telling half: it holds not just
+        the id but the QUERY that found it, against the account that asked.
+        A memory someone was told was gone must not stay findable in a table
+        whose only other cleanup is a 30-day clock.
+        """
+        if not ids:
+            return
+        cur.execute("DELETE FROM search_log WHERE memory_id = ANY(%s::uuid[])", (list(ids),))
+        for one in ids:            # it also appears inside other rows' result lists
+            cur.execute("UPDATE search_log SET results = array_remove(results, %s::uuid) "
+                        "WHERE %s::uuid = ANY(results)", (one, one))
 
     def _count_usage(self, kind: str, ids: Sequence[str], *,
                      want: bool = False) -> Optional[dict]:
@@ -1797,6 +1818,11 @@ class Store:
         it would quietly reconstruct the wrong text.
         """
         ns, _ = self._authorize(token, space=space, space_id=space_id, need="read")
+        # A cursor is caller input: out-of-range values used to reach Postgres and
+        # come back as `integer out of range` — a 500 where a refusal belongs.
+        limit = max(1, min(int(limit), 1000)) if limit else None
+        if before_seq is not None:
+            before_seq = max(0, min(int(before_seq), 2 ** 31 - 1))
         id, _moved = self._address(ns, id, at, follow=if_moved == "follow")
         cur = self._conn.cursor()
         cur.execute("SELECT 1 FROM memory WHERE id=%s AND namespace=%s", (id, ns))
@@ -1912,6 +1938,7 @@ class Store:
                 # foreign key is absent. Same transaction as the delete, so the
                 # counts cannot outlive the memory they counted.
                 cur.execute("DELETE FROM memory_usage WHERE memory_id=%s", (id,))
+                self._forget_in_log(cur, [id])
         if deleted and self._vectors is not None:
             # drop this memory's chunk vectors (pgvector: FK-cascaded already;
             # qdrant: an out-of-band collection, so this is the real cleanup there)
@@ -1952,6 +1979,7 @@ class Store:
             if gone:
                 cur.execute("DELETE FROM memory_usage WHERE memory_id = ANY(%s::uuid[])",
                             ([m for m, _ns in gone],))
+                self._forget_in_log(cur, [m for m, _ns in gone])
         if gone and self._vectors is not None:
             for mid, ns in gone:
                 self._vectors.delete_chunks(self._conn, mid, ns)

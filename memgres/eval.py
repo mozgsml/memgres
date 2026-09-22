@@ -68,8 +68,15 @@ def _title_cases(conn, ns: Sequence[str], n: int, rng: random.Random) -> List[Ca
     but as a query it has no single right answer."""
     with conn.cursor() as cur:
         cur.execute(
+            # ORDER BY id, then shuffle with a seeded rng: without the ORDER BY
+            # the sample rides on PHYSICAL row order, which Postgres rewrites
+            # whenever the rows are updated — so a re-embed silently changed the
+            # case set and two runs were no longer comparable. Found by noticing
+            # that the lexical column, which touches no vectors at all, moved
+            # between two passes of an A/B.
             "SELECT id, title FROM memory WHERE namespace = ANY(%s::text[]) "
-            "AND title IS NOT NULL AND length(title) > 20 AND length(body) > 200",
+            "AND title IS NOT NULL AND length(title) > 20 AND length(body) > 200 "
+            "ORDER BY id",
             (list(ns),))
         rows = cur.fetchall()
     rng.shuffle(rows)
@@ -92,7 +99,7 @@ def _literal_cases(conn, ns: Sequence[str], n: int, rng: random.Random,
 
     with conn.cursor() as cur:
         cur.execute("SELECT id, body FROM memory WHERE namespace = ANY(%s::text[]) "
-                    "AND body <> ''", (list(ns),))
+                    "AND body <> '' ORDER BY id", (list(ns),))   # see _title_cases
         rows = cur.fetchall()
     where: Dict[str, set] = {}
     for mid, body in rows:
@@ -322,6 +329,10 @@ def main() -> None:  # pragma: no cover - entrypoint
     ap.add_argument("--sweep", action="store_true", help="also try a grid of fusion settings")
     ap.add_argument("--failures", action="store_true", help="list the cases that missed")
     ap.add_argument("--json", help="write the full report here")
+    ap.add_argument("--dump-cases", metavar="FILE",
+                    help="write the cases to a JSON Lines file and exit — feed it "
+                         "back with --queries to measure two builds of the index "
+                         "on exactly the same questions")
     ap.add_argument("--seed", type=int, default=0, help="case sampling seed (repeatable)")
     args = ap.parse_args()
 
@@ -360,6 +371,14 @@ def main() -> None:  # pragma: no cover - entrypoint
     if not cases:
         raise SystemExit("no cases: the corpus has no titles or literals to "
                          "derive them from — pass --queries with your own.")
+
+    if args.dump_cases:
+        with open(args.dump_cases, "w", encoding="utf-8") as fh:
+            for kind, query, want in cases:
+                fh.write(json.dumps({"query": query, "expect": want, "kind": kind},
+                                    ensure_ascii=False) + "\n")
+        print(f"{len(cases)} cases → {args.dump_cases}")
+        return
 
     report = evaluate(conn, cfg, embedder, backend, ns, cases,
                       default_settings(cfg, args.sweep), k=args.k)
