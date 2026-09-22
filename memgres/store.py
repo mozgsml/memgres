@@ -1460,8 +1460,7 @@ class Store:
         tags across 97 memories) before normalisation and this call existed."""
         from .tags import tag_counts
         ns, _ = self._authorize_read(token, space=space, space_id=space_id)
-        return tag_counts(self._conn, ns, prefix=prefix,
-                          k=max(1, min(int(k), MAX_RESULTS)))
+        return tag_counts(self._conn, ns, prefix=prefix, k=self._clamp_k(k))
 
     # ─── list: enumerate a subtree (no query, no ranking) ───────────────────
     def list(self, token: Optional[str], *, path_prefix: Optional[str] = None,
@@ -1483,7 +1482,7 @@ class Store:
         """
         from .vector.base import build_filters
         ns, names = self._authorize_read(token, space=space, space_id=space_id)
-        limit = max(1, min(int(limit), MAX_RESULTS))
+        limit = self._clamp_k(limit)
         offset = max(0, int(offset))
         where, params = build_filters(ns, tags, path_prefix,
                                       check_tag_match(match_tags))

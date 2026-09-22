@@ -95,6 +95,26 @@ rarely reaches the tenth. The per-kind columns are the diagnosis: a `literal` MR
 means exact strings are getting lost — raise `W_LEXICAL_LITERAL`, or check that
 there is a lexical index at all.
 
+**Comparing two builds of the index.** To measure a change that alters the
+vectors — a different embedding model, `MEMGRES_CHUNK_CONTEXT` — the two runs
+must answer the *same* questions, and generated cases are sampled fresh each
+time. Freeze them first:
+
+```bash
+memgres-eval --dump-cases cases.jsonl          # once
+memgres-eval --titles 0 --literals 0 --queries cases.jsonl --json before.json
+# … change the setting, memgres-reembed …
+memgres-eval --titles 0 --literals 0 --queries cases.jsonl --json after.json
+```
+
+A caution learned the hard way: the sample is seeded, but a re-embed rewrites
+rows and therefore their physical order, and an unordered `SELECT` follows that
+order. The queries are now taken in id order before shuffling, so a seed really
+does reproduce a set — and the `lexical` column, which touches no vectors, is
+the check: if it moves between two passes, the case sets differ and the
+comparison is meaningless. (Expect it to wobble by a case or two anyway, where
+two memories tie on `ts_rank` and physical order breaks the tie.)
+
 **Why the sweep is cheap.** Both rankings are fetched once per case, deep, and
 every setting is then scored against those stored lists in memory. Twenty
 settings cost one query each, not twenty, nothing is re-embedded, and every row
