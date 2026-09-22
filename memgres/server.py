@@ -9,6 +9,7 @@ billing layer can wrap these routes without touching store logic:
     POST   /memories/{id}/move      convenience reparent
     DELETE /memories/{id}           forget (hard-erase + history)
     GET    /memories/{id}/history   provenance chain
+    GET    /memories/{id}/verify    recompute the hash chain
     GET    /recall                  lexical / semantic / hybrid recall
     GET    /healthz                 liveness
 
@@ -248,10 +249,31 @@ def create_app(cfg: Optional[Config] = None):
 
     @app.get("/memories/{mid}/history")
     def history(mid: str, tok: Optional[str] = Depends(token),
+                limit: int = Query(0, ge=0, le=1000),
+                before_seq: Optional[int] = Query(None, ge=0, le=2 ** 31 - 1),
                 space: Optional[str] = None, space_id: Optional[str] = None):
+        """The change chain, oldest first. `limit` returns the newest that many
+        instead and `before_seq` pages further back; `limit=0` is the whole
+        chain."""
         with pool.connection() as conn:
             return _guard(lambda: _store(conn).history(
-                tok, **_ref(mid), space=space, space_id=space_id))
+                tok, **_ref(mid), limit=limit or None, before_seq=before_seq,
+                space=space, space_id=space_id))
+
+    @app.get("/memories/{mid}/verify")
+    def verify(mid: str, tok: Optional[str] = Depends(token),
+               space: Optional[str] = None, space_id: Optional[str] = None):
+        """Recompute this memory's hash chain: `{"ok": true}` if every revision
+        still hashes to what it claims.
+
+        Tamper-evidence that nobody can check is a promise, not a property — and
+        until now the check existed only in the Python library, so the Docker +
+        MCP deployment the docs recommend could not run it at all. Each row is
+        verified with the recipe it records, so a chain written across an upgrade
+        verifies end to end."""
+        with pool.connection() as conn:
+            return {"ok": _guard(lambda: _store(conn).verify_history(
+                tok, **_ref(mid), space=space, space_id=space_id))}
 
     @app.get("/memories/{mid}/blame")
     def blame(mid: str, upto_seq: Optional[int] = None,

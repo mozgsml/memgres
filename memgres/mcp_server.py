@@ -137,6 +137,7 @@ TOOL_VISIBILITY = {
     "memory_links": (),
     "memory_blame": (),
     "memory_history": (),
+    "memory_verify_history": (),      # reading the chain is a read
     "memory_server_info": (),
     "memory_write": ("can_write",),
     "memory_move": ("can_write",),
@@ -674,6 +675,24 @@ def build_server(cfg: Optional[Config] = None):
                                         limit=max(0, limit) or None,
                                         before_seq=before_seq,
                                         space=space, space_id=space_id)
+
+    @tool()
+    def memory_verify_history(id: Optional[str] = None, at: Optional[str] = None,
+                              space: Optional[str] = None,
+                              space_id: Optional[str] = None,
+                              ctx: Context = None) -> dict:
+        """Recompute a memory's hash chain: `{"ok": true}` when every revision
+        still hashes to what it claims, `false` when one does not.
+
+        What it proves: the stored history has not been edited in the database
+        behind the server's back — each row's digest covers the row before it, so
+        a changed or removed revision breaks the chain from there on. What it
+        does not prove: that what someone wrote was true. Each row is verified
+        with the recipe it records, so a chain written across an upgrade verifies
+        end to end."""
+        with pool.connection() as conn:
+            return {"ok": _store(conn).verify_history(_token(ctx), id, at=at,
+                                                      space=space, space_id=space_id)}
 
     @tool()
     def memory_move(new_path: str, id: Optional[str] = None,

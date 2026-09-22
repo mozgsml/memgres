@@ -1053,6 +1053,13 @@ def create_own_namespace(conn, principal: Principal, name: str, *,
 
 
 def add_member(conn, namespace_id: str, user_id: str, permission: str = "read") -> None:
+    """SET a member's permission — the deliberate act of saying what someone has.
+
+    Use :func:`grant_at_least` for anything that GIVES access as a side effect
+    (an approval, an invitation, an add-by-email): this one can lower, and
+    lowering someone silently because an old request was finally approved is a
+    surprise nobody asked for.
+    """
     if permission not in _RANK:
         raise ValueError(f"bad permission: {permission}")
     with conn.cursor() as cur:
@@ -1061,6 +1068,40 @@ def add_member(conn, namespace_id: str, user_id: str, permission: str = "read") 
             "VALUES (%s, %s, %s) ON CONFLICT (namespace_id, user_id) "
             "DO UPDATE SET permission=EXCLUDED.permission",
             (namespace_id, user_id, permission))
+
+
+def grant_at_least(conn, namespace_id: str, user_id: str, permission: str,
+                   cur=None) -> None:
+    """Make someone a member with AT LEAST this permission; stronger access they
+    already have stays.
+
+    This is what every "let them in" path wants, and until now only the panel
+    had it: approving a months-old request for `read` through the API could take
+    `admin` away from someone who had been promoted since, while the same act in
+    the browser could not. Same user-facing act, two outcomes, depending on the
+    door — so the rule lives here and both doors call it.
+
+    Changing a member's permission downwards is its own act
+    (:func:`add_member`), performed by someone who means it.
+
+    `cur` lets a caller fold this into a cursor it already holds, so an approval
+    stays one transaction with the row it closes.
+    """
+    if permission not in _RANK:
+        raise ValueError(f"bad permission: {permission}")
+    sql = ("INSERT INTO namespace_member (namespace_id, user_id, permission) "
+           "VALUES (%s, %s, %s) ON CONFLICT (namespace_id, user_id) DO UPDATE SET "
+           "permission = CASE WHEN array_position(ARRAY['read','write','admin'], "
+           "                       EXCLUDED.permission) > "
+           "                  array_position(ARRAY['read','write','admin'], "
+           "                       namespace_member.permission) "
+           "             THEN EXCLUDED.permission ELSE namespace_member.permission END")
+    args = (namespace_id, user_id, permission)
+    if cur is not None:
+        cur.execute(sql, args)
+        return
+    with conn.cursor() as c:
+        c.execute(sql, args)
 
 
 def edit_namespace(conn, namespace_id: str, *, description: Optional[str] = None,
@@ -1744,11 +1785,21 @@ def list_requests(conn, namespace_id: str, *, pending_only: bool = True) -> List
 
 
 def approve_request(conn, request_id: str, *,
-                    expect_permission: Optional[str] = None) -> None:
-    """Grant the requested membership and close the request.
+                    expect_permission: Optional[str] = None,
+                    permission: Optional[str] = None) -> None:
+    """Grant the membership and close the request.
 
     `expect_permission` is what the approver SAW when they decided. Supplying it
     turns "the request changed under me" from a silent over-grant into a refusal.
+
+    `permission` is what the approver decided to give, which need not be what
+    was asked — an administrator may answer a request for `admin` with `write`.
+    Omitted, the request's own ask is granted.
+
+    The grant never lowers what the requester already has (`grant_at_least`),
+    and the namespace's OWNER is not made a member of their own namespace: they
+    reach it by owning it, and a membership row would be a second, weaker answer
+    to the same question.
     """
     with conn.cursor() as cur:
         # FOR UPDATE so the row cannot change between the authorization above
@@ -1767,7 +1818,11 @@ def approve_request(conn, request_id: str, *,
             raise AuthError(
                 f"this request now asks for '{perm}', not '{expect_permission}' "
                 "— look at it again before approving")
-    add_member(conn, str(nsid), str(requester), perm)
+    granted = permission or perm
+    if granted not in _RANK:
+        raise ValueError(f"bad permission: {granted}")
+    if namespace_owner(conn, str(nsid)) != str(requester):
+        grant_at_least(conn, str(nsid), str(requester), granted)
     with conn.cursor() as cur:
         cur.execute("UPDATE access_request SET status='approved', decided_at=now() "
                     "WHERE id=%s", (request_id,))

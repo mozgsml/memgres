@@ -117,11 +117,12 @@ async function renderPeople(box) {
     if (my !== seq) return;
     total = got.total;
     const rows = got.people;
-    $("#pp-table", box).innerHTML = rows.length ? `<thead><tr>${["adm.col.person", "acc.role", "adm.col.signins", "adm.col.lastSignin", "adm.col.lastWrite", "tok.status"].map((k) => `<th>${esc(t(k))}</th>`).join("")}</tr></thead>
+    $("#pp-table", box).innerHTML = rows.length ? `<thead><tr>${["adm.col.person", "acc.role", "adm.col.signins", "adm.col.lastSeen", "adm.col.lastSignin", "adm.col.lastWrite", "tok.status"].map((k) => `<th>${esc(t(k))}</th>`).join("")}</tr></thead>
       <tbody>${rows.map((p) => `<tr>
         <td class="strong">${personLink(p.id, personName(p))}<small class="cell-sub">${esc([p.email, p.department].filter(Boolean).join(" · "))}</small></td>
         <td><span class="perm ${p.role === "user" ? "read" : "admin"}">${esc(t("role." + p.role))}</span></td>
         <td class="num">${nf(p.signins)}</td>
+        <td${p.last_seen_at ? ` title="${esc(t("adm.lastSeenWhy"))}"` : ""}>${esc(p.last_seen_at ? ago(p.last_seen_at) : t("tok.never"))}</td>
         <td>${esc(p.last_signin_at ? ago(p.last_signin_at) : t("tok.never"))}</td>
         <td>${esc(p.last_write_at ? ago(p.last_write_at) : t("tok.never"))}</td>
         <td><span class="dot ${p.disabled ? "off" : "on"}"><i></i>${esc(t(p.disabled ? "people.disabled" : "people.active"))}</span></td>

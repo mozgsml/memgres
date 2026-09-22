@@ -659,3 +659,103 @@ def test_an_administrator_cannot_mint_past_the_accounts_token_cap(box, monkeypat
         assert client.post(f"/ui/api/admin/people/{ids['ivan']}/tokens", json=body, headers=h).status_code == 201
     r = client.post(f"/ui/api/admin/people/{ids['ivan']}/tokens", json=body, headers=h)
     assert r.status_code == 409 and "2 active tokens" in r.text
+
+
+def test_a_person_is_last_seen_when_anything_of_theirs_was_used(box):
+    """Reads are not attributed per account anywhere in memgres — that would be
+    a row per recall — so "last seen" is built from what the server already
+    keeps: a sign-in, a write, and a token being presented. The token half is
+    what makes an agent reading all night count as its owner being active."""
+    client, cfg, _, ids = box
+    h = _as(client, cfg, ids["mgr"])
+    who = client.get(f"/ui/api/admin/people?q=ivan", headers=h).json()["people"][0]
+    assert who["last_seen_at"] is None                  # ivan has done nothing
+
+    tok = client.post(f"/ui/api/admin/people/{ids['ivan']}/tokens",
+                      json={"permission": "read", "expires_days": 30}, headers=h).json()
+    assert tok["token"]
+    with psycopg.connect(DSN) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE token SET last_used_at = now() WHERE id = %s", (tok["id"],))
+        conn.commit()
+
+    again = client.get(f"/ui/api/admin/people?q=ivan", headers=h).json()["people"][0]
+    assert again["last_seen_at"] is not None
+    prof = client.get(f"/ui/api/people/{ids['ivan']}", headers=h).json()
+    assert prof["person"]["last_seen_at"] == again["last_seen_at"]
+
+
+def test_approving_a_request_never_takes_away_access_gained_since(box):
+    """The two doors disagreed: the panel's approval could only raise a
+    membership, the API's set it outright — so approving a months-old request
+    for `read` through the API demoted someone who had been made `admin` in the
+    meantime. Same act, two outcomes, depending on which door. One path now."""
+    client, cfg, _, ids = box
+    # olga asks mark for `read` on sales, and is given `admin` before he answers
+    with psycopg.connect(DSN) as conn:
+        from memgres import admin as adm
+        from memgres import identity as ident
+        p = ident.Principal(user_id=ids["olga"], permission="admin", scope_namespace_id=None)
+        adm.request_access(conn, p, namespace_id=ids["sales"], permission="read")
+        ident.add_member(conn, ids["sales"], ids["olga"], "admin")
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id::text FROM access_request WHERE requester_user_id=%s "
+                        "AND namespace_id=%s AND status='pending'",
+                        (ids["olga"], ids["sales"]))
+            req = {"id": cur.fetchone()[0]}
+
+    h = _as(client, cfg, ids["mark"])
+    r = client.post(f"/ui/api/spaces/{ids['sales']}/requests/{req['id']}",
+                    json={"approve": True}, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["permission"] == "admin"          # not lowered to read
+
+    members = {m["id"]: m["permission"]
+               for m in client.get(f"/ui/api/spaces/{ids['sales']}/members").json()["members"]}
+    assert members[ids["olga"]] == "admin"
+
+    # and the API door, on a fresh request from someone else, behaves the same
+    with psycopg.connect(DSN) as conn:
+        from memgres import admin as adm
+        from memgres import identity as ident
+        ivan = ident.Principal(user_id=ids["ivan"], permission="admin", scope_namespace_id=None)
+        adm.request_access(conn, ivan, namespace_id=ids["sales"], permission="read")
+        ident.add_member(conn, ids["sales"], ids["ivan"], "write")   # promoted meanwhile
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id::text FROM access_request WHERE requester_user_id=%s "
+                        "AND namespace_id=%s AND status='pending'",
+                        (ids["ivan"], ids["sales"]))
+            req2 = cur.fetchone()[0]
+        owner = ident.Principal(user_id=ids["mark"], permission="admin", scope_namespace_id=None)
+        adm.decide_access(conn, owner, request_id=req2, approve=True)
+        conn.commit()
+        with conn.cursor() as cur:
+            assert ident._reach(cur, ids["ivan"], ids["sales"]) == "write"
+
+
+def test_a_record_past_its_retention_stops_appearing_in_the_activity_feed(box):
+    """Every read hides an expired record (`build_filters`), but the sweeper may
+    not have reached it yet — and the panel's activity feed was the one place
+    with a hand-written predicate, which forgot the clause. So a record the
+    deployment had promised to forget still appeared, by name, on a page."""
+    client, cfg, _, ids = box
+    tok = client.post("/admin/tokens", json={"user_id": ids["mark"]},
+                      headers=_bearer(os.environ["MEMGRES_ADMIN_TOKEN"])).json()["token"]
+    made = client.post("/memories", json={"space": "sales", "path": "notes.expiring",
+                                          "title": "Expiring note", "body": "x" * 50},
+                       headers=_bearer(tok)).json()
+
+    h = _as(client, cfg, ids["mark"])
+    prof = client.get(f"/ui/api/people/{ids['mark']}", headers=h).json()
+    assert any(r["record_id"] == made["id"] for r in prof["recent"])
+    before = prof["activity"]["total"]
+
+    with psycopg.connect(DSN) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE memory SET expires_at = now() - interval '1 day' WHERE id = %s",
+                    (made["id"],))
+        conn.commit()
+
+    after = client.get(f"/ui/api/people/{ids['mark']}", headers=h).json()
+    assert not any(r["record_id"] == made["id"] for r in after["recent"])
+    assert after["activity"]["total"] < before

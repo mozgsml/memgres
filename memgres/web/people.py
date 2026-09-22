@@ -75,7 +75,13 @@ def activity(conn, user_id: str, *, spaces: Optional[list]) -> dict:
         cur.execute(
             "SELECT (h.created_at AT TIME ZONE 'UTC')::date, m.namespace, h.op, count(*) "
             "FROM memory_history h JOIN memory m ON m.id = h.memory_id "
-            "WHERE h.author_user_id = %s AND h.created_at > now() - make_interval(days => %s)"
+            "WHERE h.author_user_id = %s AND h.created_at > now() - make_interval(days => %s) "
+            # A record whose retention window has closed is invisible to every
+            # read (`vector.base.build_filters`) but the sweeper may not have
+            # reached it yet — and until it does it was still being counted, and
+            # named, here. The one hand-written tenant predicate in the panel is
+            # also the one that forgot this clause.
+            "AND (m.expires_at IS NULL OR m.expires_at > now())"
             + where + " GROUP BY 1, 2, 3", params)
         rows = cur.fetchall()
         ns_ids = sorted({r[1] for r in rows if r[1]})
@@ -118,8 +124,10 @@ def recent_edits(conn, user_id: str, *, spaces: Optional[list]) -> list:
         cur.execute(
             "SELECT h.created_at, h.op, m.id::text, m.namespace, m.path::text, m.title, n.name "
             "FROM memory_history h JOIN memory m ON m.id = h.memory_id "
-            "JOIN namespace n ON n.id::text = m.namespace "
-            "WHERE h.author_user_id = %s" + where + " ORDER BY h.created_at DESC, h.id DESC LIMIT %s", params)
+            "JOIN namespace n ON n.id = m.namespace::uuid "      # cast the text side, not the key
+            "WHERE h.author_user_id = %s "
+            "AND (m.expires_at IS NULL OR m.expires_at > now()) "   # see `activity`
+            + where + " ORDER BY h.created_at DESC, h.id DESC LIMIT %s", params)
         return [{"at": at, "op": op, "record_id": rid, "space_id": ns, "path": path, "title": title or "",
                  "space": sname} for at, op, rid, ns, path, title, sname in cur.fetchall()]
 
@@ -177,6 +185,8 @@ def profile(conn, viewer, target_id: str, *, providers: dict) -> dict:
         cur.execute("SELECT count(*) FROM web_session WHERE user_id = %s AND revoked_at IS NULL "
                     "AND expires_at > now()", (str(uid),))
         live_sessions = cur.fetchone()[0]
+        cur.execute("SELECT " + LAST_SEEN + " FROM app_user u WHERE u.id = %s", (str(uid),))
+        person["last_seen_at"] = cur.fetchone()[0]
     # A user_manager hands out access without gaining it, so an administrator's
     # tokens and sign-in methods are not theirs to see (admin.list_tokens
     # refuses the same thing).
@@ -198,6 +208,24 @@ def profile(conn, viewer, target_id: str, *, providers: dict) -> dict:
         # will enforce it
         out["can"] = {"manage": may_manage, "set_role": viewer.role == "superadmin"}
     return out
+
+
+# When an account was last *used* — by the person or by anything acting on
+# their behalf. Three signals the server already keeps, none of them new
+# tracking: a sign-in to the panel, a write, and a token being presented (which
+# `identity.resolve` stamps on every authenticated call, so an agent reading all
+# night keeps its owner's account warm).
+#
+# Deliberately NOT "last read by this person": reads are not attributed per
+# account anywhere in memgres, by design — that would mean writing a row for
+# every recall. `MEMGRES_SEARCH_LOG` is the one place a read is attributable,
+# and it is off by default and swept, so it cannot be the basis of a column that
+# must always have an answer.
+LAST_SEEN = """(SELECT max(t) FROM (VALUES
+        ((SELECT max(last_login_at) FROM app_user_identity i WHERE i.user_id = u.id)),
+        ((SELECT max(created_at) FROM memory_history h WHERE h.author_user_id = u.id)),
+        ((SELECT max(last_used_at) FROM token tk WHERE tk.user_id = u.id))
+    ) AS s(t))"""
 
 
 # ─── the directory (service administrators) ──────────────────────────────────
@@ -222,14 +250,15 @@ def directory(conn, *, q: str = "", limit: int = 50, offset: int = 0) -> dict:
             "       u.created_at, "
             "       (SELECT max(last_login_at) FROM app_user_identity i WHERE i.user_id = u.id), "
             "       (SELECT max(created_at) FROM memory_history h WHERE h.author_user_id = u.id), "
-            "       (SELECT count(*) FROM app_user_identity i WHERE i.user_id = u.id) "
+            "       (SELECT count(*) FROM app_user_identity i WHERE i.user_id = u.id), "
+            "       " + LAST_SEEN + " "
             f"FROM app_user u {where} "
             "ORDER BY u.disabled_at IS NOT NULL, lower(COALESCE(NULLIF(u.full_name, ''), u.name)), u.id "
             "LIMIT %(limit)s OFFSET %(offset)s", params)
         people = [{"id": str(i), "name": n, "full_name": fn, "email": e, "department": d, "role": r,
                    "disabled": bool(off), "created_at": c, "last_signin_at": ls, "last_write_at": lw,
-                   "signins": si}
-                  for i, n, fn, e, d, r, off, c, ls, lw, si in cur.fetchall()]
+                   "signins": si, "last_seen_at": seen}
+                  for i, n, fn, e, d, r, off, c, ls, lw, si, seen in cur.fetchall()]
     return {"people": people, "total": total, "limit": limit, "offset": offset}
 
 
@@ -250,7 +279,7 @@ def _guard(fn):
 
 def end_sessions(conn, p, user_id: str) -> int:
     user_id = _uuid(user_id)
-    _guard(lambda: admin._require_target_is_plain_user(conn, admin.require_manage_users(p), user_id,
+    _guard(lambda: admin.require_target_plain(conn, admin.require_manage_users(p), user_id,
                                                        "ending sessions"))
     with conn.cursor() as cur:
         cur.execute("UPDATE web_session SET revoked_at = now() WHERE user_id = %s AND revoked_at IS NULL",
@@ -262,7 +291,7 @@ def unlink_signin(conn, p, user_id: str, identity_id: str) -> None:
     """An administrator removes a sign-in method — the last one too: that is how
     a wrongly linked sign-in is taken back. Its sessions end with it."""
     user_id, identity_id = _uuid(user_id), _uuid(identity_id)
-    _guard(lambda: admin._require_target_is_plain_user(conn, admin.require_manage_users(p), user_id,
+    _guard(lambda: admin.require_target_plain(conn, admin.require_manage_users(p), user_id,
                                                        "removing a sign-in method"))
     with conn.cursor() as cur:
         cur.execute("DELETE FROM app_user_identity WHERE id = %s AND user_id = %s RETURNING id",
@@ -307,7 +336,7 @@ def edit(conn, p, user_id: str, changes: dict) -> None:
         else:
             # an empty email is "none", which the unique index allows many of
             with conn.cursor() as cur:
-                _guard(lambda: admin._require_target_is_plain_user(conn, admin.require_manage_users(p), user_id,
+                _guard(lambda: admin.require_target_plain(conn, admin.require_manage_users(p), user_id,
                                                                    "editing a profile"))
                 cur.execute("UPDATE app_user SET email = NULL WHERE id = %s", (user_id,))
             fields.pop("email")
@@ -398,47 +427,6 @@ def issue_for(conn, p, user_id: str, *, label: str, permission: str,
 
 
 # ─── record history (for authors) ────────────────────────────────────────────
-HISTORY_PAGE = 25
-
-
-def record_history(store, principal, space_id: str, record_id: str, *,
-                   before_seq: Optional[int] = None) -> dict:
-    """Who changed a record and when — the way into a person's profile from
-    what they wrote. No diffs: the panel shows the record as it is now.
-
-    A page at a time, newest first. A memory that has been edited for a year
-    otherwise answers with its entire chain, which is a slow request and a list
-    nobody scrolls."""
-    rows = store.history(principal, id=record_id, space_id=space_id,
-                         limit=HISTORY_PAGE + 1, before_seq=before_seq)
-    more = len(rows) > HISTORY_PAGE
-    rows = rows[-HISTORY_PAGE:] if more else rows        # rows are oldest-first
-    return {"history": [{"seq": r["seq"], "op": r["op"], "at": r["created_at"],
-                         "author_id": r["author_user_id"], "author": r["author_name"],
-                         "reason": r["reason"], "path_before": r["path_before"],
-                         "path_after": r["path_after"]}
-                        for r in reversed(rows)],
-            "more": more}
-
-
-def record_blame(store, principal, space_id: str, record_id: str) -> dict:
-    """The body split into runs, each carrying who last touched it and when.
-
-    Grouped rather than per-line: a long memory edited by two people is a
-    handful of blocks, and a list of five hundred identically-attributed lines
-    is not something a person reads. The text comes back as written — the panel
-    shows it verbatim here, because blame is about lines, and rendering Markdown
-    across block boundaries would put the attribution in the wrong places.
-    """
-    blocks = store.annotate_grouped(principal, id=record_id, space_id=space_id)
-    return {"blame": [{"start": b["start"], "end": b["end"], "seq": b.get("seq"),
-                       "op": b.get("op"), "at": b.get("created_at"),
-                       "author_id": b.get("author_user_id"),
-                       "author": b.get("author_name"),
-                       "reason": b.get("reason"), "text": b.get("text", "")}
-                      for b in blocks]}
-
-
 # ─── HTTP ────────────────────────────────────────────────────────────────────
 def mount(app, cfg, pool, panel, providers, make_store) -> None:
     from fastapi import Body, HTTPException, Query, Request
@@ -532,32 +520,3 @@ def mount(app, cfg, pool, panel, providers, make_store) -> None:
         _run(lambda conn: revoke_token(conn, p, user_id, token_id))
         return {"revoked": token_id}
 
-    @app.get("/ui/api/spaces/{space_id}/records/{record_id}/blame")
-    def blame(space_id: str, record_id: str, request: Request):
-        from ..identity import AuthError, SpaceNotFound
-        from ..store import NotFound
-        s = panel["session"](request)
-        if s.user_id is None:
-            raise HTTPException(409, "the administrator token has no memory to show")
-        with pool.connection() as conn:
-            try:
-                sid, rid = identity._as_uuid(space_id), identity._as_uuid(record_id)
-                return record_blame(make_store(conn), panel["principal"](s), sid, rid)
-            except (NotFound, SpaceNotFound, AuthError, KeyError, ValueError):
-                raise HTTPException(404, "not found")
-
-    @app.get("/ui/api/spaces/{space_id}/records/{record_id}/history")
-    def history(space_id: str, record_id: str, request: Request,
-                before_seq: Optional[int] = Query(None, ge=0, le=2 ** 31 - 1)):
-        from ..identity import AuthError, SpaceNotFound
-        from ..store import NotFound
-        s = panel["session"](request)
-        if s.user_id is None:
-            raise HTTPException(409, "the administrator token has no memory to show")
-        with pool.connection() as conn:
-            try:
-                sid, rid = identity._as_uuid(space_id), identity._as_uuid(record_id)
-                return record_history(make_store(conn), panel["principal"](s), sid, rid,
-                                      before_seq=before_seq)
-            except (NotFound, SpaceNotFound, AuthError, KeyError, ValueError):
-                raise HTTPException(404, "not found")

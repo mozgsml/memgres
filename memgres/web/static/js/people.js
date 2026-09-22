@@ -134,6 +134,8 @@ function detailsCard(p) {
       <dt>${esc(t("people.department"))}</dt><dd>${esc(p.department || "—")}</dd>
       <dt>${esc(t("people.position"))}</dt><dd>${esc(p.position || "—")}</dd>
       <dt>${esc(t("people.since"))}</dt><dd>${esc(fmtDate(p.created_at))}</dd>
+      <dt title="${esc(t("adm.lastSeenWhy"))}">${esc(t("people.lastSeen"))}</dt>
+      <dd>${p.last_seen_at ? `<time datetime="${esc(p.last_seen_at)}" title="${esc(fmtDate(p.last_seen_at))}">${esc(ago(p.last_seen_at))}</time>` : esc(t("tok.never"))}</dd>
     </dl></div>`;
 }
 

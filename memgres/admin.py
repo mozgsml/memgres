@@ -112,8 +112,8 @@ def require_superadmin(p: Principal) -> Principal:
     return p
 
 
-def _require_target_is_plain_user(conn, p: Principal, user_id: Optional[str],
-                                  action: str) -> None:
+def require_target_plain(conn, p: Principal, user_id: Optional[str],
+                         action: str) -> None:
     """A user_manager may only act on accounts that carry no authority.
 
     Provisioning is gated on the caller's role but was not gated on the
@@ -294,7 +294,7 @@ def edit_user(conn, p: Principal, *, user_id: str, **profile) -> dict:
     an audit reads, so being able to rewrite whose it looks like is authority.
     """
     require_manage_users(p)
-    _require_target_is_plain_user(conn, p, user_id, "editing a profile")
+    require_target_plain(conn, p, user_id, "editing a profile")
     identity.edit_user(conn, user_id, **profile)
     return {"user_id": user_id}
 
@@ -303,7 +303,7 @@ def set_can_create_namespace(conn, p: Principal, *, user_id: str,
                              allowed: bool) -> dict:
     """Grant or withdraw a user's right to create namespaces."""
     require_manage_users(p)
-    _require_target_is_plain_user(conn, p, user_id, "changing namespace rights")
+    require_target_plain(conn, p, user_id, "changing namespace rights")
     identity.set_can_create_namespace(conn, user_id, allowed)
     return {"user_id": user_id, "can_create_namespace": allowed}
 
@@ -479,7 +479,7 @@ def set_disabled(conn, p: Principal, *, user_id: str, disabled: bool) -> dict:
     "gone for now" as well as "gone".
     """
     require_manage_users(p)
-    _require_target_is_plain_user(conn, p, user_id,
+    require_target_plain(conn, p, user_id,
                                   "disabling an account" if disabled
                                   else "re-enabling an account")
     return identity.set_disabled(conn, user_id, disabled)
@@ -552,7 +552,7 @@ def issue_token(conn, p: Principal, *, user_id: str,
     which is the point when the caller is an agent.
     """
     require_manage_users(p)
-    _require_target_is_plain_user(conn, p, user_id, "issuing a token")
+    require_target_plain(conn, p, user_id, "issuing a token")
     expires_at = None
     if expires_days:
         expires_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=expires_days)
@@ -624,7 +624,7 @@ def create_enrollment(conn, p: Principal, *, user_id: str,
     token itself is created on the far side and never travels.
     """
     require_manage_users(p)
-    _require_target_is_plain_user(conn, p, user_id, "issuing an enrollment key")
+    require_target_plain(conn, p, user_id, "issuing an enrollment key")
     kw = {} if expires_minutes is None else {"expires_minutes": expires_minutes}
     out = identity.create_enrollment(
         conn, user_id, namespace_id=namespace_id, permission=permission,
@@ -644,7 +644,7 @@ def list_enrollments(conn, p: Principal, *,
     """Enrollment keys and what became of them — metadata only, never a key."""
     require_manage_users(p)
     if user_id is not None:
-        _require_target_is_plain_user(conn, p, user_id, "listing enrollment keys")
+        require_target_plain(conn, p, user_id, "listing enrollment keys")
         return identity.list_enrollments(conn, user_id=user_id)
     # Unfiltered, the listing handed a user_manager the credential timeline of
     # the accounts ABOVE it — `list_tokens` refuses exactly that. The guard has
@@ -655,7 +655,7 @@ def list_enrollments(conn, p: Principal, *,
 def revoke_enrollment(conn, p: Principal, *, enrollment_id: str) -> bool:
     """Kill an unredeemed key. False if it was already spent, revoked or absent."""
     require_manage_users(p)
-    _require_target_is_plain_user(conn, p,
+    require_target_plain(conn, p,
                                   identity.enrollment_owner(conn, enrollment_id),
                                   "revoking an enrollment key")
     return identity.revoke_enrollment(conn, enrollment_id)
@@ -667,7 +667,7 @@ def revoke_token(conn, p: Principal, *, token_id: str) -> bool:
     Addressed by token, so the target account is whoever owns it.
     """
     require_manage_users(p)
-    _require_target_is_plain_user(conn, p, identity.token_owner(conn, token_id),
+    require_target_plain(conn, p, identity.token_owner(conn, token_id),
                                   "revoking a token")
     return identity.revoke_token(conn, token_id)
 
@@ -675,7 +675,7 @@ def revoke_token(conn, p: Principal, *, token_id: str) -> bool:
 def list_tokens(conn, p: Principal, *, user_id: str) -> List[dict]:
     """A user's tokens — metadata only, never the secret."""
     require_manage_users(p)
-    _require_target_is_plain_user(conn, p, user_id, "listing tokens")
+    require_target_plain(conn, p, user_id, "listing tokens")
     return identity.list_tokens(conn, user_id)
 
 
@@ -929,7 +929,8 @@ def list_requests(conn, p: Principal, *, namespace_id: str) -> List[dict]:
 
 
 def decide_access(conn, p: Principal, *, request_id: str, approve: bool,
-                  expect_permission: Optional[str] = None) -> None:
+                  expect_permission: Optional[str] = None,
+                  permission: Optional[str] = None) -> None:
     """Approve or deny a request, authorized against the namespace it targets.
 
     `expect_permission` is the permission the approver SAW in `list_requests`.
@@ -937,6 +938,10 @@ def decide_access(conn, p: Principal, *, request_id: str, approve: bool,
     and a requester can raise their own pending ask between the listing and the
     decision. `request_access` no longer amends a pending request, so this is
     the second lock on the same door rather than the only one.
+
+    `permission` is what the approver chose to grant, which may differ from what
+    was asked; omitted, the ask is granted. The grant never lowers access the
+    requester has gained since (`identity.grant_at_least`).
 
     Both "no such request" and "a request you may not decide" answer the same
     way, for the same reason `request_access` does: which uuids are real is not
@@ -954,6 +959,7 @@ def decide_access(conn, p: Principal, *, request_id: str, approve: bool,
         raise identity.SpaceNotFound("no such request") from None
     if approve:
         identity.approve_request(conn, request_id,
-                                 expect_permission=expect_permission)
+                                 expect_permission=expect_permission,
+                                 permission=permission)
     else:
         identity.deny_request(conn, request_id)

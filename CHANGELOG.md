@@ -21,6 +21,34 @@ patch = fixes).
   lexical when there is no embedder. Ask for `semantic` explicitly to ignore
   wording on purpose.
 
+### Added
+- **`GET /memories/{id}/verify` and `memory_verify_history`.** Tamper-evident
+  history is the README's headline claim, and the check existed only for
+  someone importing the package in Python — the Docker + MCP deployment the
+  docs recommend could not run it at all.
+- **"Last seen" for a person**, in the directory and on their page: the latest
+  of a sign-in, a write, and a token of theirs being presented. Reads are still
+  not attributed per account — that would be a row per recall — so this is built
+  from what the server already keeps, and an agent working all night counts as
+  its owner being active.
+
+### Changed — one path where there were two
+- **Approving an access request never lowers access gained since.** The panel
+  refused to lower, the API set the permission outright — so approving a
+  months-old request for `read` through the API demoted someone who had been
+  made `admin` meanwhile, while the same act in the browser could not. The rule
+  (`identity.grant_at_least`) and the owner case now live in one place, and the
+  approver's choice of permission — which only the panel had — works on both.
+- **`admin.require_target_plain` is public**, since the panel was calling the
+  private spelling three times; the record history and blame routes moved to
+  `web/memory.py`, which is the module that reads memory.
+
+### Fixed
+- **An expired record no longer appears in a person's activity feed.** Every
+  read hides one, but the panel's feed was the single place with a hand-written
+  predicate and it had forgotten the clause — so a record the deployment had
+  promised to forget still showed up, by name, until the sweeper ran.
+
 ### Changed — one policy for what an account may do for itself
 - **Issuing, listing and revoking your own tokens moved into the service
   layer** (`admin.issue_own_token` and friends), and the three doors that each

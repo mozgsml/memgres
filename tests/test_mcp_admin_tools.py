@@ -412,3 +412,26 @@ def test_naming_a_space_while_minting_a_token_does_not_create_one(box):
         _call(mine, "memory_issue_token", space="invented", permission="read")
     assert _call(mcp, "memory_admin_list_namespaces") == [] or all(
         n["name"] != "invented" for n in _call(mcp, "memory_admin_list_namespaces"))
+
+
+def test_the_hash_chain_can_be_checked_from_outside_the_library(box):
+    """"Tamper-evident history" is the README's headline claim, and until now
+    the check existed only for someone importing the package in Python — the
+    Docker + MCP deployment the docs recommend could not run it at all."""
+    as_, root = box
+    mcp = as_(root)
+    # the seeded superadmin owns no namespace yet — memory has to live somewhere
+    nsid = _call(mcp, "memory_admin_create_namespace", name="chains",
+                 owner_user_id=_call(mcp, "memory_whoami")["user_id"])["id"]
+    made = _call(mcp, "memory_write", body="one", title="chain", path="c.a",
+                 space_id=nsid)
+    _call(mcp, "memory_write", id=made["id"], body="two", title="chain", space_id=nsid)
+    assert _call(mcp, "memory_verify_history", id=made["id"], space_id=nsid) == {"ok": True}
+
+    # edit a stored revision behind the server's back, as an intruder with the
+    # database would: the chain no longer recomputes
+    with psycopg.connect(DSN) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE memory_history SET reason = 'not what was written' "
+                    "WHERE memory_id = %s AND seq = 1", (made["id"],))
+        conn.commit()
+    assert _call(mcp, "memory_verify_history", id=made["id"], space_id=nsid) == {"ok": False}

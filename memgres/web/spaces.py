@@ -74,18 +74,6 @@ def normalize_email(value: str) -> str:
     return email
 
 
-def _grant_at_least(cur, space_id: str, user_id: str, permission: str) -> None:
-    """Make someone a member with at least this permission. Stronger access
-    they already have stays — changing a member's permission is its own act."""
-    cur.execute(
-        "INSERT INTO namespace_member (namespace_id, user_id, permission) VALUES (%s, %s, %s) "
-        "ON CONFLICT (namespace_id, user_id) DO UPDATE SET permission = CASE "
-        "WHEN array_position(ARRAY['read','write','admin'], EXCLUDED.permission) > "
-        "     array_position(ARRAY['read','write','admin'], namespace_member.permission) "
-        "THEN EXCLUDED.permission ELSE namespace_member.permission END",
-        (space_id, user_id, permission))
-
-
 def _person(row) -> dict:
     uid, name, full_name, email, disabled = row
     return {"id": str(uid), "name": name, "full_name": full_name, "email": email,
@@ -187,7 +175,7 @@ def invite(conn, p, space_id: str, *, email: str, permission: str, inviter_id: O
         if len(matches) == 1:
             uid = matches[0]
             if identity.namespace_owner(conn, space_id) != uid:
-                _grant_at_least(cur, space_id, uid, permission)
+                identity.grant_at_least(conn, space_id, uid, permission, cur=cur)
             # an older invitation for the same address has been answered by this
             cur.execute("DELETE FROM space_invite WHERE namespace_id = %s AND lower(email) = lower(%s) "
                         "AND accepted_at IS NULL", (space_id, email))
@@ -333,11 +321,10 @@ def decide(conn, p, space_id: str, request_id: str, *, approve: bool,
                         (request_id,))
             return {"status": "denied"}
         granted = _perm(permission or asked)
-        if identity.namespace_owner(conn, space_id) != requester:
-            # approving an old request never takes away access given since
-            _grant_at_least(cur, space_id, requester, granted)
-        cur.execute("UPDATE access_request SET status = 'approved', decided_at = now() WHERE id = %s",
-                    (request_id,))
+    # the grant, the never-lowering and the owner case all live in `identity`
+    # now, so approving through the panel and through the API are the same act
+    identity.approve_request(conn, request_id, permission=granted)
+    with conn.cursor() as cur:
         now_has = identity._reach(cur, requester, space_id)
     return {"status": "approved", "permission": now_has}
 
@@ -363,7 +350,7 @@ def apply_invites(conn, user_id: str, verified_email: Optional[str]) -> int:
             if not _still_may_grant(cur, str(by) if by else None, str(nsid)):
                 continue
             if str(owner) != user_id:
-                _grant_at_least(cur, str(nsid), user_id, perm)
+                identity.grant_at_least(conn, str(nsid), user_id, perm, cur=cur)
             cur.execute("UPDATE space_invite SET accepted_at = now(), user_id = %s WHERE id = %s",
                         (user_id, iid))
             applied += 1

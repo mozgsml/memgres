@@ -438,5 +438,8 @@
  "insp.blame": "Who wrote this",
  "insp.blameOff": "Back to the text",
  "insp.blameLines": "lines {from}–{to}",
- "insp.blameEmpty": "Nothing to attribute yet."
+ "insp.blameEmpty": "Nothing to attribute yet.",
+ "adm.col.lastSeen": "Last seen",
+ "people.lastSeen": "Last seen",
+ "adm.lastSeenWhy": "The latest of: a sign-in, a write, or a token of theirs being used."
 }
