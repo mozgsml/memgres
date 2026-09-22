@@ -354,7 +354,11 @@ def build_server(cfg: Optional[Config] = None):
         admin_surface = cfg.key_mode != "single"
 
     def _store(conn):
-        return Store(cfg, embedder=embedder, conn=conn, backend=backend)
+        # `source="mcp"`: search-log rows say which door asked, because an agent
+        # and a person ask different things and a measurement that mixes them
+        # describes neither.
+        return Store(cfg, embedder=embedder, conn=conn, backend=backend,
+                     source="mcp")
 
     def _iso(rows: List[dict], *keys: str) -> List[dict]:
         """Stringify datetimes in place — MCP returns JSON, FastAPI encodes."""
@@ -664,15 +668,23 @@ def build_server(cfg: Optional[Config] = None):
 
     @tool()
     def memory_history(id: Optional[str] = None, at: Optional[str] = None,
+                       limit: int = 25, before_seq: Optional[int] = None,
                        space: Optional[str] = None,
                        space_id: Optional[str] = None,
                        ctx: Context = None) -> List[dict]:
-        """The full change chain for a memory: per version the diff, provenance
+        """The change chain for a memory: per version the diff, provenance
         (source/reason), the server-stamped author (author_user_id / author_token_id
         / resolved author_name), and the hash-chain fields. Author is authoritative
-        (from the authenticated principal), unlike free-text source/reason."""
+        (from the authenticated principal), unlike free-text source/reason.
+
+        The LATEST `limit` versions, oldest-first within the page; page further
+        back with `before_seq` (the lowest `seq` you have). A long-lived memory
+        can carry hundreds of diffs, and reading all of them to see the last
+        change is a context window spent on nothing. `limit=0` asks for the
+        whole chain."""
         with pool.connection() as conn:
             return _store(conn).history(_token(ctx), id, at=at,
+                                        limit=limit or None, before_seq=before_seq,
                                         space=space, space_id=space_id)
 
     @tool()

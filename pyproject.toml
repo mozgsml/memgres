@@ -45,6 +45,7 @@ memgres-relink = "memgres.relink:main"
 memgres-grant-superadmin = "memgres.admin_cli:main"
 memgres-provision = "memgres.token_cli:main"
 memgres-healthcheck = "memgres.healthcheck:main"
+memgres-eval = "memgres.eval:main"
 
 [build-system]
 requires = ["setuptools>=68"]

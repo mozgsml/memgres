@@ -211,3 +211,32 @@ def test_the_list_of_every_space_says_when_it_is_cut(box, monkeypatch):
     monkeypatch.setattr(memory, "MAX_EVERY_SPACE", 1)
     got = client.get("/ui/api/admin/spaces").json()
     assert len(got["spaces"]) == 1 and got["truncated"] is True
+
+
+def test_the_panel_shows_who_wrote_which_lines(box):
+    """Blame has existed in the core since the history wave; the panel simply
+    never had a way in. Grouped into runs, because a per-line list of five
+    hundred identically-attributed rows is not something a person reads."""
+    client, cfg, ids = box
+    tok = client.post("/admin/tokens", json={"user_id": ids["mark"]},
+                      headers=_bearer(os.environ["MEMGRES_ADMIN_TOKEN"])).json()["token"]
+    made = client.post("/memories", json={"space": "sales", "path": "notes.blame",
+                                          "title": "Notes", "body": "first line\nsecond line\n"},
+                       headers=_bearer(tok))
+    rid = made.json()["id"]
+    edit = client.patch(f"/memories/{rid}", json={"title": "Notes",
+                        "body": "first line\nsecond line\nthird line\n"},
+                        headers=_bearer(tok))
+    assert edit.status_code == 200, edit.text
+
+    h = _as(client, cfg, ids["mark"])
+    r = client.get(f"/ui/api/spaces/{ids['sales']}/records/{rid}/blame")
+    assert r.status_code == 200, r.text
+    blocks = r.json()["blame"]
+    assert "".join(b["text"] for b in blocks) == "first line\nsecond line\nthird line\n"
+    assert [b["start"] for b in blocks] == sorted(b["start"] for b in blocks)
+    assert blocks[-1]["end"] == 3
+
+    # someone with no way into that space is told nothing about it
+    _as(client, cfg, ids["olga"])
+    assert client.get(f"/ui/api/spaces/{ids['sales']}/records/{rid}/blame").status_code == 404

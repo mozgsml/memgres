@@ -15,12 +15,13 @@ matches via vectors, and neither backend needs to know about the other.
 
 from __future__ import annotations
 
+import re
 from typing import List, Optional, Sequence
 
 from .vector.base import (HIT_COLUMNS, Hit, as_namespaces, build_filters,
                           row_to_hit)
 
-RRF_K = 60  # standard RRF damping constant
+RRF_K = 60  # the standard RRF damping constant; the default of cfg.rrf_k
 
 
 def _tsquery(cfg, match: Optional[str], query: str):
@@ -83,12 +84,49 @@ def _lexical(conn, cfg, ns, query, k, tags, path_prefix,
         return [row_to_hit(r, r[-1]) for r in cur.fetchall()]   # score = trailing col
 
 
-def _rrf(lists: Sequence[List[Hit]], k: int) -> List[Hit]:
+# A query that carries one of these is a hunt for an exact string, not for a
+# meaning: an IP, a uuid, AN_ENV_KEY, an_identifier, a /path, a host or file.ext.
+# Such strings hold nothing for a vector to compress — every similar-looking one
+# sits about as close — while the lexical index keeps them whole (Postgres parses
+# `192.168.1.121` and `agentstools.dev` as single tokens). Deciding this from the
+# query text costs nothing; asking Postgres (`ts_debug`) would be a second round
+# trip for the same answer. Dotted forms must carry a letter, so that "5.7" or a
+# version number in prose does not make an ordinary sentence look like a literal.
+_LITERAL = re.compile(r"""
+      \b\d{1,3}(?:\.\d{1,3}){3}\b                     # 192.168.1.121
+    | \b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}   # a uuid
+    | \b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b                # MEMGRES_TOKEN_SINK
+    | \b[a-zA-Z]\w*(?:_\w+)+\b                        # create_own_namespace
+    | /[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+             # /var/www/memgres
+    | \b[\w-]*[A-Za-z][\w-]*(?:\.[\w-]+)+\b          # okx.agentstools.dev
+""", re.X)
+
+
+def looks_literal(query: str) -> bool:
+    """Is the caller after an exact string rather than a meaning?"""
+    return bool(_LITERAL.search(query or ""))
+
+
+def _rrf(lists: Sequence[List[Hit]], k: int, *, rrf_k: int = RRF_K,
+         weights: Optional[Sequence[float]] = None) -> List[Hit]:
+    """Reciprocal Rank Fusion: each ranking votes for a memory by its POSITION,
+    and the votes add up.
+
+    Ranks, not scores, because the two rankings are not comparable — `ts_rank`
+    measures match density on an open scale, a vector match is a cosine in
+    [0, 1], and normalising them per query is guesswork. The consequence worth
+    knowing: RRF cannot see confidence either, so a weak lexical hit sitting at
+    #1 votes exactly as loudly as a perfect one. That is what `weights` are for
+    — a list you trust less for this query contributes a smaller vote, while a
+    memory both rankings agree on still adds up to more than either alone.
+    """
+    if weights is None:
+        weights = [1.0] * len(lists)
     scores: dict = {}
     keep: dict = {}
-    for hits in lists:
+    for hits, w in zip(lists, weights):
         for rank, h in enumerate(hits):
-            scores[h.id] = scores.get(h.id, 0.0) + 1.0 / (RRF_K + rank + 1)
+            scores[h.id] = scores.get(h.id, 0.0) + w / (rrf_k + rank + 1)
             keep[h.id] = h
     fused = sorted(keep.values(), key=lambda h: scores[h.id], reverse=True)
     for h in fused:
@@ -223,7 +261,10 @@ def recall(conn, cfg, embedder, ns, query: str, *, k: int = 10,
                        tags_match)
         sem = backend.search(conn, cfg, embedder.embed_query(query), k, ns,
                              tags, path_prefix, tags_match)
-        hits = _rrf([sem, lex], k)
+        w_lex = (cfg.rrf_w_lexical_literal if looks_literal(query)
+                 else cfg.rrf_w_lexical)
+        hits = _rrf([sem, lex], k, rrf_k=cfg.rrf_k,
+                    weights=[cfg.rrf_w_semantic, w_lex])
     else:
         raise ValueError(
             f"unknown recall mode: {mode!r} (lexical|semantic|hybrid|auto)")

@@ -27,6 +27,33 @@ from .segments import segment
 _log = logging.getLogger("memgres.indexing")
 
 
+def _context_lead(conn, cfg, memory_id: str, ns: str) -> str:
+    """What a chunk is prefixed with before it is embedded.
+
+    A chunk 400 characters from the middle of a memory arrives at the model with
+    no idea whose it is: "the free pool refills, so the earlier reading was
+    wrong" says nothing about PayAI unless the surrounding memory does. Naming
+    the memory in the chunk itself is the cheap end of what Anthropic published
+    as contextual retrieval — theirs writes a sentence of context per chunk with
+    an LLM; this costs one SELECT and no tokens.
+
+    Only the path and the curated title, and only when `MEMGRES_CHUNK_CONTEXT`
+    is on: the prefix is part of what gets embedded, so turning it on or off
+    changes every vector, and `memgres-reembed` is how a deployment adopts it.
+    """
+    if not cfg.chunk_context:
+        return ""
+    with conn.cursor() as cur:
+        cur.execute("SELECT path::text, COALESCE(title, '') FROM memory "
+                    "WHERE id = %s AND namespace = %s", (memory_id, ns))
+        row = cur.fetchone()
+    if not row:
+        return ""
+    path, title = row
+    lead = " — ".join(x for x in (path, title) if x)
+    return f"{lead}\n" if lead else ""
+
+
 def index_memory(conn, cfg, embedder, backend, memory_id: str, body: str,
                  ns: str, src_hash: Optional[str] = None) -> bool:
     """Build and store the chunk vectors for one memory, then clear its pending
@@ -43,7 +70,8 @@ def index_memory(conn, cfg, embedder, backend, memory_id: str, body: str,
         return False
     spans = segment(body, cfg.chunk_chars, cfg.chunk_overlap)
     if spans:
-        vecs = embedder.embed_documents([body[s:e] for (s, e) in spans])
+        lead = _context_lead(conn, cfg, memory_id, ns)
+        vecs = embedder.embed_documents([lead + body[s:e] for (s, e) in spans])
         chunks = [(i, s, e, v) for i, ((s, e), v) in enumerate(zip(spans, vecs))]
         backend.index_chunks(conn, memory_id, ns, src, chunks)
     else:

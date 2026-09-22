@@ -398,14 +398,45 @@ def issue_for(conn, p, user_id: str, *, label: str, permission: str,
 
 
 # ─── record history (for authors) ────────────────────────────────────────────
-def record_history(store, principal, space_id: str, record_id: str) -> list:
+HISTORY_PAGE = 25
+
+
+def record_history(store, principal, space_id: str, record_id: str, *,
+                   before_seq: Optional[int] = None) -> dict:
     """Who changed a record and when — the way into a person's profile from
-    what they wrote. No diffs: the panel shows the record as it is now."""
-    rows = store.history(principal, id=record_id, space_id=space_id)
-    return [{"seq": r["seq"], "op": r["op"], "at": r["created_at"], "author_id": r["author_user_id"],
-             "author": r["author_name"], "reason": r["reason"],
-             "path_before": r["path_before"], "path_after": r["path_after"]}
-            for r in reversed(rows)]
+    what they wrote. No diffs: the panel shows the record as it is now.
+
+    A page at a time, newest first. A memory that has been edited for a year
+    otherwise answers with its entire chain, which is a slow request and a list
+    nobody scrolls."""
+    rows = store.history(principal, id=record_id, space_id=space_id,
+                         limit=HISTORY_PAGE + 1, before_seq=before_seq)
+    more = len(rows) > HISTORY_PAGE
+    rows = rows[-HISTORY_PAGE:] if more else rows        # rows are oldest-first
+    return {"history": [{"seq": r["seq"], "op": r["op"], "at": r["created_at"],
+                         "author_id": r["author_user_id"], "author": r["author_name"],
+                         "reason": r["reason"], "path_before": r["path_before"],
+                         "path_after": r["path_after"]}
+                        for r in reversed(rows)],
+            "more": more}
+
+
+def record_blame(store, principal, space_id: str, record_id: str) -> dict:
+    """The body split into runs, each carrying who last touched it and when.
+
+    Grouped rather than per-line: a long memory edited by two people is a
+    handful of blocks, and a list of five hundred identically-attributed lines
+    is not something a person reads. The text comes back as written — the panel
+    shows it verbatim here, because blame is about lines, and rendering Markdown
+    across block boundaries would put the attribution in the wrong places.
+    """
+    blocks = store.annotate_grouped(principal, id=record_id, space_id=space_id)
+    return {"blame": [{"start": b["start"], "end": b["end"], "seq": b.get("seq"),
+                       "op": b.get("op"), "at": b.get("created_at"),
+                       "author_id": b.get("author_user_id"),
+                       "author": b.get("author_name"),
+                       "reason": b.get("reason"), "text": b.get("text", "")}
+                      for b in blocks]}
 
 
 # ─── HTTP ────────────────────────────────────────────────────────────────────
@@ -501,8 +532,8 @@ def mount(app, cfg, pool, panel, providers, make_store) -> None:
         _run(lambda conn: revoke_token(conn, p, user_id, token_id))
         return {"revoked": token_id}
 
-    @app.get("/ui/api/spaces/{space_id}/records/{record_id}/history")
-    def history(space_id: str, record_id: str, request: Request):
+    @app.get("/ui/api/spaces/{space_id}/records/{record_id}/blame")
+    def blame(space_id: str, record_id: str, request: Request):
         from ..identity import AuthError, SpaceNotFound
         from ..store import NotFound
         s = panel["session"](request)
@@ -511,6 +542,22 @@ def mount(app, cfg, pool, panel, providers, make_store) -> None:
         with pool.connection() as conn:
             try:
                 sid, rid = identity._as_uuid(space_id), identity._as_uuid(record_id)
-                return {"history": record_history(make_store(conn), panel["principal"](s), sid, rid)}
+                return record_blame(make_store(conn), panel["principal"](s), sid, rid)
+            except (NotFound, SpaceNotFound, AuthError, KeyError, ValueError):
+                raise HTTPException(404, "not found")
+
+    @app.get("/ui/api/spaces/{space_id}/records/{record_id}/history")
+    def history(space_id: str, record_id: str, request: Request,
+                before_seq: Optional[int] = None):
+        from ..identity import AuthError, SpaceNotFound
+        from ..store import NotFound
+        s = panel["session"](request)
+        if s.user_id is None:
+            raise HTTPException(409, "the administrator token has no memory to show")
+        with pool.connection() as conn:
+            try:
+                sid, rid = identity._as_uuid(space_id), identity._as_uuid(record_id)
+                return record_history(make_store(conn), panel["principal"](s), sid, rid,
+                                      before_seq=before_seq)
             except (NotFound, SpaceNotFound, AuthError, KeyError, ValueError):
                 raise HTTPException(404, "not found")

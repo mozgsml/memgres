@@ -89,6 +89,33 @@ class Config:
     fts_language: str            # Postgres FTS dict: simple | english | russian | …
     lexical_match: str           # any (OR-any words, default) | all (AND-all words)
     vector_backend: str          # pgvector (default) | qdrant
+    # search log: what was asked, and what the caller opened next. Off by
+    # default — a query is content, and one deployment's audit trail is
+    # another's privacy problem. Turn it on to gather real cases for
+    # `memgres-eval` (docs/RECALL.md), and it is swept like any other retention.
+    search_log: bool             # MEMGRES_SEARCH_LOG
+    search_log_days: int         # MEMGRES_SEARCH_LOG_DAYS (0 = keep until swept
+                                 # by hand; the sweeper skips it)
+    # hybrid fusion (RRF): how the lexical and semantic rankings are merged.
+    # Deployment-specific — a corpus of prose and a corpus of identifiers want
+    # different weights — so they are settings, not constants, and
+    # `memgres-eval` sweeps them against YOUR memories to find the numbers.
+    rrf_k: int                   # RRF damping: score = w / (rrf_k + rank). Larger
+                                 # flattens the top, so agreement between the two
+                                 # rankings counts for more than one list's #1
+    rrf_w_semantic: float        # weight of the vector ranking in the fusion
+    rrf_w_lexical: float         # weight of the lexical ranking …
+    rrf_w_lexical_literal: float # … and its weight when the query carries a
+                                 # literal (an IP, a host, a path, AN_ENV_KEY):
+                                 # there the exact match is the trustworthy one,
+                                 # while a vector ranks such strings by vague
+                                 # resemblance. Default 2.0 — measured, not
+                                 # guessed: on a 160-case run it lifted literal
+                                 # MRR .759 → .809 under every other setting,
+                                 # and cost nothing elsewhere. Damping the
+                                 # lexical weight on prose, which looked obvious
+                                 # beforehand, made things WORSE and is why
+                                 # these are measured
     # snippets (a relevant slice of each recall hit's body + its line range)
     snippet: bool                # extract a relevant slice; off = return the body
     full_body: bool              # force the whole body on every hit (off = auto:
@@ -102,6 +129,11 @@ class Config:
                                  # MEMGRES_CHUNK_CHARS (legacy MEMGRES_SNIPPET_SEG_CHARS)
     chunk_overlap: int           # chars shared between consecutive chunks
                                  # (MEMGRES_CHUNK_OVERLAP / legacy _SNIPPET_SEG_OVERLAP)
+    chunk_context: bool          # prefix each chunk with its memory's path and
+                                 # title before embedding, so a slice from the
+                                 # middle still says what it belongs to
+                                 # (MEMGRES_CHUNK_CONTEXT). Changing it changes
+                                 # every vector — adopt it with memgres-reembed
     # embedding pipeline (chunks are the semantic index; see docs/EMBEDDINGS.md)
     embed_dispatch: str          # how a write's chunk-embedding happens:
                                  #   inline — embed within the write (safe default;
@@ -196,6 +228,18 @@ class Config:
                 "none", "local", "jina", "openai",
                 "openai-compatible", "compatible", "custom"):
             raise ValueError(f"unknown MEMGRES_EMBED_PROVIDER: {self.embed_provider}")
+        if self.search_log_days < 0:
+            raise ValueError("MEMGRES_SEARCH_LOG_DAYS must be >= 0")
+        if self.rrf_k < 0:
+            raise ValueError("MEMGRES_RRF_K must be >= 0")
+        for _name, _w in (("SEMANTIC", self.rrf_w_semantic),
+                          ("LEXICAL", self.rrf_w_lexical),
+                          ("LEXICAL_LITERAL", self.rrf_w_lexical_literal)):
+            if _w < 0:
+                raise ValueError(f"MEMGRES_RRF_W_{_name} must be >= 0")
+        if self.rrf_w_semantic == 0 and self.rrf_w_lexical == 0:
+            raise ValueError("MEMGRES_RRF_W_SEMANTIC and _LEXICAL cannot both be 0 "
+                             "— hybrid recall would rank nothing")
         if self.lexical_match not in ("any", "all"):
             raise ValueError(f"unknown MEMGRES_LEXICAL_MATCH: {self.lexical_match}")
         if self.vector_backend not in ("pgvector", "qdrant"):
@@ -265,6 +309,12 @@ def load() -> Config:
         history_enabled=_bool("MEMGRES_HISTORY", True),
         fts_language=_str("MEMGRES_FTS_LANGUAGE", "simple"),
         lexical_match=_str("MEMGRES_LEXICAL_MATCH", "any"),
+        search_log=_bool("MEMGRES_SEARCH_LOG", False),
+        search_log_days=_int("MEMGRES_SEARCH_LOG_DAYS", 30),
+        rrf_k=_int("MEMGRES_RRF_K", 60),
+        rrf_w_semantic=_float("MEMGRES_RRF_W_SEMANTIC", 1.0),
+        rrf_w_lexical=_float("MEMGRES_RRF_W_LEXICAL", 1.0),
+        rrf_w_lexical_literal=_float("MEMGRES_RRF_W_LEXICAL_LITERAL", 2.0),
         vector_backend=_str("MEMGRES_VECTOR_BACKEND", "pgvector"),
         snippet=_bool("MEMGRES_SNIPPET", True),
         full_body=_bool("MEMGRES_FULL_BODY", False),
@@ -274,6 +324,7 @@ def load() -> Config:
                          _int("MEMGRES_SNIPPET_SEG_CHARS", 400)),
         chunk_overlap=_int("MEMGRES_CHUNK_OVERLAP",
                            _int("MEMGRES_SNIPPET_SEG_OVERLAP", 80)),
+        chunk_context=_bool("MEMGRES_CHUNK_CONTEXT", False),
         embed_dispatch=_str("MEMGRES_EMBED_DISPATCH", "inline"),
         embed_worker=_bool("MEMGRES_EMBED_WORKER", True),
         embed_worker_interval=_float("MEMGRES_EMBED_WORKER_INTERVAL", 1.0),

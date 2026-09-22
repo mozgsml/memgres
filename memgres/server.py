@@ -121,8 +121,9 @@ def create_app(cfg: Optional[Config] = None):
     def _mem(m) -> dict:
         return m.to_dict()          # FastAPI JSON-encodes the raw datetimes
 
-    def _store(conn):
-        return Store(cfg, embedder=embedder, conn=conn, backend=backend)
+    def _store(conn, source: str = "rest"):
+        return Store(cfg, embedder=embedder, conn=conn, backend=backend,
+                     source=source)
 
     def _guard(fn):
         """Run a store or admin call, mapping domain exceptions to HTTP codes."""
@@ -734,7 +735,9 @@ def create_app(cfg: Optional[Config] = None):
 
     if cfg.web_enabled:
         from .web.routes import mount
-        mount(app, cfg, pool, _store)
+        # the panel is people, the REST API is scripts and agents: the search
+        # log keeps them apart (see Store(source=...))
+        mount(app, cfg, pool, lambda conn: _store(conn, "web"))
 
     return app
 

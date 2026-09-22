@@ -505,8 +505,12 @@ def _why_replace_missed(body: str, old: str) -> str:
 class Store:
     def __init__(self, cfg: Config, embedder: Optional[Embedder] = None,
                  conn: Optional["psycopg.Connection"] = None,
-                 backend: object = None):
+                 backend: object = None, source: str = "lib"):
         self.cfg = cfg
+        # Which door this Store is, recorded on search-log rows: an agent over
+        # MCP and a person in the panel ask different things, and a measurement
+        # that mixes them describes neither.
+        self.source = source
         self.embedder = embedder if embedder is not None else get_embedder(cfg)
         # identity is on for open/managed; single mode is one shared space,
         # namespace = '' , no auth.
@@ -1323,9 +1327,12 @@ class Store:
         which searched titles and nothing else — two half-searches the caller had
         to choose between, one of which answered "nothing found" for every
         memory that had no caption."""
+        import time
+
         from .search import recall as _recall
         k = self._clamp_k(k)
         ns, names = self._authorize_read(token, space=space, space_id=space_id)
+        _began = time.monotonic()
         hits = _recall(self._conn, self.cfg, self.embedder, ns,
                        query, k=k, tags=tags, path_prefix=path_prefix, mode=mode,
                        match=match, backend=self._vectors,
@@ -1338,6 +1345,11 @@ class Store:
         # the ranking discarded showed nobody anything.
         if _count:      # False for a person browsing the panel: usage counts what agents recall
             self._count_usage("recall", [h.id for h in hits])
+        self._log_search("recall", token=token, query=query,
+                         mode=("hybrid" if mode == "auto" and self._vectors
+                               else "lexical" if mode == "auto" else mode),
+                         k=k, ns=ns, results=[h.id for h in hits],
+                         ms=int((time.monotonic() - _began) * 1000))
         return hits
 
     # ─── links: the graph between memories ──────────────────────────────────
@@ -1620,6 +1632,46 @@ class Store:
                           space=space, space_id=space_id)
 
     # ─── usage counters ─────────────────────────────────────────────────────
+    def _log_search(self, kind: str, *, token=None, query: Optional[str] = None,
+                    mode: Optional[str] = None, k: Optional[int] = None,
+                    ns: Optional[Sequence[str]] = None,
+                    results: Optional[Sequence[str]] = None,
+                    memory_id: Optional[str] = None,
+                    ms: Optional[int] = None) -> None:
+        """Record that this was searched for, or that this was opened.
+
+        Off unless `MEMGRES_SEARCH_LOG` says otherwise, because a query is
+        content — often more telling than the memory it found. When on, it is
+        what lets `memgres-eval` build cases from real traffic instead of only
+        from titles and literals (docs/RECALL.md).
+
+        Best-effort, like the usage counters and for the same reason: a log that
+        cannot be written must never be the reason a read fails. It also never
+        raises out of the principal lookup — an anonymous row is worth more than
+        a failed search.
+        """
+        if not self.cfg.search_log:
+            return
+        user_id = token_id = None
+        if self._identity_on:
+            try:
+                p = self._principal(token)
+                user_id, token_id = p.user_id, getattr(p, "token_id", None)
+            except Exception:                                   # pragma: no cover
+                pass
+        try:
+            with self._conn.transaction(), self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO search_log (kind, source, user_id, token_id, "
+                    "namespaces, query, mode, k, results, memory_id, ms) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (kind, self.source, user_id, token_id,
+                     list(ns) if ns else None, query, mode, k,
+                     [str(r) for r in results] if results else None,
+                     memory_id, ms))
+        except Exception as e:                                  # pragma: no cover
+            _log.warning("search log write failed (ignored): %s", e)
+
     def _count_usage(self, kind: str, ids: Sequence[str], *,
                      want: bool = False) -> Optional[dict]:
         """Record that these memories were used — `kind` is ``"get"`` (read in
@@ -1712,6 +1764,11 @@ class Store:
         # write path reads a row back mid-edit, and counting that would measure
         # the store working rather than the memory being used.
         if _count:
+            # The other half of the log: WHICH result answered the query. A get
+            # shortly after a recall by the same caller is that answer, and it
+            # is the only signal a deployment has about what its searches are
+            # actually for.
+            self._log_search("get", token=token, memory_id=m.id, ns=[ns] if ns else None)
             m.usage = self._count_usage("get", [m.id], want=True)
             if m.usage is not None:
                 # How often this memory has been REWRITTEN, which is a different
@@ -1724,8 +1781,21 @@ class Store:
 
     def history(self, token: Optional[str], id: Optional[str] = None, *,
                 at: Optional[str] = None, if_moved: str = "follow",
+                limit: Optional[int] = None, before_seq: Optional[int] = None,
                 space: Optional[str] = None,
                 space_id: Optional[str] = None) -> List[dict]:
+        """Every revision of a memory, oldest first.
+
+        ``limit`` returns the NEWEST that many instead, and ``before_seq`` pages
+        further back — a memory edited a few hundred times is otherwise one
+        answer carrying every diff it ever had, which is a page nobody reads and
+        a context window an agent cannot spare.
+
+        The replay paths (``annotate``, ``reconstruct``, ``verify_history``) call
+        this WITHOUT a limit and must keep doing so: they rebuild the body by
+        applying diffs from the beginning, so a partial chain would not raise —
+        it would quietly reconstruct the wrong text.
+        """
         ns, _ = self._authorize(token, space=space, space_id=space_id, need="read")
         id, _moved = self._address(ns, id, at, follow=if_moved == "follow")
         cur = self._conn.cursor()
@@ -1743,13 +1813,18 @@ class Store:
             "h.title_before, h.title_after, h.hash_version, h.valid_at, "
             "h.prev_row_hash, h.row_hash, h.created_at FROM memory_history h "
             "LEFT JOIN app_user u ON u.id = h.author_user_id "
-            "WHERE h.memory_id=%s ORDER BY h.seq", (id,))
+            "WHERE h.memory_id=%s AND (%s::int IS NULL OR h.seq < %s) "
+            # newest-first while paging, then flipped back below: a page is
+            # "the latest N", but a chain always reads oldest → newest
+            + ("ORDER BY h.seq DESC LIMIT %s" if limit else "ORDER BY h.seq"),
+            (id, before_seq, before_seq) + ((limit,) if limit else ()))
         cols = ["seq", "op", "diff", "hash_before", "hash_after", "path_before",
                 "path_after", "tags_before", "tags_after", "source", "reason",
                 "author_user_id", "author_token_id", "author_name", "author_email",
                 "title_before", "title_after", "hash_version", "valid_at",
                 "prev_row_hash", "row_hash", "created_at"]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        return rows[::-1] if limit else rows
 
     def annotate(self, token: Optional[str], id: Optional[str] = None,
                  upto_seq: Optional[int] = None,

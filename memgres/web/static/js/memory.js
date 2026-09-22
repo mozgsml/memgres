@@ -11,7 +11,7 @@ const LARGE = 60;          // above this many records the whole graph gets busy:
 const m = {
   spaces: [], visiting: [], space: null, graph: null,
   T: new Map(), links: [], deg: new Map(), rootAuto: {}, spaceAuto: {}, byRecord: new Map(),
-  selected: null, query: "", hits: null, scope: "all", depth: 1, vizId: store.get("memgres.viz") || "graph",
+  selected: null, record: null, query: "", hits: null, scope: "all", depth: 1, vizId: store.get("memgres.viz") || "graph",
   ctl: null, ctxIds: new Set(), dismissed: new Set(), root: null, navigate: null, searchSeq: 0,
 };
 
@@ -765,35 +765,100 @@ async function inspect() {
   }
   if (seq !== inspectSeq) return;
   const r = full.record, out = (full.links.out || []), inn = (full.links.in || []);
+  m.record = r;          // the blame toggle needs the body it is toggling back to
   const outIds = [...new Set(out.filter((l) => l.id && m.byRecord.has(l.id)).map((l) => m.byRecord.get(l.id)))];
   const inIds = [...new Set(inn.filter((l) => m.byRecord.has(l.id)).map((l) => m.byRecord.get(l.id)))];
   const dangling = out.filter((l) => !l.resolved && !l.scheme);
   box.innerHTML = head + `
     ${stats([["insp.links", outIds.length + inIds.length], ["insp.opened", r.usage?.gets ?? 0], ["insp.found", r.usage?.recalled ?? 0]])}
-    <div class="body md">${renderMarkdown(r.body, { link: wikiLink })}</div>
+    <div class="bodywrap"><button class="btn quiet small blamebtn" data-blame>${esc(t("insp.blame"))}</button>
+      <div class="body md" id="insp-body">${renderMarkdown(r.body, { link: wikiLink })}</div></div>
     <div><p class="h3">${esc(t("insp.linksTo"))}</p>${listOf(outIds)}${dangling.length ? `<p class="note">${esc(t("insp.danglingList", { list: dangling.map((l) => l.target).join(", ") }))}</p>` : ""}</div>
     <div><p class="h3">${esc(t("insp.linkedFrom"))}</p>${listOf(inIds)}</div>
     <div><p class="h3">${esc(t("insp.color"))}</p><div class="colorline"><span class="txt">${hexIcon(c, false, 14)} ${t("color.auto", { name: esc(colorName(c)), root: esc(n.root) })}</span></div></div>
     <div><p class="h3">${esc(t("insp.history"))}</p><div class="hist" id="insp-hist"><p class="note">…</p></div></div>
     <div class="row">${n.path ? `<button class="btn quiet" data-copy="${esc(n.path)}">${esc(t("insp.copy"))}</button>` : ""}<button class="btn quiet" data-copy="${esc(r.id)}">${esc(t("insp.copyId"))}</button></div>`;
-  let hist;
+  // History arrives a page at a time: a record edited for a year has hundreds of
+  // revisions, and the panel used to ask for every one of them to show eight.
+  const histUrl = (before) => `/spaces/${encodeURIComponent(m.space.id)}/records/`
+    + `${encodeURIComponent(rec.id)}/history${before ? `?before_seq=${before}` : ""}`;
+  let page;
   try {
-    hist = (await get(`/spaces/${encodeURIComponent(m.space.id)}/records/${encodeURIComponent(rec.id)}/history`)).history;
+    page = await get(histUrl());
   } catch {
-    hist = null;
+    page = null;
   }
   const el = seq === inspectSeq && $("#insp-hist", box);
   if (!el) return;
-  if (!hist) { el.innerHTML = `<p class="note">${esc(t("err.network"))}</p>`; return; }
-  const shown = hist.slice(0, 8);
-  el.innerHTML = shown.map((h) => `<div class="hrow"><span class="op">${esc(t("op." + h.op) === "op." + h.op ? h.op : t("op." + h.op))}</span>
+  if (!page) { el.innerHTML = `<p class="note">${esc(t("err.network"))}</p>`; return; }
+  const rows = page.history;
+  let more = page.more, shown = 8;
+  const row = (h) => `<div class="hrow"><span class="op">${esc(t("op." + h.op) === "op." + h.op ? h.op : t("op." + h.op))}</span>
       ${h.author_id ? `<a class="person" href="/people?id=${encodeURIComponent(h.author_id)}">${esc(h.author || t("people.unnamed"))}</a>` : `<span class="note">${esc(t("insp.noAuthor"))}</span>`}
       <time class="note" datetime="${esc(h.at)}" title="${esc(fmtDate(h.at))}">${esc(ago(h.at))}</time>
-      ${h.reason ? `<small>${esc(h.reason)}</small>` : ""}</div>`).join("")
-    + (hist.length > shown.length ? `<p class="note">${esc(t("insp.andMore", { n: hist.length - shown.length }))}</p>` : "");
+      ${h.reason ? `<small>${esc(h.reason)}</small>` : ""}</div>`;
+  const draw = () => {
+    el.innerHTML = rows.slice(0, shown).map(row).join("")
+      + (shown < rows.length || more
+         ? `<button class="btn quiet small" data-more>${esc(t("insp.more"))}</button>` : "");
+  };
+  draw();
+  el.addEventListener("click", async (e) => {
+    if (!e.target.closest("[data-more]")) return;
+    if (shown < rows.length) { shown = rows.length; draw(); return; }
+    const last = rows[rows.length - 1];
+    try {
+      const next = await get(histUrl(last?.seq));
+      rows.push(...next.history);
+      more = next.more;
+      shown = rows.length;
+    } catch {
+      more = false;
+    }
+    draw();
+  });
+}
+
+// Blame: the body as runs, each tagged with who last changed those lines.
+// Shown verbatim rather than as Markdown — attribution is per line, and
+// rendering across block boundaries would move it to the wrong text.
+async function showBlame(rec, box) {
+  const body = $("#insp-body", box), btn = $("[data-blame]", box);
+  if (body.dataset.blame === "on") {                 // toggle back to the text
+    body.innerHTML = renderMarkdown(rec.body, { link: wikiLink });
+    body.classList.add("md"); body.classList.remove("blame");
+    body.dataset.blame = ""; btn.textContent = t("insp.blame");
+    return;
+  }
+  btn.disabled = true;
+  let blocks;
+  try {
+    blocks = (await get(`/spaces/${encodeURIComponent(m.space.id)}/records/`
+      + `${encodeURIComponent(rec.id)}/blame`)).blame;
+  } catch {
+    btn.disabled = false; toast(t("err.network")); return;
+  }
+  btn.disabled = false;
+  body.classList.remove("md"); body.classList.add("blame");
+  body.dataset.blame = "on";
+  btn.textContent = t("insp.blameOff");
+  body.innerHTML = blocks.map((b) => {
+    const who = b.author_id
+      ? `<a class="person" href="/people?id=${encodeURIComponent(b.author_id)}">${esc(b.author || t("people.unnamed"))}</a>`
+      : `<span class="note">${esc(t("insp.noAuthor"))}</span>`;
+    const c = PALETTE[PALETTE_KEYS[fnv(String(b.author_id || b.seq)) % PALETTE_KEYS.length]];
+    return `<div class="blk" style="--c:${c}">
+      <div class="who">${who} <time datetime="${esc(b.at || "")}" title="${esc(b.at ? fmtDate(b.at) : "")}">${esc(b.at ? ago(b.at) : "")}</time>
+        <span class="ln">${esc(t("insp.blameLines", { from: b.start, to: b.end }))}</span>
+        ${b.reason ? `<small>${esc(b.reason)}</small>` : ""}</div>
+      <pre>${esc(b.text)}</pre></div>`;
+  }).join("") || `<p class="note">${esc(t("insp.blameEmpty"))}</p>`;
 }
 
 async function onInspectorAction(e) {
+  if (e.target.closest("[data-blame]") && m.record && m.space) {
+    return showBlame(m.record, $("#inspector", m.root));
+  }
   const b = e.target.closest("[data-sp]");
   if (!b || !m.space) return;
   const space = m.space;

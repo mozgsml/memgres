@@ -21,6 +21,43 @@ patch = fixes).
   lexical when there is no embedder. Ask for `semantic` explicitly to ignore
   wording on purpose.
 
+### Added — reading a record's past
+- **Blame in the panel** (*Who wrote this* on a record): the body split into
+  runs, each banded with its author's colour and labelled with who last changed
+  those lines and when. The core has had line-level blame since 0.6; the panel
+  had no way in.
+- **History is paged.** `memory_history` and the panel both returned the ENTIRE
+  chain — every revision with its diff — to show the last few changes. Both now
+  take the newest 25 (`limit` / `before_seq`, `limit=0` for everything), and the
+  panel has a *Show more*. The replay paths — blame, reconstruct, verify — still
+  read the whole chain, as they must: they rebuild the body from the first diff
+  onward, and a partial chain would produce wrong text rather than an error.
+
+### Added — measuring recall instead of guessing at it
+- **`memgres-eval`**: a tool that measures search quality against *your*
+  memories and sweeps the fusion settings to find the numbers that suit them.
+  Cases are derived from the corpus itself — a memory's title as the query, and
+  strings that occur in exactly one memory — so there is something to measure
+  without hand-labelling anything. Both rankings are fetched once per case and
+  every setting scored over the stored lists, so a twenty-row sweep costs one
+  query per case, not twenty. See [docs/RECALL.md](docs/RECALL.md).
+- **The hybrid fusion is configurable**: `MEMGRES_RRF_K` and the weights
+  `MEMGRES_RRF_W_SEMANTIC` / `_W_LEXICAL` / `_W_LEXICAL_LITERAL`. The last one
+  applies when the query carries a literal — an IP, a host, a `/path`,
+  `AN_ENV_KEY` — detected from the query text, since that is the case where the
+  exact match is the trustworthy ranking and a vector is at its worst.
+- **`MEMGRES_RRF_W_LEXICAL_LITERAL` ships at 2.0, measured rather than guessed**:
+  on a 160-case run it lifted literal-query MRR from .759 to .809 under every
+  other setting and cost nothing elsewhere. The change that looked equally
+  obvious beforehand — damping the lexical vote on prose — measured worse and
+  was dropped.
+- **An optional search log** (`MEMGRES_SEARCH_LOG`, off by default, swept after
+  `MEMGRES_SEARCH_LOG_DAYS`): what was searched for, what came back, and what
+  the caller opened next. `memgres-eval --from-log N` turns those pairs into
+  cases — the only ground truth that is not made of words taken out of the
+  corpus. Rows record which door asked (`mcp` / `web` / `rest`), because agents
+  and people ask differently.
+
 ## [0.14.0] — 2026-09-21
 
 The panel stops being read-only about *people*: administrators take accounts on,

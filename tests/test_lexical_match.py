@@ -112,6 +112,8 @@ def test_auto_is_hybrid_wherever_an_embedder_exists(monkeypatch):
     that is what people come back for, and a vector alone ranks them by vague
     resemblance. `auto` therefore means hybrid, and only falls to lexical when
     there is no embedder at all."""
+    from types import SimpleNamespace
+
     from memgres import search
 
     seen = {}
@@ -130,12 +132,14 @@ def test_auto_is_hybrid_wherever_an_embedder_exists(monkeypatch):
             return []
 
     monkeypatch.setattr(search, "_lexical", fake_lexical)
+    cfg = SimpleNamespace(rrf_k=60, rrf_w_semantic=1.0, rrf_w_lexical=1.0,
+                          rrf_w_lexical_literal=1.0)
 
-    search.recall(None, None, FakeEmbedder(), None, "ip 10.0.0.1",
+    search.recall(None, cfg, FakeEmbedder(), None, "ip 10.0.0.1",
                   backend=FakeBackend(), bodies=False)
     assert seen == {"lexical": True, "vector": True}       # both lists: hybrid
 
     seen.clear()
-    search.recall(None, None, FakeEmbedder(), None, "ip 10.0.0.1",
+    search.recall(None, cfg, FakeEmbedder(), None, "ip 10.0.0.1",
                   backend=None, bodies=False)
     assert seen == {"lexical": True}                       # no embedder: lexical

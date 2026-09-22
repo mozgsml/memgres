@@ -87,8 +87,13 @@ token that does not exist.
   A record's body is rendered as Markdown — headings, lists, tables, code,
   links, and `[[path]]` links that open the record they name. Nothing in a body
   runs: raw HTML is shown as text, only `http(s)`/`mailto` links are kept, images
-  are not fetched. A record shows its history: who changed it and when, each name
-  opening that person's page. The record panel is as wide as you drag its edge
+  are not fetched. A record shows its history — who changed it and when, each name
+  opening that person's page — a page at a time, newest first, with **Show more**
+  for older revisions. **Who wrote this** turns the body into blame: the text
+  split into runs, each banded with its author's colour and labelled with who
+  last touched those lines and when. Blame is shown verbatim rather than as
+  Markdown, because attribution is per line and rendering across run boundaries
+  would put the labels on the wrong text. The record panel is as wide as you drag its edge
   (double-click the edge to reset); the width is remembered in the browser.
 - **Tokens** (Account → Tokens). A token for each device or client, with:
   - access `read` or `write` — never `admin`: an admin-ceiling token can mint

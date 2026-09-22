@@ -128,6 +128,30 @@ class RetentionSweeper(PeriodicWorker):
         n = store.purge_expired()
         if n:
             _log.info("retention sweep deleted %d expired memories", n)
+        self._sweep_search_log()
+        return n
+
+    def _sweep_search_log(self) -> int:
+        """Expire search-log rows on their own clock.
+
+        The log is not memories, so it does not follow `MEMGRES_RETENTION_DAYS`
+        — a deployment that keeps memories forever still should not keep a
+        record of every question anyone asked. Best-effort, like the log itself.
+        """
+        days = getattr(self.cfg, "search_log_days", 0)
+        if not self.cfg.search_log or days <= 0:
+            return 0
+        try:
+            conn = self._conn_ok()
+            with conn.transaction(), conn.cursor() as cur:
+                cur.execute("DELETE FROM search_log WHERE at < now() - %s::interval",
+                            (f"{days} days",))
+                n = cur.rowcount or 0
+        except Exception as e:                                  # pragma: no cover
+            _log.warning("search log sweep failed (ignored): %s", e)
+            return 0
+        if n:
+            _log.info("search log sweep deleted %d rows older than %d days", n, days)
         return n
 
     def _tick(self) -> None:
@@ -148,6 +172,9 @@ def maybe_start_sweeper(cfg, connect: Callable[[], "object"],
     bounded and idempotent, and each row can only be deleted once), but the work
     is redundant, so a deployment that runs a dedicated sweeper can silence the
     rest."""
-    if cfg.retention_days <= 0 or not cfg.retention_sweep:
+    # A deployment can keep memories forever and still expire the search log,
+    # so either policy is reason enough to run the thread.
+    sweeps_log = cfg.search_log and cfg.search_log_days > 0
+    if (cfg.retention_days <= 0 and not sweeps_log) or not cfg.retention_sweep:
         return None
     return RetentionSweeper(cfg, connect, embedder, backend).start()

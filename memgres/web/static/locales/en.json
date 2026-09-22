@@ -433,5 +433,10 @@
  "sp.makeGo": "Create",
  "sp.makeNote": "You own it and decide who else gets in. Agents write into it with a token of yours; the panel only reads.",
  "sp.made": "Space “{name}” created",
- "clients.codex": "In ~/.codex/config.toml. Codex takes the token from an environment variable, so export it in your shell profile too:"
+ "clients.codex": "In ~/.codex/config.toml. Codex takes the token from an environment variable, so export it in your shell profile too:",
+ "insp.more": "Show more",
+ "insp.blame": "Who wrote this",
+ "insp.blameOff": "Back to the text",
+ "insp.blameLines": "lines {from}–{to}",
+ "insp.blameEmpty": "Nothing to attribute yet."
 }

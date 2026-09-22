@@ -135,3 +135,35 @@ def test_blame_survives_whole_body_replace(store):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ─── paging a long chain ─────────────────────────────────────────────────────
+def test_history_pages_from_the_newest_end(store):
+    """A memory edited for a year answered with its entire chain — every diff,
+    in one response — which is a slow page in the panel and a context window an
+    agent cannot spare. Now it is the latest N, with a cursor further back."""
+    m = store.write(body="v0", title="counting", path="c")
+    for i in range(1, 12):
+        store.write(id=m.id, body=f"v{i}", title="counting")
+
+    whole = store.history(None, id=m.id)
+    assert [h["seq"] for h in whole] == list(range(1, 13))      # unchanged default
+
+    page = store.history(None, id=m.id, limit=5)
+    assert [h["seq"] for h in page] == [8, 9, 10, 11, 12]       # newest, oldest-first
+    older = store.history(None, id=m.id, limit=5, before_seq=page[0]["seq"])
+    assert [h["seq"] for h in older] == [3, 4, 5, 6, 7]
+    assert store.history(None, id=m.id, limit=5, before_seq=3)[0]["seq"] == 1
+
+
+def test_the_replay_paths_still_see_the_whole_chain(store):
+    """Blame and reconstruct rebuild the body by applying diffs from the start.
+    A partial chain would not raise — it would quietly produce the wrong text —
+    so they must never inherit a page size."""
+    m = store.write(body="one\n", title="t", path="p")
+    for line in ("two\n", "three\n", "four\n"):
+        store.write(id=m.id, body=store.get(None, id=m.id).body + line, title="t")
+
+    assert store.reconstruct(None, id=m.id) == "one\ntwo\nthree\nfour\n"
+    assert len(store.annotate(None, id=m.id)) == 4
+    assert store.verify_history(None, id=m.id) is True
