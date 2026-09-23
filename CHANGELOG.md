@@ -5,7 +5,13 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
-## [Unreleased]
+## [0.15.0] — 2026-09-23
+
+Search stops being a matter of opinion: there is a tool that measures it on
+your own memories, the fusion it measures is configurable, and two changes that
+looked obvious were dropped because they measured worse. Plus a record's past —
+paged history and blame in the panel — and one policy for what an account may
+do for itself.
 
 ### Changed
 - **The default recall mode is now hybrid, not semantic.** `mode="auto"` — what
