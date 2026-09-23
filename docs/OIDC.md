@@ -54,6 +54,7 @@ the problem, rather than leaving a sign-in door that half works.
 | `allowed_email_domains` | any | the person's **verified** email must be at one of these |
 | `on_email_match` | `pending` (managed) / `link` (open) | a verified email equals an account's email: `link`, `pending` or `deny` |
 | `on_no_match` | `deny` (managed) / `create` (open) | nobody matches: `create`, `pending` or `deny` |
+| `prompt` | `select_account` | what to ask the provider before it answers: `select_account` (show its account chooser), `login` (re-authenticate every time), or `""` (ask nothing) |
 | `sync_on_login` | `false` | see [Taking access back](#taking-access-back) |
 | `allow_http` | `false` | allow an `http://` issuer — for a local test provider only |
 
@@ -88,6 +89,25 @@ Typical rules:
 - **Keycloak / Authentik**: a group — `claim = "groups"`, `has = "memgres-users"` (add a groups mapper to the client).
 - **Entra ID**: an app role — `claim = "roles"`, `has = "memgres.user"`.
 - **Require MFA** where the provider reports it: `claim = "amr"`, `has = "mfa"`.
+
+## Which account the provider hands back
+
+A browser usually holds more than one session at the identity provider — a
+service admin used once for setup, a colleague who borrowed the laptop. Asked
+nothing, the provider picks one of them and does not say which, so the person
+can arrive as an account that is not theirs. In a managed deployment that
+account is unlinked, so it queues for an administrator — and if the person
+queuing *is* the administrator, they have locked themselves out with no way to
+choose differently. Switching account in the provider's own interface does not
+help: the other session stays valid, and it is what the next sign-in returns.
+
+So memgres sends `prompt=select_account` on both signing in and linking, and
+the provider shows its chooser. Set `prompt = ""` for a provider that always
+shows one anyway, or `prompt = "login"` to force re-authentication.
+
+If you are already stuck this way: sign in through `/signin/admin` with an
+administrator's token, or open the provider in a private window, where it has
+no session to reuse.
 
 ## Who gets in
 

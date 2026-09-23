@@ -642,9 +642,16 @@ def test_a_verified_stranger_is_still_told_there_is_no_account(box):
                                                   "email_verified": True}) == "/signin?auth=denied_no_account"
 
 
-def test_linking_asks_the_provider_to_let_the_person_choose(box):
+def test_both_flows_ask_the_provider_to_let_the_person_choose(box):
     """A browser often holds another session at the provider — a service admin's
-    — and without this the provider hands that one back without asking."""
+    — and without this the provider hands that one back without asking.
+
+    SIGNING IN needs it as much as linking, and used not to send it: the person
+    arrives as an account that is not theirs, an unlinked one queues for
+    approval, and an administrator who queues themselves that way is locked out
+    with no way to choose differently. Switching account in the provider's own
+    interface does not help — the other session stays valid and is what we get.
+    """
     client, root, idp, _ = box
     _admin_client(client, root)
     csrf = client.get("/ui/api/session").json()["csrf"]
@@ -652,7 +659,7 @@ def test_linking_asks_the_provider_to_let_the_person_choose(box):
                       headers={"Origin": ORIGIN, "X-Memgres-CSRF": csrf}).json()["url"]
     assert parse_qs(urlsplit(url).query)["prompt"] == ["select_account"]
     plain = client.get("/ui/auth/corp/start", follow_redirects=False).headers["location"]
-    assert "prompt" not in parse_qs(urlsplit(plain).query)
+    assert parse_qs(urlsplit(plain).query)["prompt"] == ["select_account"]
 
 
 def test_the_access_log_does_not_keep_the_code(box):
@@ -672,3 +679,18 @@ def test_pages_answer_head(box):
     client, _, _, _ = box
     for path in ("/signin", "/signin/admin", "/memory", "/account"):
         assert client.head(path, follow_redirects=False).status_code in (200, 307), path
+
+
+def test_a_provider_may_turn_the_chooser_off():
+    """One that always shows a chooser needs no asking, and an unknown value is
+    refused at startup rather than sent to the provider to puzzle over."""
+    from memgres.web.oidc_config import OIDCConfigError, parse
+
+    base = {"issuer": "https://id.example", "client_id": "abc"}
+    cfg = lambda **extra: {"providers": {"p": {**base, **extra}}}   # noqa: E731
+
+    assert parse(cfg(), key_mode="managed")["p"].prompt == "select_account"
+    assert parse(cfg(prompt=""), key_mode="managed")["p"].prompt == ""
+    assert parse(cfg(prompt="login"), key_mode="managed")["p"].prompt == "login"
+    with pytest.raises(OIDCConfigError, match="prompt must be one of"):
+        parse(cfg(prompt="consent"), key_mode="managed")

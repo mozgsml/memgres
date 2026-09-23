@@ -5,6 +5,23 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [0.15.1] — 2026-09-23
+
+### Fixed
+- **Signing in now asks the provider which account to use.** `prompt=select_account`
+  was sent when linking a provider but not when signing in, so the provider
+  picked among the sessions the browser held and never said which. A person
+  arrives as an account that is not theirs — typically a service admin used once
+  during setup — and in a managed deployment that unlinked account queues for an
+  administrator. When the person queuing IS the administrator, they are locked
+  out with no way to choose differently, and switching account in the provider's
+  own interface does not help: the other session stays valid and is what the
+  next sign-in returns. Found the hard way, on our own deployment, twice.
+- The behaviour is a provider setting, `prompt`: `select_account` (default),
+  `login` to force re-authentication, or `""` for a provider that always shows a
+  chooser anyway. An unknown value is refused at startup. See docs/OIDC.md,
+  which also says what to do when you are already stuck this way.
+
 ## [0.15.0] — 2026-09-23
 
 Search stops being a matter of opinion: there is a tool that measures it on

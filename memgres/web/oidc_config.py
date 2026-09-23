@@ -79,7 +79,25 @@ class Provider:
     on_no_match: str = "deny"
     sync_on_login: bool = False
     hint: str = ""
+    # What to ask the provider to do before handing an identity back.
+    # "select_account" by default, and the default is not politeness: a browser
+    # commonly holds more than one session at the provider (a service admin, a
+    # colleague who borrowed the laptop), and without this the provider picks
+    # one and never says which. Someone then arrives as an account that is not
+    # theirs — as an unlinked one it queues for approval, and if the person
+    # queuing is the only administrator, they have locked themselves out with
+    # no way to choose differently. Switching accounts in the provider's own UI
+    # does NOT fix it: the other session stays valid and is what we get.
+    # "" turns it off for a provider that shows a chooser on its own; "login"
+    # forces re-authentication every time.
+    prompt: str = "select_account"
     allow_http: bool = False   # plain-http issuer, for a local test provider only
+
+
+# What we may ask the provider to do before answering. "" sends nothing and
+# lets the provider decide, which is what memgres used to do everywhere and is
+# how someone ends up signed in as a session they forgot they had.
+PROMPTS = ("select_account", "login", "")
 
 
 def _read_secret(path: str, pid: str) -> str:
@@ -107,7 +125,7 @@ def parse(data: dict, *, key_mode: str) -> Dict[str, Provider]:
 
     known = {"label", "issuer", "client_id", "client_secret_file", "scopes", "token_auth",
              "require", "allowed_email_domains", "on_email_match", "on_no_match",
-             "sync_on_login", "hint", "allow_http"}
+             "sync_on_login", "hint", "prompt", "allow_http"}
     out: Dict[str, Provider] = {}
     for pid, p in raw.items():
         if not _ID_RE.match(pid):
@@ -165,12 +183,17 @@ def parse(data: dict, *, key_mode: str) -> Dict[str, Provider]:
         if on_no not in ACTIONS_NO_MATCH:
             raise OIDCConfigError(f"provider {pid!r}: on_no_match must be one of {', '.join(ACTIONS_NO_MATCH)}")
 
+        prompt = p.get("prompt", "select_account")
+        if prompt not in PROMPTS:
+            raise OIDCConfigError(
+                f"provider {pid!r}: prompt must be one of {', '.join(repr(x) for x in PROMPTS)}")
+
         out[pid] = Provider(
             id=pid, label=str(p.get("label") or pid), issuer=issuer, client_id=p["client_id"].strip(),
             client_secret=secret, scopes=tuple(scopes), token_auth=token_auth, require=tuple(conds),
             allowed_email_domains=tuple(d.lower().lstrip("@") for d in domains),
             on_email_match=on_match, on_no_match=on_no, sync_on_login=bool(p.get("sync_on_login", False)),
-            hint=str(p.get("hint", "")), allow_http=allow_http)
+            hint=str(p.get("hint", "")), prompt=prompt, allow_http=allow_http)
     return out
 
 

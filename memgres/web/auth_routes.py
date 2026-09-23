@@ -57,12 +57,18 @@ def mount(app, cfg, pool, panel, providers, fetch=None) -> None:
         starts.fail(key)
         state, nonce, browser = secrets.token_urlsafe(32), secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         verifier, challenge = new_pkce()
-        # Linking asks the provider to show its account chooser: a browser often
-        # holds another session there (a service admin, a colleague's), and the
-        # provider would otherwise hand that one back without asking.
+        # Ask the provider to show its account chooser — on SIGNING IN as much
+        # as on linking. A browser commonly holds another session there (a
+        # service admin, a colleague's), and without this the provider picks one
+        # and never says which: the person arrives as an account that is not
+        # theirs, waits in the approval queue for an administrator, and — when
+        # they ARE the administrator — cannot get in to approve themselves.
+        # Switching account in the provider's own interface does not help,
+        # because the other session stays valid and is what we are handed.
+        # Per provider, because one that always shows a chooser needs no asking.
         url = client.authorize_url(redirect_uri=_redirect_uri(request, pid), state=state,
                                    nonce=nonce, challenge=challenge,
-                                   prompt="select_account" if link_session else None)
+                                   prompt=providers[pid].prompt or None)
         with pool.connection() as conn, conn.transaction(), conn.cursor() as cur:
             cur.execute("DELETE FROM oidc_flow WHERE expires_at < now()")
             cur.execute("SELECT count(*) FROM oidc_flow")
