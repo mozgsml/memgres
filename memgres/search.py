@@ -262,13 +262,21 @@ def recall(conn, cfg, embedder, ns, query: str, *, k: int = 10,
     elif mode == "semantic":
         if backend is None:
             raise RuntimeError(
-                "semantic recall needs an embedder (MEMGRES_EMBED_PROVIDER)")
+                "semantic recall needs an embedder (MEMGRES_EMBED_PROVIDER) — "
+                "this deployment has none, so only 'lexical' exists and "
+                "mode='auto' already uses it")
         hits = backend.search(conn, cfg, embedder.embed_query(query), k, ns,
                               tags, path_prefix, tags_match)
     elif mode == "hybrid":
         if backend is None:
+            # Naming the mode the caller ASKED for, and what this deployment can
+            # actually do instead: a message about "semantic" is a puzzle when
+            # the word you typed was "hybrid", and `mode="auto"` is already
+            # lexical here, so the fix is usually to stop naming a mode at all.
             raise RuntimeError(
-                "semantic recall needs an embedder (MEMGRES_EMBED_PROVIDER)")
+                "hybrid recall needs an embedder (MEMGRES_EMBED_PROVIDER) — "
+                "this deployment has none, so only 'lexical' exists and "
+                "mode='auto' already uses it")
         lex = lexical_search(conn, cfg, ns, query, k, tags, path_prefix, match,
                        tags_match)
         sem = backend.search(conn, cfg, embedder.embed_query(query), k, ns,

@@ -143,3 +143,15 @@ def test_auto_is_hybrid_wherever_an_embedder_exists(monkeypatch):
     search.recall(None, cfg, FakeEmbedder(), None, "ip 10.0.0.1",
                   backend=None, bodies=False)
     assert seen == {"lexical": True}                       # no embedder: lexical
+
+
+def test_a_deployment_without_an_embedder_is_told_what_it_does_have():
+    """`auto` already resolves to lexical there, so the only way to reach this
+    is to name a mode — and the answer should say which one to stop naming."""
+    import pytest
+
+    from memgres import search
+
+    for mode in ("hybrid", "semantic"):
+        with pytest.raises(RuntimeError, match="mode='auto' already uses it"):
+            search.recall(None, None, None, None, "anything", mode=mode, backend=None)

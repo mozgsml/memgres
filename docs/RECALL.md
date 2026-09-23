@@ -20,8 +20,15 @@ compress, so every similar-looking string sits about as close, and the one
 memory you wanted lands mid-list.
 
 `mode="auto"` — the default for every caller — runs **hybrid** wherever an
-embedder is configured, and falls back to lexical when there is none. Ask for
-`semantic` explicitly when you want wording ignored on purpose.
+embedder is configured, and **lexical** when there is none. Ask for `semantic`
+explicitly when you want wording ignored on purpose.
+
+**A deployment without an embedder is unaffected by any of this.** With
+`MEMGRES_EMBED_PROVIDER=none` there is no vector ranking to fuse, `auto` is
+lexical exactly as it always was, `server_info` advertises `recall_modes:
+["lexical"]` so an agent reading it never asks for more, and naming `hybrid` or
+`semantic` anyway is refused with a message that says which mode to stop
+naming. Nothing in the fusion settings applies, and nothing needs configuring.
 
 ## How the two get merged (RRF)
 
