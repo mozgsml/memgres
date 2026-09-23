@@ -240,3 +240,35 @@ def test_the_panel_shows_who_wrote_which_lines(box):
     # someone with no way into that space is told nothing about it
     _as(client, cfg, ids["olga"])
     assert client.get(f"/ui/api/spaces/{ids['sales']}/records/{rid}/blame").status_code == 404
+
+
+def test_a_person_picks_a_colour_for_a_space_or_a_branch(box):
+    """The graph colours a branch by hashing its name — stable and meaningless.
+    A choice is per person (like the interface language beside it), so nobody
+    repaints what everyone else sees, and it survives to another device."""
+    client, cfg, ids = box
+    _as(client, cfg, ids["mark"])
+    # a changing request carries the CSRF token and a same-origin Origin
+    h = {"Origin": ORIGIN, "X-Memgres-CSRF": client.get("/ui/api/session").json()["csrf"]}
+    assert client.get("/ui/api/session").json()["user"]["ui_colors"] == {}
+
+    r = client.put("/ui/api/me/colors", json={"key": ids["sales"], "color": "amber"}, headers=h)
+    assert r.status_code == 200 and r.json()["colors"] == {ids["sales"]: "amber"}
+    branch = f"{ids['sales']}:leads"
+    client.put("/ui/api/me/colors", json={"key": branch, "color": "lime"}, headers=h)
+
+    # it comes back with the session, which is what the panel draws from
+    colours = client.get("/ui/api/session").json()["user"]["ui_colors"]
+    assert colours == {ids["sales"]: "amber", branch: "lime"}
+
+    # a colour the panel cannot draw is refused rather than stored
+    assert client.put("/ui/api/me/colors", json={"key": branch, "color": "octarine"},
+                      headers=h).status_code == 422
+
+    # and clearing one brings the automatic colour back
+    client.put("/ui/api/me/colors", json={"key": branch, "color": None}, headers=h)
+    assert client.get("/ui/api/session").json()["user"]["ui_colors"] == {ids["sales"]: "amber"}
+
+    # someone else's choices are their own
+    _as(client, cfg, ids["olga"])
+    assert client.get("/ui/api/session").json()["user"]["ui_colors"] == {}

@@ -441,5 +441,6 @@
  "insp.blameEmpty": "Nothing to attribute yet.",
  "adm.col.lastSeen": "Last seen",
  "people.lastSeen": "Last seen",
- "adm.lastSeenWhy": "The latest of: a sign-in, a panel visit, a write, or a token of theirs being used."
+ "adm.lastSeenWhy": "The latest of: a sign-in, a panel visit, a write, or a token of theirs being used.",
+ "color.autoPick": "Automatic (from the name)"
 }

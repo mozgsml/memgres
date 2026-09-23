@@ -1,0 +1,17 @@
+-- A person's own colours for the spaces and branches they look at.
+--
+-- The graph colours a branch by hashing its name, which is stable and
+-- meaningless: two branches someone thinks of as related get unrelated colours,
+-- and the one they look at all day may land on the colour they like least.
+-- This lets them say otherwise.
+--
+-- PER PERSON, like `ui_language` beside it, and deliberately not per space: a
+-- shared palette would raise a question this does not need to answer — who may
+-- repaint what everyone else sees — and a colour is not memory, it is how one
+-- reader prefers to look at it.
+--
+-- jsonb keyed by "<namespace_id>" for a space and "<namespace_id>:<root>" for a
+-- branch inside it, valued by a PALETTE NAME ("sky", "amber", …) rather than a
+-- hex: the palette is part of the panel's design and may be restyled, and a
+-- stored hex would then be a colour from the old one.
+ALTER TABLE app_user ADD COLUMN IF NOT EXISTS ui_colors jsonb NOT NULL DEFAULT '{}'::jsonb;

@@ -238,13 +238,55 @@ def profile(conn, user_id: Optional[str]) -> Optional[dict]:
     if user_id is None:
         return None
     with conn.cursor() as cur:
-        cur.execute("SELECT id, name, full_name, email, role, ui_language "
+        cur.execute("SELECT id, name, full_name, email, role, ui_language, ui_colors "
                     "FROM app_user WHERE id = %s", (user_id,))
         row = cur.fetchone()
     if row is None:
         return None
     return {"id": str(row[0]), "name": row[1], "full_name": row[2], "email": row[3],
-            "role": row[4], "ui_language": row[5]}
+            "role": row[4], "ui_language": row[5], "ui_colors": row[6] or {}}
+
+
+MAX_COLOURS = 200          # a person looking at more branches than this is
+                           # not choosing colours, and neither is whatever is
+                           # calling the endpoint
+
+
+def set_colour(conn, user_id: str, key: str, colour: Optional[str],
+               allowed: tuple) -> dict:
+    """Remember (or forget, with ``colour=None``) one person's colour for one
+    space or branch. Returns the whole map, so the caller never has to guess
+    what it now holds.
+
+    The key is opaque here on purpose — it is a namespace id, optionally with a
+    branch after a colon — because validating that a branch still exists would
+    make a preference depend on memory that may be renamed or deleted. A key
+    that stops meaning anything simply stops being read; the cap is what keeps
+    the column from growing without bound.
+    """
+    from psycopg.types.json import Json
+
+    if colour is not None and colour not in allowed:
+        raise ValueError(f"unknown colour {colour!r}")
+    if len(key) > 200:
+        raise ValueError("that key is too long to be a space or a branch")
+    with conn.cursor() as cur:
+        cur.execute("SELECT ui_colors FROM app_user WHERE id = %s FOR UPDATE",
+                    (user_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError("no such account")
+        colours = dict(row[0] or {})
+        if colour is None:
+            colours.pop(key, None)
+        else:
+            if key not in colours and len(colours) >= MAX_COLOURS:
+                raise ValueError(
+                    f"that is {MAX_COLOURS} colours already — clear some first")
+            colours[key] = colour
+        cur.execute("UPDATE app_user SET ui_colors = %s WHERE id = %s",
+                    (Json(colours), user_id))
+    return colours
 
 
 def set_language(conn, user_id: str, lang: Optional[str]) -> None:

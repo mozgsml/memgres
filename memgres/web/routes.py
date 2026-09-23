@@ -97,6 +97,14 @@ def _scrub_access_log() -> None:
         access.addFilter(_ScrubSignInQuery())
 
 
+# The palette the panel draws with (static/js/ui.js). Here only to refuse a
+# colour this panel cannot render — a preference nobody can draw is worse
+# than no preference. Names rather than hexes, so restyling the palette
+# carries everyone's choices with it.
+PALETTE_NAMES = ("sky", "green", "amber", "lavender", "pink", "butter",
+                 "periwinkle", "lime")
+
+
 def mount(app, cfg, pool, make_store, *, oidc_fetch=None) -> None:
     from fastapi import Body, HTTPException, Request, Response
     from fastapi.responses import FileResponse, RedirectResponse
@@ -277,6 +285,21 @@ def mount(app, cfg, pool, make_store, *, oidc_fetch=None) -> None:
         with pool.connection() as conn:
             sessions.set_language(conn, s.user_id, ui_language)
         return _session_view(s)
+
+    @app.put("/ui/api/me/colors")
+    def set_colour(request: Request, key: str = Body(..., embed=True),
+                   color: Optional[str] = Body(None, embed=True)):
+        """One person's colour for one space or branch; `color: null` forgets it
+        and the automatic one comes back. Answers with the whole map."""
+        s = _changing(request)
+        if s.user_id is None:
+            raise HTTPException(409, "the administrator token has no account to save this to")
+        with pool.connection() as conn:
+            try:
+                return {"colors": sessions.set_colour(conn, s.user_id, key, color,
+                                                      PALETTE_NAMES)}
+            except ValueError as e:
+                raise HTTPException(422, str(e))
 
     # the other modules of the panel attach here
     app.state.panel = {"session": _signed_in, "changing": _changing,

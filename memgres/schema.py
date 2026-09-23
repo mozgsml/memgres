@@ -18,7 +18,7 @@ from pathlib import Path
 from .config import Config
 
 # The version this build migrates the database TO (the latest migration it carries).
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 # The compatibility FLOOR: the schema version of the most recent backward-
 # INCOMPATIBLE migration — one that changed the shape/semantics old code relied on
@@ -89,6 +89,8 @@ SCHEMA_VERSION = 26
 #   v26 (0025): added search_log → additive, floor stays 16. An older client
 #     never writes it and never reads it; the sweeper that expires its rows is
 #     keyed on MEMGRES_SEARCH_LOG_DAYS, not on the client version.
+#   v27 (0026): added app_user.ui_colors → additive, floor stays 16. A panel
+#     preference; an older client neither reads nor writes it.
 SCHEMA_BREAKING_VERSION = 16
 
 # Dev layout: repo/migrations next to the package. When packaged, migrations are

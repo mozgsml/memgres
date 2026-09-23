@@ -26,6 +26,12 @@ patch = fixes).
   history is the README's headline claim, and the check existed only for
   someone importing the package in Python — the Docker + MCP deployment the
   docs recommend could not run it at all.
+- **Pick the colour of a space or a branch** from its card in the panel: eight
+  swatches and *automatic*. The graph hashes a name into a colour, which is
+  stable and arbitrary — two branches someone thinks of as related land on
+  unrelated colours. The choice is per person and stored on the account (like
+  the interface language), so it follows them between devices and changes
+  nothing for anybody else.
 - **"Last seen" for a person**, in the directory and on their page: the latest
   of a sign-in, a panel visit, a write, and a token of theirs being presented. Reads are still
   not attributed per account — that would be a row per recall — so this is built

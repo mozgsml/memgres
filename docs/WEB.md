@@ -117,6 +117,11 @@ token that does not exist.
   but an oracle all the same.
 - **Sign-in methods** (Account). Link another provider, or unlink one — not the
   last.
+- **The colour of a space or a branch.** The graph colours a branch by hashing
+  its name — stable, and meaningless — so a record's card offers eight swatches
+  and *automatic*. The choice is **per person**, like the language beside it: it
+  follows them to another device and repaints nothing for anyone else, which is
+  why it needs no permission to make.
 - **Language** (Account → Profile, and on the sign-in page). Otherwise the
   browser's language, otherwise English.
 - **Their own activity** (Account → Profile): what they and their agents wrote,

@@ -1,7 +1,7 @@
 // Memory: a space drawn as a graph or a tree, search, the local view and a record's card.
 // Read-only in this release.
 
-import { get, post, ApiError } from "./api.js";
+import { del, get, post, put, ApiError } from "./api.js";
 import { ago, fmtDate, nf, t } from "./i18n.js";
 import { renderMarkdown } from "./md.js";
 import { VISUALIZERS } from "./viz.js";
@@ -329,7 +329,16 @@ async function loadSpaces() {
   m.spaceAuto = autoSlots(m.spaces.map((s) => s.name));
 }
 
-const spaceColor = (s) => s.visiting ? PALETTE[fnv(s.name) % PALETTE.length] : PALETTE[m.spaceAuto[s.name] ?? 0];
+// A colour is chosen, or it is hashed from the name. `chosen` is the person's
+// own map (ui_colors), keyed by space id and by "<space id>:<branch>", holding
+// PALETTE names rather than hexes so a restyle carries the choice with it.
+const chosen = (key) => {
+  const name = m.session?.user?.ui_colors?.[key];
+  const i = name ? PALETTE_KEYS.indexOf(name) : -1;
+  return i < 0 ? null : PALETTE[i];
+};
+const spaceColor = (s) => chosen(s.id)
+  ?? (s.visiting ? PALETTE[fnv(s.name) % PALETTE.length] : PALETTE[m.spaceAuto[s.name] ?? 0]);
 
 function renderSpaceList() {
   const q = $("#space-filter").value.trim().toLowerCase();
@@ -460,7 +469,11 @@ function index(graph) {
 }
 
 const count = (n) => (n.record ? 1 : 0) + n.children.reduce((s, c) => s + count(c), 0);
-const colorOf = (id) => id === "" ? spaceColor(m.space) : PALETTE[m.rootAuto[m.T.get(id)?.root ?? id] ?? 0];
+const colorOf = (id) => {
+  if (id === "") return spaceColor(m.space);
+  const root = m.T.get(id)?.root ?? id;
+  return chosen(`${m.space?.id}:${root}`) ?? PALETTE[m.rootAuto[root] ?? 0];
+};
 
 function neighbours(id) {
   const s = new Set([id]), n = m.T.get(id);
@@ -732,7 +745,8 @@ async function inspect() {
     box.innerHTML = `<div class="eyebrow">${hexIcon(sc, false, 13)}${esc(t("insp.space"))}</div><h2 class="mono">${esc(m.space.name)}</h2>
       ${m.space.description ? `<p class="note" style="color:var(--text)">${esc(m.space.description)}</p>` : ""}
       ${stats([["insp.records", m.graph.total], ["insp.links", m.links.length]])}
-      <div><p class="h3">${esc(t("insp.color"))}</p><div class="colorline"><span class="txt">${hexIcon(sc, false, 14)} ${t("color.spaceAuto", { name: esc(colorName(sc)) })}</span></div></div>
+      <div><p class="h3">${esc(t("insp.color"))}</p><div class="colorline"><span class="txt">${hexIcon(sc, false, 14)} ${t("color.spaceAuto", { name: esc(colorName(sc)) })}</span>
+        ${swatches(m.space.id, sc, PALETTE[m.spaceAuto[m.space.name] ?? 0])}</div></div>
       <div><p class="h3">${esc(t("insp.mostLinked"))}</p>${listOf(hubs)}</div>
       ${m.graph.truncated ? `<p class="note" style="color:var(--admin)">${esc(t("mem.truncatedNote", { shown: nf(m.graph.records.length), total: nf(m.graph.total) }))}</p>` : ""}
       <div class="row">
@@ -775,7 +789,8 @@ async function inspect() {
       <div class="body md" id="insp-body">${renderMarkdown(r.body, { link: wikiLink })}</div></div>
     <div><p class="h3">${esc(t("insp.linksTo"))}</p>${listOf(outIds)}${dangling.length ? `<p class="note">${esc(t("insp.danglingList", { list: dangling.map((l) => l.target).join(", ") }))}</p>` : ""}</div>
     <div><p class="h3">${esc(t("insp.linkedFrom"))}</p>${listOf(inIds)}</div>
-    <div><p class="h3">${esc(t("insp.color"))}</p><div class="colorline"><span class="txt">${hexIcon(c, false, 14)} ${t("color.auto", { name: esc(colorName(c)), root: esc(n.root) })}</span></div></div>
+    <div><p class="h3">${esc(t("insp.color"))}</p><div class="colorline"><span class="txt">${hexIcon(c, false, 14)} ${t("color.auto", { name: esc(colorName(c)), root: esc(n.root) })}</span>
+      ${swatches(`${m.space.id}:${n.root}`, c, PALETTE[m.rootAuto[n.root] ?? 0])}</div></div>
     <div><p class="h3">${esc(t("insp.history"))}</p><div class="hist" id="insp-hist"><p class="note">…</p></div></div>
     <div class="row">${n.path ? `<button class="btn quiet" data-copy="${esc(n.path)}">${esc(t("insp.copy"))}</button>` : ""}<button class="btn quiet" data-copy="${esc(r.id)}">${esc(t("insp.copyId"))}</button></div>`;
   // History arrives a page at a time: a record edited for a year has hundreds of
@@ -819,6 +834,35 @@ async function inspect() {
   });
 }
 
+// The colour picker for a space or a branch. Eight swatches and "automatic":
+// the automatic one is a hash of the name, which is stable and meaningless, so
+// the choice here is only ever an improvement on a coin toss.
+function swatches(key, current, autoColor) {
+  const mine = m.session?.user?.ui_colors?.[key];
+  return `<div class="swatches" data-colorkey="${esc(key)}">
+    ${PALETTE.map((hex, i) => `<button class="sw" data-color="${esc(PALETTE_KEYS[i])}"
+        style="--c:${hex}" aria-pressed="${mine === PALETTE_KEYS[i]}"
+        title="${esc(t("pal." + PALETTE_KEYS[i]))}"></button>`).join("")}
+    <button class="sw auto" data-color="" aria-pressed="${!mine}"
+      style="--c:${autoColor}" title="${esc(t("color.autoPick"))}">↺</button>
+  </div>`;
+}
+
+async function pickColour(key, colour) {
+  const before = m.session?.user?.ui_colors ? { ...m.session.user.ui_colors } : {};
+  try {
+    const out = await put("/me/colors", { key, color: colour || null });
+    if (m.session?.user) m.session.user.ui_colors = out.colors;
+  } catch {
+    if (m.session?.user) m.session.user.ui_colors = before;
+    toast(t("err.save"));
+    return;
+  }
+  drawGraph();                      // the tree and the sidebar both read colorOf
+  renderSpaceList();
+  inspect();
+}
+
 // Blame: the body as runs, each tagged with who last changed those lines.
 // Shown verbatim rather than as Markdown — attribution is per line, and
 // rendering across block boundaries would move it to the wrong text.
@@ -856,6 +900,11 @@ async function showBlame(rec, box) {
 }
 
 async function onInspectorAction(e) {
+  const sw = e.target.closest("[data-color]");
+  if (sw) {
+    const key = sw.closest("[data-colorkey]")?.dataset.colorkey;
+    if (key) return pickColour(key, sw.dataset.color);
+  }
   if (e.target.closest("[data-blame]") && m.record && m.space) {
     return showBlame(m.record, $("#inspector", m.root));
   }
