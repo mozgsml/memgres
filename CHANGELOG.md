@@ -5,7 +5,12 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
-## [Unreleased]
+## [0.16.0] — 2026-09-24
+
+The panel stops getting in the way of reading. Blame marks the record up where
+it stands instead of replacing it with monospace blocks, colour is one button
+with a palette behind it and belongs to whatever node you are on, the local view
+always has something to centre on, and an empty section is no longer drawn.
 
 ### Changed
 - **Blame keeps the text.** "Who wrote this" used to replace a record's body
