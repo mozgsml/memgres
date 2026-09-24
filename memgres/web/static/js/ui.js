@@ -14,8 +14,32 @@ export const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)"
 
 // ─── colors ────────────────────────────────────────────────────────────────
 // Red is deliberately absent: it is kept for warnings.
+//
+// PALETTE is what a name hashes to — eight bright marks that stay legible on
+// both grounds, and it is deliberately short: the automatic colour exists to
+// tell branches apart at a glance, and more slots make near-identical
+// neighbours likelier, not clearer. Choosing by hand is a different job, so
+// the picker adds a deeper shade of each and four hues the automatic set has
+// no room for. The extra colours are pick-only: the hash never reaches them,
+// so widening the picker leaves every automatic colour exactly where it was.
 export const PALETTE = ["#4fd6f2", "#62e38d", "#ffa24c", "#b9a4ff", "#ff7cc0", "#f1de6b", "#7da2ff", "#c4e36a"];
 export const PALETTE_KEYS = ["sky", "green", "amber", "lavender", "pink", "butter", "periwinkle", "lime"];
+
+const PICK_EXTRA = ["#2e9bd6", "#35a862", "#d9703a", "#8a6ede", "#d4498f", "#c9a227", "#4a6fd0", "#8aa33c",
+                    "#ff8a80", "#3fd0c2", "#7cefc0", "#aab4cc"];
+const PICK_EXTRA_KEYS = ["ocean", "forest", "rust", "purple", "cerise", "gold", "denim", "olive",
+                         "coral", "teal", "mint", "slate"];
+
+// Every colour a person may pick, bright row first, then the deeper shades.
+export const PICKABLE = [...PALETTE, ...PICK_EXTRA];
+export const PICKABLE_KEYS = [...PALETTE_KEYS, ...PICK_EXTRA_KEYS];
+
+// A stored preference is a NAME; this turns it back into a colour, and returns
+// null for anything this panel cannot draw (an older name, a newer one).
+export const colorByName = (name) => {
+  const i = name ? PICKABLE_KEYS.indexOf(name) : -1;
+  return i < 0 ? null : PICKABLE[i];
+};
 
 export function fnv(s) {
   let h = 2166136261;

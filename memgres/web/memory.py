@@ -161,17 +161,23 @@ def record_blame(store, principal, space_id: str, record_id: str) -> dict:
 
     Grouped rather than per-line: a long memory edited by two people is a
     handful of blocks, and a list of five hundred identically-attributed lines
-    is not something a person reads. The text comes back as written — the panel
-    shows it verbatim here, because blame is about lines, and rendering Markdown
-    across block boundaries would put the attribution in the wrong places.
+    is not something a person reads.
+
+    Line ranges, not text: the panel already has the body and shows it rendered,
+    tinting each block by whoever wrote most of its lines. What it cannot work
+    out for itself is the provenance behind those lines, so every run carries the
+    whole stamp — who, when, which revision, and the `source`/`reason`/`valid_at`
+    the writer left — which is what the tooltip reads.
     """
-    blocks = store.annotate_grouped(principal, id=record_id, space_id=space_id)
-    return {"blame": [{"start": b["start"], "end": b["end"], "seq": b.get("seq"),
-                       "op": b.get("op"), "at": b.get("created_at"),
+    runs = store.annotate_grouped(principal, id=record_id, space_id=space_id,
+                                  include_text=False)
+    return {"blame": [{"start": b["start"], "end": b["end"], "lines": b.get("lines"),
+                       "seq": b.get("seq"), "op": b.get("op"),
+                       "at": b.get("created_at"), "valid_at": b.get("valid_at"),
                        "author_id": b.get("author_user_id"),
                        "author": b.get("author_name"),
-                       "reason": b.get("reason"), "text": b.get("text", "")}
-                      for b in blocks]}
+                       "source": b.get("source"), "reason": b.get("reason")}
+                      for b in runs]}
 
 
 def mount(app, cfg, pool, panel, make_store) -> None:

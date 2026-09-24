@@ -216,16 +216,23 @@ def test_the_list_of_every_space_says_when_it_is_cut(box, monkeypatch):
 def test_the_panel_shows_who_wrote_which_lines(box):
     """Blame has existed in the core since the history wave; the panel simply
     never had a way in. Grouped into runs, because a per-line list of five
-    hundred identically-attributed rows is not something a person reads."""
+    hundred identically-attributed rows is not something a person reads.
+
+    Ranges and provenance, no text: the panel already has the body and tints it
+    where it stands, so what it cannot work out for itself is who wrote each
+    line and what they said they were doing."""
     client, cfg, ids = box
     tok = client.post("/admin/tokens", json={"user_id": ids["mark"]},
                       headers=_bearer(os.environ["MEMGRES_ADMIN_TOKEN"])).json()["token"]
     made = client.post("/memories", json={"space": "sales", "path": "notes.blame",
-                                          "title": "Notes", "body": "first line\nsecond line\n"},
+                                          "title": "Notes", "body": "first line\nsecond line\n",
+                                          "source": "the first meeting", "reason": "seed"},
                        headers=_bearer(tok))
     rid = made.json()["id"]
     edit = client.patch(f"/memories/{rid}", json={"title": "Notes",
-                        "body": "first line\nsecond line\nthird line\n"},
+                        "body": "first line\nsecond line\nthird line\n",
+                        "source": "a later mail", "reason": "one more line",
+                        "valid_at": "2026-09-01"},
                         headers=_bearer(tok))
     assert edit.status_code == 200, edit.text
 
@@ -233,9 +240,12 @@ def test_the_panel_shows_who_wrote_which_lines(box):
     r = client.get(f"/ui/api/spaces/{ids['sales']}/records/{rid}/blame")
     assert r.status_code == 200, r.text
     blocks = r.json()["blame"]
-    assert "".join(b["text"] for b in blocks) == "first line\nsecond line\nthird line\n"
-    assert [b["start"] for b in blocks] == sorted(b["start"] for b in blocks)
-    assert blocks[-1]["end"] == 3
+    assert [(b["start"], b["end"]) for b in blocks] == [(1, 2), (3, 3)]
+    assert all("text" not in b for b in blocks)      # the body is not sent twice
+    last = blocks[-1]
+    assert last["source"] == "a later mail" and last["reason"] == "one more line"
+    assert last["valid_at"] == "2026-09-01" and last["author"]
+    assert blocks[0]["source"] == "the first meeting"
 
     # someone with no way into that space is told nothing about it
     _as(client, cfg, ids["olga"])
@@ -264,6 +274,15 @@ def test_a_person_picks_a_colour_for_a_space_or_a_branch(box):
     # a colour the panel cannot draw is refused rather than stored
     assert client.put("/ui/api/me/colors", json={"key": branch, "color": "octarine"},
                       headers=h).status_code == 422
+
+    # the picker offers more than the eight the automatic colour hashes to,
+    # and nothing BUT colours: "automatic" is the absence of an entry, so it is
+    # sent as `color: null` and has no name of its own to store
+    assert client.put("/ui/api/me/colors", json={"key": branch, "color": "teal"},
+                      headers=h).status_code == 200
+    for word in ("auto", "inherit"):
+        assert client.put("/ui/api/me/colors", json={"key": branch, "color": word},
+                          headers=h).status_code == 422
 
     # and clearing one brings the automatic colour back
     client.put("/ui/api/me/colors", json={"key": branch, "color": None}, headers=h)

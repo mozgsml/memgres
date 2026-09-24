@@ -102,7 +102,10 @@ def _scrub_access_log() -> None:
 # than no preference. Names rather than hexes, so restyling the palette
 # carries everyone's choices with it.
 PALETTE_NAMES = ("sky", "green", "amber", "lavender", "pink", "butter",
-                 "periwinkle", "lime")
+                 "periwinkle", "lime",
+                 # pick-only shades: the automatic colour never hashes to these
+                 "ocean", "forest", "rust", "purple", "cerise", "gold", "denim",
+                 "olive", "coral", "teal", "mint", "slate")
 
 
 def mount(app, cfg, pool, make_store, *, oidc_fetch=None) -> None:
@@ -289,8 +292,9 @@ def mount(app, cfg, pool, make_store, *, oidc_fetch=None) -> None:
     @app.put("/ui/api/me/colors")
     def set_colour(request: Request, key: str = Body(..., embed=True),
                    color: Optional[str] = Body(None, embed=True)):
-        """One person's colour for one space or branch; `color: null` forgets it
-        and the automatic one comes back. Answers with the whole map."""
+        """One person's colour for one space or branch; `color: null` forgets it,
+        which is how it goes back to the colour its name gives it. Answers with
+        the whole map."""
         s = _changing(request)
         if s.user_id is None:
             raise HTTPException(409, "the administrator token has no account to save this to")

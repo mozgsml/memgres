@@ -81,19 +81,30 @@ token that does not exist.
   opens as a graph (records as hexagons, sized by how many links they have) or
   as a tree. Select a record to fade everything unrelated; switch to the local
   view to see only its neighbours up to three steps away, with the path back to
-  the root. Search uses the server's recall, lexical or semantic as configured;
+  the root — with nothing selected it starts at the space itself, since "show me
+  the neighbourhood" always has an answer. Search uses the server's recall, lexical or semantic as configured;
   its results open in their own column beside the record, so opening one keeps
   the list, and the column closes with ×.
+  A section with nothing in it is not drawn: a record that nothing links to says
+  so by having no "Linked from" heading, rather than a heading followed by
+  "None".
   A record's body is rendered as Markdown — headings, lists, tables, code,
   links, and `[[path]]` links that open the record they name. Nothing in a body
   runs: raw HTML is shown as text, only `http(s)`/`mailto` links are kept, images
   are not fetched. A record shows its history — who changed it and when, each name
   opening that person's page — a page at a time, newest first, with **Show more**
-  for older revisions. **Who wrote this** turns the body into blame: the text
-  split into runs, each banded with its author's colour and labelled with who
-  last touched those lines and when. Blame is shown verbatim rather than as
-  Markdown, because attribution is per line and rendering across run boundaries
-  would put the labels on the wrong text. The record panel is as wide as you drag its edge
+  for older revisions. **Who wrote this** leaves the text exactly as it is
+  and tints it instead, the way an editor marks up a file: each block — a
+  paragraph, a heading, a list item, a table row — is banded in the colour of
+  whoever wrote most of its lines, with a key of everyone who touched the record
+  above it. Lists are split by item and tables by row because in both the source
+  lines up one to one with what is drawn; a cell cannot be told from its
+  neighbours, since a row is a single line. Point at a block (or tap it, on a phone) and the tooltip names
+  everyone behind those lines: who, when, which revision, and the `source`,
+  `reason` and `valid_at` they stamped on it. Attribution is per line and a
+  rendered block covers several, which is why a block carries the dominant
+  author rather than pretending to a precision it does not have.
+  The record panel is as wide as you drag its edge
   (double-click the edge to reset); the width is remembered in the browser.
 - **Tokens** (Account → Tokens). A token for each device or client, with:
   - access `read` or `write` — never `admin`: an admin-ceiling token can mint
@@ -117,11 +128,33 @@ token that does not exist.
   but an oracle all the same.
 - **Sign-in methods** (Account). Link another provider, or unlink one — not the
   last.
-- **The colour of a space or a branch.** The graph colours a branch by hashing
-  its name — stable, and meaningless — so a record's card offers eight swatches
-  and *automatic*. The choice is **per person**, like the language beside it: it
-  follows them to another device and repaints nothing for anyone else, which is
-  why it needs no permission to make.
+- **The colour of a space or a branch.** **Color**, next to the copy buttons at
+  the foot of the card, opens the palette: twenty colours, plus *automatic* —
+  the slot the name hashes to, which is what a space or a branch shows until
+  somebody picks. The twelve added colours are pick-only: the hash reaches the
+  first eight, so widening the picker moved nothing already on screen.
+
+  Only a chosen colour is stored, and *automatic* clears that entry rather than
+  storing a word of its own — a reset that leaves something behind is how a
+  picker ends up claiming a colour was "your choice" when nobody chose it. The
+  card says which of the two you are looking at in as many words ("pink, picked
+  from the name “x402”" / "gold — your choice"), because a swatch cannot.
+
+  Colour belongs to whatever is selected — the space, a path, one record — and
+  runs down everything under it: the nearest thing above with a colour of its
+  own wins, so painting `x402` paints the lot and painting `x402.rails` repaints
+  that part of it again. Nobody painted means a top-level branch shows the slot
+  its name hashes to, which is what makes colour read as "these belong together"
+  on the map. Below the swatches sits the way back, and it is named for what it
+  actually hands you: **parent's colour** on anything nested, **colour from the
+  name** on a top-level branch and on the space, which have no parent to take one
+  from. Either way it clears the entry rather than storing a word of its own. The
+  line above says where the colour on screen came from ("no colour of its own —
+  gold, from “x402.okx”").
+
+  The choice is **per person**, like the language beside it: it follows them to
+  another device and repaints nothing for anyone else, which is why it needs no
+  permission to make.
 - **Language** (Account → Profile, and on the sign-in page). Otherwise the
   browser's language, otherwise English.
 - **Their own activity** (Account → Profile): what they and their agents wrote,

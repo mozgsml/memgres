@@ -3,9 +3,9 @@
 
 import { del, get, post, put, ApiError } from "./api.js";
 import { ago, fmtDate, nf, t } from "./i18n.js";
-import { renderMarkdown } from "./md.js";
+import { blameBlocks, renderMarkdown } from "./md.js";
 import { VISUALIZERS } from "./viz.js";
-import { $, $$, autoSlots, esc, fnv, hexIcon, PALETTE, PALETTE_KEYS, reducedMotion, store, toast } from "./ui.js";
+import { $, $$, autoSlots, colorByName, esc, fnv, hexIcon, PALETTE, PICKABLE, PICKABLE_KEYS, reducedMotion, store, toast } from "./ui.js";
 
 const LARGE = 60;          // above this many records the whole graph gets busy: suggest the local view
 const m = {
@@ -245,7 +245,7 @@ function buildArea(root) {
   $("#crumbs", root).addEventListener("click", (e) => {
     const b = e.target.closest("[data-crumb]");
     if (!b || b.getAttribute("aria-current")) return;
-    if (b.dataset.crumb === "") { m.scope = "all"; select(""); m.ctl?.fit?.(); } else select(b.dataset.crumb, { centre: true });
+    select(b.dataset.crumb, { centre: true });
   });
   $("#suggest", root).addEventListener("click", (e) => {
     const b = e.target.closest("[data-sg]");
@@ -329,16 +329,20 @@ async function loadSpaces() {
   m.spaceAuto = autoSlots(m.spaces.map((s) => s.name));
 }
 
-// A colour is chosen, or it is hashed from the name. `chosen` is the person's
-// own map (ui_colors), keyed by space id and by "<space id>:<branch>", holding
-// PALETTE names rather than hexes so a restyle carries the choice with it.
-const chosen = (key) => {
-  const name = m.session?.user?.ui_colors?.[key];
-  const i = name ? PALETTE_KEYS.indexOf(name) : -1;
-  return i < 0 ? null : PALETTE[i];
-};
-const spaceColor = (s) => chosen(s.id)
-  ?? (s.visiting ? PALETTE[fnv(s.name) % PALETTE.length] : PALETTE[m.spaceAuto[s.name] ?? 0]);
+// A colour is either chosen by hand or comes from the name, and NOTHING IS
+// STORED FOR THE SECOND ONE: clearing the entry is how you go back to it, the
+// way a reset works everywhere else. `pref` is the person's own map
+// (ui_colors), keyed by space id and by "<space id>:<branch>", holding palette
+// NAMES rather than hexes so a restyle carries the choice with it — and a name
+// this panel does not know reads as no choice at all, which is what makes an
+// entry written by an older or newer build harmless.
+const pref = (key) => m.session?.user?.ui_colors?.[key] ?? null;
+const chosen = (key) => colorByName(pref(key));
+// A space opened by role is not in the list the slots were shared out over, so
+// its automatic colour comes straight from the name.
+const spaceAuto = (s) => (s.visiting ? PALETTE[fnv(s.name) % PALETTE.length] : PALETTE[m.spaceAuto[s.name] ?? 0]);
+// A space has nothing above it, so "inherit" there falls back to the name.
+const spaceColor = (s) => chosen(s.id) ?? spaceAuto(s);
 
 function renderSpaceList() {
   const q = $("#space-filter").value.trim().toLowerCase();
@@ -465,15 +469,39 @@ function index(graph) {
     m.deg.set(b, (m.deg.get(b) || 0) + 1);
   }
   m.T = T;
-  m.rootAuto = autoSlots(T.get("").children.map((c) => c.id));
+  m.rootAuto = autoSlots(T.get("").children.map((c) => c.path ?? c.label ?? c.id));
 }
 
 const count = (n) => (n.record ? 1 : 0) + n.children.reduce((s, c) => s + count(c), 0);
+const colourKey = (path) => `${m.space?.id}:${path}`;
+// Colour belongs to a node and runs down its whole subtree: the nearest
+// ancestor carrying one of its own wins, so painting `x402` paints everything
+// under it and painting `x402.rails` repaints that part of it again. With
+// nobody painted, a top-level branch takes the slot its name hashes to — that
+// is what makes colour read as "these belong together" on the map.
+// The automatic colour comes from a NAME: a branch is named by its path, and a
+// record sitting straight in the space — which has an id where a name would be
+// — by its title, so that "colour from the name" is never a lie.
+const autoName = (id) => { const n = m.T.get(id); return n?.path ?? n?.label ?? id; };
+const branchAuto = (root) => PALETTE[m.rootAuto[autoName(root)] ?? 0];
 const colorOf = (id) => {
   if (id === "") return spaceColor(m.space);
-  const root = m.T.get(id)?.root ?? id;
-  return chosen(`${m.space?.id}:${root}`) ?? PALETTE[m.rootAuto[root] ?? 0];
+  for (let n = m.T.get(id); n && n.id !== ""; n = m.T.get(n.parent)) {
+    const own = chosen(colourKey(n.id));
+    if (own) return own;
+  }
+  return branchAuto(m.T.get(id)?.root ?? id);
 };
+
+// What a node would show with no colour of its own — what the reset button
+// hands back, and what the card has to be able to name.
+function inheritedColour(n) {
+  for (let p = m.T.get(n.parent); p && p.id !== ""; p = m.T.get(p.parent)) {
+    const own = chosen(colourKey(p.id));
+    if (own) return { colour: own, from: p.path ?? p.label };
+  }
+  return { colour: branchAuto(n.root), from: null };
+}
 
 function neighbours(id) {
   const s = new Set([id]), n = m.T.get(id);
@@ -484,7 +512,10 @@ function neighbours(id) {
   return s;
 }
 
-const isLocal = () => m.scope === "local" && m.selected !== null && m.selected !== "" && m.T.has(m.selected);
+// The local view is built around one node — and the space itself is a node, so
+// "show me the neighbourhood" always has an answer, even before anything is
+// picked: it starts at the space and its branches.
+const isLocal = () => m.scope === "local" && m.selected !== null && m.T.has(m.selected);
 
 function visibleIds() {
   m.ctxIds = new Set();
@@ -567,7 +598,7 @@ function updateCrumbs() {
   let cur = node;
   while (cur && cur.id !== "") { chain.unshift(cur); cur = m.T.get(cur.parent); }
   const sc = spaceColor(m.space);
-  el.innerHTML = `<nav aria-label="${esc(t("crumbs.label"))}"><button data-crumb="" style="--c:${sc}">${hexIcon(sc, false, 13)}${esc(m.space.name)}</button>${chain.map((n, i) =>
+  el.innerHTML = `<nav aria-label="${esc(t("crumbs.label"))}"><button data-crumb="" style="--c:${sc}"${chain.length ? "" : ' aria-current="true"'}>${hexIcon(sc, false, 13)}${esc(m.space.name)}</button>${chain.map((n, i) =>
     `<span class="sep">/</span><button data-crumb="${esc(n.id)}" style="--c:${colorOf(n.id)}"${i === chain.length - 1 ? ' aria-current="true"' : ""}>${esc(n.label)}</button>`).join("")}</nav>`;
   el.hidden = false;
 }
@@ -583,7 +614,8 @@ function updateSuggest() {
 }
 
 function setScope(scope) {
-  if (scope === "local" && (m.selected === null || m.selected === "")) { toast(t("local.needSel")); return; }
+  // nothing picked yet: centre on the space rather than refusing
+  if (scope === "local" && m.selected === null) { m.selected = ""; inspect(); }
   m.scope = scope;
   sync("data");
   if (scope === "local" && m.ctl?.focus) setTimeout(() => m.ctl.focus(m.selected), reducedMotion() ? 0 : 480);
@@ -593,7 +625,7 @@ function select(id, opts = {}) {
   if (id !== null && !m.T.has(id)) return;
   m.selected = id;
   if (opts.clearSearch && m.hits) { m.hits = null; m.query = ""; $("#q", m.root).value = ""; }
-  if (m.scope === "local") { if (id === null || id === "") m.scope = "all"; sync("data"); } else sync("focus");
+  if (m.scope === "local") { if (id === null) m.scope = "all"; sync("data"); } else sync("focus");
   inspect();
   if (opts.centre && id !== null && m.ctl?.focus) setTimeout(() => m.ctl.focus(id), m.scope === "local" && !reducedMotion() ? 480 : 0);
 }
@@ -703,14 +735,27 @@ function tip(id, e) {
   if (id === "") el.innerHTML = `<b>${esc(m.space.name)}</b><small>${esc(t("mem.records", { n: count(n) }))} · ${esc(t("mem.links", { n: m.links.length }))}</small>`;
   else if (!n.record) el.innerHTML = `<b>${esc(n.path)}</b><small>${esc(t("tip.below", { records: t("mem.records", { n: count(n) }) }))}</small>`;
   else el.innerHTML = `<b>${esc(n.record.title || n.path)}</b><small>${esc(t("tip.rec", { path: n.path || "—", links: t("mem.links", { n: m.deg.get(id) || 0 }), ago: ago(n.record.updated_at) }))}</small>${n.record.tags.length ? `<div class="tags">${n.record.tags.map((x) => `<span class="tag">${esc(x)}</span>`).join("")}</div>` : ""}`;
+  place(el, e.clientX, e.clientY);
+}
+
+// html straight into the tooltip, placed by the pointer — the blame view's
+// "who wrote this, and why" reads the same as the map's node tooltip.
+function showTip(html, x, y) {
+  const el = $("#tip");
+  el.innerHTML = html;
+  place(el, x, y);
+}
+
+function place(el, x, y) {
   el.hidden = false;
   const w = el.offsetWidth, h = el.offsetHeight;
-  let x = e.clientX + 16, y = e.clientY + 16;
-  if (x + w > innerWidth - 8) x = e.clientX - w - 16;
-  if (y + h > innerHeight - 8) y = e.clientY - h - 16;
-  el.style.left = Math.max(8, x) + "px";
-  el.style.top = Math.max(8, y) + "px";
+  let nx = x + 16, ny = y + 16;
+  if (nx + w > innerWidth - 8) nx = x - w - 16;
+  if (ny + h > innerHeight - 8) ny = y - h - 16;
+  el.style.left = Math.max(8, nx) + "px";
+  el.style.top = Math.max(8, ny) + "px";
 }
+
 function hideTip() { $("#tip").hidden = true; }
 
 // ─── inspector ───────────────────────────────────────────────────────────────
@@ -722,9 +767,13 @@ const pathNav = (node) => {
 const listOf = (ids) => ids.length ? `<div class="list">${ids.map((id) => {
   const n = m.T.get(id);
   return `<button data-go="${esc(id)}">${hexIcon(colorOf(id), !n.record, 12)}<span>${esc(n.record?.title || n.path || n.label)}</span><small>${esc(n.path || "")}</small></button>`;
-}).join("")}</div>` : `<p class="note">${esc(t("insp.none"))}</p>`;
+}).join("")}</div>` : "";
+// A heading with nothing under it is worse than no heading: "Linked from —
+// None" is three lines spent saying that a record is not linked to, which the
+// link count above already said. An empty section simply is not drawn.
+const section = (key, inner) => (inner ? `<div><p class="h3">${esc(t(key))}</p>${inner}</div>` : "");
 const stats = (pairs) => `<div class="stats">${pairs.map(([k, v]) => `<div class="stat"><small>${esc(t(k))}</small><b>${nf(v)}</b></div>`).join("")}</div>`;
-const colorName = (hex) => t("pal." + PALETTE_KEYS[PALETTE.indexOf(hex)]);
+const colorName = (hex) => t("pal." + PICKABLE_KEYS[PICKABLE.indexOf(hex)]);
 
 // a [[path]] inside a body: a button to the record if it exists, else a dimmed name
 function wikiLink(target, label) {
@@ -737,6 +786,7 @@ let inspectSeq = 0;
 async function inspect() {
   const box = $("#inspector", m.root);
   if (!m.graph) return;
+  hideTip();          // a blame tooltip belongs to the card that is going away
   if (m.query) renderResults();          // keep the open result marked in the list
   const n = m.selected === null ? null : m.T.get(m.selected);
   const sc = spaceColor(m.space);
@@ -745,13 +795,12 @@ async function inspect() {
     box.innerHTML = `<div class="eyebrow">${hexIcon(sc, false, 13)}${esc(t("insp.space"))}</div><h2 class="mono">${esc(m.space.name)}</h2>
       ${m.space.description ? `<p class="note" style="color:var(--text)">${esc(m.space.description)}</p>` : ""}
       ${stats([["insp.records", m.graph.total], ["insp.links", m.links.length]])}
-      <div><p class="h3">${esc(t("insp.color"))}</p><div class="colorline"><span class="txt">${hexIcon(sc, false, 14)} ${t("color.spaceAuto", { name: esc(colorName(sc)) })}</span>
-        ${swatches(m.space.id, sc, PALETTE[m.spaceAuto[m.space.name] ?? 0])}</div></div>
-      <div><p class="h3">${esc(t("insp.mostLinked"))}</p>${listOf(hubs)}</div>
+      ${section("insp.mostLinked", listOf(hubs))}
       ${m.graph.truncated ? `<p class="note" style="color:var(--admin)">${esc(t("mem.truncatedNote", { shown: nf(m.graph.records.length), total: nf(m.graph.total) }))}</p>` : ""}
       <div class="row">
         ${m.space.permission === "admin" ? `<a class="btn" href="/space?id=${encodeURIComponent(m.space.id)}">${esc(t("insp.members"))}${m.space.waiting ? ` <span class="badge">${nf(m.space.waiting)}</span>` : ""}</a>` : ""}
         <button class="btn quiet" data-sp="link">${esc(t("insp.copyLink"))}</button>
+        ${colourBtn(sc)}
         ${m.space.mine || m.space.visiting ? "" : `<button class="btn quiet" data-sp="leave">${esc(t("sp.leave"))}</button>`}
       </div>
       <p class="note">${esc(t("insp.spaceNote"))}</p>`;
@@ -760,8 +809,10 @@ async function inspect() {
   if (!n.record) {
     box.innerHTML = `${pathNav(n)}<div class="eyebrow">${hexIcon(colorOf(n.id), true, 13)}${esc(t("insp.bare"))}</div><h2 class="mono">${esc(n.path)}</h2>
       ${stats([["insp.below", count(n)], ["insp.direct", n.children.length]])}
-      <div><p class="h3">${esc(t("insp.inside"))}</p>${listOf(n.children.slice(0, 12).map((k) => k.id))}${n.children.length > 12 ? `<p class="note">${esc(t("insp.andMore", { n: n.children.length - 12 }))}</p>` : ""}</div>
-      <div class="row"><button class="btn quiet" data-copy="${esc(n.path)}">${esc(t("insp.copy"))}</button></div>`;
+      ${section("insp.inside", listOf(n.children.slice(0, 12).map((k) => k.id))
+        + (n.children.length > 12 ? `<p class="note">${esc(t("insp.andMore", { n: n.children.length - 12 }))}</p>` : ""))}
+      <div class="row"><button class="btn quiet" data-copy="${esc(n.path)}">${esc(t("insp.copy"))}</button>
+        ${colourBtn(colorOf(n.id))}</div>`;
     return;
   }
   const c = colorOf(n.id), rec = n.record, seq = ++inspectSeq;
@@ -785,14 +836,14 @@ async function inspect() {
   const dangling = out.filter((l) => !l.resolved && !l.scheme);
   box.innerHTML = head + `
     ${stats([["insp.links", outIds.length + inIds.length], ["insp.opened", r.usage?.gets ?? 0], ["insp.found", r.usage?.recalled ?? 0]])}
-    <div class="bodywrap"><button class="btn quiet small blamebtn" data-blame>${esc(t("insp.blame"))}</button>
-      <div class="body md" id="insp-body">${renderMarkdown(r.body, { link: wikiLink })}</div></div>
-    <div><p class="h3">${esc(t("insp.linksTo"))}</p>${listOf(outIds)}${dangling.length ? `<p class="note">${esc(t("insp.danglingList", { list: dangling.map((l) => l.target).join(", ") }))}</p>` : ""}</div>
-    <div><p class="h3">${esc(t("insp.linkedFrom"))}</p>${listOf(inIds)}</div>
-    <div><p class="h3">${esc(t("insp.color"))}</p><div class="colorline"><span class="txt">${hexIcon(c, false, 14)} ${t("color.auto", { name: esc(colorName(c)), root: esc(n.root) })}</span>
-      ${swatches(`${m.space.id}:${n.root}`, c, PALETTE[m.rootAuto[n.root] ?? 0])}</div></div>
+    <div class="bodywrap"><div class="body md" id="insp-body">${renderMarkdown(r.body, { link: wikiLink })}</div></div>
+    ${section("insp.linksTo", listOf(outIds)
+      + (dangling.length ? `<p class="note">${esc(t("insp.danglingList", { list: dangling.map((l) => l.target).join(", ") }))}</p>` : ""))}
+    ${section("insp.linkedFrom", listOf(inIds))}
     <div><p class="h3">${esc(t("insp.history"))}</p><div class="hist" id="insp-hist"><p class="note">…</p></div></div>
-    <div class="row">${n.path ? `<button class="btn quiet" data-copy="${esc(n.path)}">${esc(t("insp.copy"))}</button>` : ""}<button class="btn quiet" data-copy="${esc(r.id)}">${esc(t("insp.copyId"))}</button></div>`;
+    <div class="row">${n.path ? `<button class="btn quiet" data-copy="${esc(n.path)}">${esc(t("insp.copy"))}</button>` : ""}<button class="btn quiet" data-copy="${esc(r.id)}">${esc(t("insp.copyId"))}</button>
+      <button class="btn quiet" data-blame>${esc(t("insp.blame"))}</button>
+      ${colourBtn(c)}</div>`;
   // History arrives a page at a time: a record edited for a year has hundreds of
   // revisions, and the panel used to ask for every one of them to show eight.
   const histUrl = (before) => `/spaces/${encodeURIComponent(m.space.id)}/records/`
@@ -834,18 +885,66 @@ async function inspect() {
   });
 }
 
-// The colour picker for a space or a branch. Eight swatches and "automatic":
-// the automatic one is a hash of the name, which is stable and meaningless, so
-// the choice here is only ever an improvement on a coin toss.
-function swatches(key, current, autoColor) {
-  const mine = m.session?.user?.ui_colors?.[key];
-  return `<div class="swatches" data-colorkey="${esc(key)}">
-    ${PALETTE.map((hex, i) => `<button class="sw" data-color="${esc(PALETTE_KEYS[i])}"
-        style="--c:${hex}" aria-pressed="${mine === PALETTE_KEYS[i]}"
-        title="${esc(t("pal." + PALETTE_KEYS[i]))}"></button>`).join("")}
-    <button class="sw auto" data-color="" aria-pressed="${!mine}"
-      style="--c:${autoColor}" title="${esc(t("color.autoPick"))}">↺</button>
+// ─── colour ──────────────────────────────────────────────────────────────────
+// Colour is chosen once and then forgotten about, so it sits in a button next to
+// the copy buttons rather than in a row of swatches halfway down the card.
+const colourBtn = (hex) => `<button class="btn quiet" data-colour>${hexIcon(hex, false, 12)}<span>${esc(t("color.pick"))}</span></button>`;
+
+// What the button in front of the person would colour: whatever is selected —
+// the space, a path, or one record — and, through inheritance, everything under
+// it. Painting the branch you are standing in is then one step up the crumbs.
+function colourTarget() {
+  const n = m.selected === null ? null : m.T.get(m.selected);
+  if (!n || n.id === "") {
+    return { key: m.space.id, space: true, name: m.space.name,
+             reset: { colour: spaceAuto(m.space), from: null } };
+  }
+  // `top`: a first-level branch has no parent to take a colour from — the space
+  // does not pass its own down — so there the reset goes back to the name, and
+  // the button has to say so rather than promise a parent.
+  return { key: colourKey(n.id), space: false, name: n.path ?? n.label, top: n.depth === 1,
+           root: n.root, reset: inheritedColour(n) };
+}
+
+// The palette, plus the two answers that are not colours: back to the name, and
+// take the colour of whatever this sits under (and keep following it).
+function colourDialog() {
+  if (!m.space) return;
+  const tgt = colourTarget(), now = pref(tgt.key), live = tgt.space ? spaceColor(m.space) : colorOf(m.selected);
+  const opt = (value, colour, label, on) => `<button type="button" class="pal-opt" data-color="${esc(value)}"
+      aria-pressed="${on}">${hexIcon(colour, false, 15)}<span>${esc(label)}</span></button>`;
+  // Where the colour it has right now came from — the one thing the swatches
+  // cannot say, and the difference between "I picked this" and "this is what
+  // came down from above" is exactly what people ask of a picker.
+  const name = esc(colorName(live));
+  const from = colorByName(now) ? t("color.chosen", { name })
+    : tgt.space ? t("color.spaceAuto", { name })
+      : tgt.reset.from ? t("color.fromParent", { name, parent: esc(tgt.reset.from) })
+        : t("color.auto", { name, root: esc(tgt.root) });
+  const veil = document.createElement("div");
+  veil.className = "veil";
+  veil.innerHTML = `<div class="dialog pal-dialog" role="dialog" aria-modal="true" aria-labelledby="pal-title">
+    <h3 id="pal-title">${esc(t(tgt.space ? "color.pickSpace" : "color.pickNode", { name: tgt.name }))}</h3>
+    <p class="pal-now">${hexIcon(live, false, 14)}<span>${from}</span></p>
+    <div class="palgrid">${PICKABLE.map((hex, i) => `<button type="button" class="sw" data-color="${esc(PICKABLE_KEYS[i])}"
+        style="--c:${hex}" aria-pressed="${now === PICKABLE_KEYS[i]}"
+        title="${esc(t("pal." + PICKABLE_KEYS[i]))}" aria-label="${esc(t("pal." + PICKABLE_KEYS[i]))}"></button>`).join("")}</div>
+    <div class="pal-opts">${opt("", tgt.reset.colour,
+      t(tgt.space || tgt.top ? "color.autoPick" : "color.inherit"), !colorByName(now))}</div>
+    <p class="note">${esc(t(tgt.space ? "color.spaceNote" : "color.branchNote"))}</p>
+    <div class="row" style="justify-content:flex-end"><button type="button" class="btn quiet" data-x>${esc(t("common.close"))}</button></div>
   </div>`;
+  document.body.append(veil);
+  const close = () => veil.remove();
+  veil.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+  veil.addEventListener("click", (e) => {
+    if (e.target === veil || e.target.closest("[data-x]")) return close();
+    const b = e.target.closest("[data-color]");
+    if (!b) return;
+    close();
+    pickColour(tgt.key, b.dataset.color);
+  });
+  $("[data-x]", veil).focus();
 }
 
 async function pickColour(key, colour) {
@@ -858,53 +957,141 @@ async function pickColour(key, colour) {
     toast(t("err.save"));
     return;
   }
-  drawGraph();                      // the tree and the sidebar both read colorOf
+  sync("data");                     // the map and the sidebar both read colorOf
   renderSpaceList();
   inspect();
 }
 
-// Blame: the body as runs, each tagged with who last changed those lines.
-// Shown verbatim rather than as Markdown — attribution is per line, and
-// rendering across block boundaries would move it to the wrong text.
+// ─── blame ───────────────────────────────────────────────────────────────────
+// The same text, in the same shape, tinted by whoever wrote it — the way an
+// editor marks up a file it is showing you. Attribution is per source LINE and
+// a rendered block covers several, so a block takes the colour of whoever wrote
+// most of its lines, and the tooltip names everyone who touched it, with the
+// provenance each of them left behind.
+
+const blameWho = (r) => r.author_id || r.author || `#${r.seq}`;
+
+// the runs covering a block, most lines first — the first one gives the colour
+function coverage(owner, start, end) {
+  const lines = new Map();
+  for (let l = start; l <= end; l++) {
+    const r = owner[l];
+    if (r) lines.set(r, (lines.get(r) || 0) + 1);
+  }
+  return [...lines.entries()].sort((a, b) => b[1] - a[1]).map(([r]) => r);
+}
+
+function blameTip(runs) {
+  if (!runs.length) return `<b>${esc(t("blame.noone"))}</b>`;
+  return runs.map((r) => {
+    const op = t("op." + r.op) === "op." + r.op ? r.op : t("op." + r.op);
+    const line = (key, value) => (value ? `<small>${esc(t(key))}: ${esc(value)}</small>` : "");
+    return `<div class="bt">
+      <b>${esc(r.author || t("people.unnamed"))}</b>
+      <small>${esc(op)} · ${esc(fmtDate(r.at))} · ${esc(ago(r.at))}</small>
+      ${line("blame.source", r.source)}
+      ${line("blame.reason", r.reason)}
+      ${line("blame.validAt", r.valid_at)}
+      <small>${esc(t("blame.rev", { n: r.seq }))}</small>
+    </div>`;
+  }).join("");
+}
+
 async function showBlame(rec, box) {
   const body = $("#insp-body", box), btn = $("[data-blame]", box);
-  if (body.dataset.blame === "on") {                 // toggle back to the text
+  if (!body || !btn) return;
+  if (body.dataset.blamed === "on") {                // toggle back to the text
+    hideTip();
+    $(".blame-key", box)?.remove();
     body.innerHTML = renderMarkdown(rec.body, { link: wikiLink });
-    body.classList.add("md"); body.classList.remove("blame");
-    body.dataset.blame = ""; btn.textContent = t("insp.blame");
+    body.classList.remove("blame");
+    body.dataset.blamed = "";
+    btn.textContent = t("insp.blame");
     return;
   }
   btn.disabled = true;
-  let blocks;
+  let runs;
   try {
-    blocks = (await get(`/spaces/${encodeURIComponent(m.space.id)}/records/`
+    runs = (await get(`/spaces/${encodeURIComponent(m.space.id)}/records/`
       + `${encodeURIComponent(rec.id)}/blame`)).blame;
   } catch {
     btn.disabled = false; toast(t("err.network")); return;
   }
   btn.disabled = false;
-  body.classList.remove("md"); body.classList.add("blame");
-  body.dataset.blame = "on";
+  if (!runs.length) { toast(t("insp.blameEmpty")); return; }
+
+  // one colour per author, handed out in the order they appear in the document
+  const colours = new Map();
+  for (const r of runs) if (!colours.has(blameWho(r))) colours.set(blameWho(r), PALETTE[colours.size % PALETTE.length]);
+  const owner = [];
+  for (const r of runs) for (let l = r.start; l <= r.end; l++) owner[l] = r;
+
+  // `blamed`, not `blame`: the button is found by [data-blame], and an attribute
+  // of that name on the body would come first in the document and be mistaken
+  // for it — which is how turning blame off used to overwrite the record.
+  m.blameTips = [];
+  const piece = (tag, b) => {
+    const cover = coverage(owner, b.start, b.end);
+    const c = cover.length ? colours.get(blameWho(cover[0])) : null;
+    m.blameTips.push(blameTip(cover));
+    return `<${tag} data-bt="${m.blameTips.length - 1}"${c ? ` style="--c:${c}"` : ""}>${b.html}</${tag}>`;
+  };
+  const html = blameBlocks(rec.body, { link: wikiLink }).map((b) => {
+    if (b.kind === "list") {
+      const tag = b.ordered ? "ol" : "ul";
+      return `<${tag}${b.ordered && b.start ? ` start="${Number(b.start)}"` : ""}>${b.items.map((it) => piece("li", it)).join("")}</${tag}>`;
+    }
+    if (b.kind === "table") {
+      return `<table><thead>${piece("tr", b.head)}</thead><tbody>${b.rows.map((r) => piece("tr", r)).join("")}</tbody></table>`;
+    }
+    return piece("div", b);
+  }).join("");
+
+  const owned = new Map();
+  for (const r of runs) owned.set(blameWho(r), (owned.get(blameWho(r)) || 0) + (r.lines || (r.end - r.start + 1)));
+  const key = [...colours.keys()].map((who) => {
+    const r = runs.find((x) => blameWho(x) === who);
+    const name = esc(r.author || t("people.unnamed"));
+    const label = `<span class="who" style="--c:${colours.get(who)}">${hexIcon(colours.get(who), false, 11)}${name}`
+      + `<small>${esc(t("blame.lines", { n: owned.get(who) }))}</small></span>`;
+    return r.author_id ? `<a class="person" href="/people?id=${encodeURIComponent(r.author_id)}">${label}</a>` : label;
+  }).join("");
+  const bar = document.createElement("div");
+  bar.className = "blame-key";
+  bar.innerHTML = `${key}<span class="note">${esc(t("blame.hint"))}</span>`;
+  body.before(bar);
+
+  body.innerHTML = html;
+  body.classList.add("blame");
+  body.dataset.blamed = "on";
   btn.textContent = t("insp.blameOff");
-  body.innerHTML = blocks.map((b) => {
-    const who = b.author_id
-      ? `<a class="person" href="/people?id=${encodeURIComponent(b.author_id)}">${esc(b.author || t("people.unnamed"))}</a>`
-      : `<span class="note">${esc(t("insp.noAuthor"))}</span>`;
-    const c = PALETTE[PALETTE_KEYS[fnv(String(b.author_id || b.seq)) % PALETTE_KEYS.length]];
-    return `<div class="blk" style="--c:${c}">
-      <div class="who">${who} <time datetime="${esc(b.at || "")}" title="${esc(b.at ? fmtDate(b.at) : "")}">${esc(b.at ? ago(b.at) : "")}</time>
-        <span class="ln">${esc(t("insp.blameLines", { from: b.start, to: b.end }))}</span>
-        ${b.reason ? `<small>${esc(b.reason)}</small>` : ""}</div>
-      <pre>${esc(b.text)}</pre></div>`;
-  }).join("") || `<p class="note">${esc(t("insp.blameEmpty"))}</p>`;
+  wireBlameTips(body);
+}
+
+// Hover to see who wrote a block; on a touch screen, tap it — and tap again (or
+// anywhere else in the body) to put it away, since there is no "pointer left".
+function wireBlameTips(body) {
+  if (body.dataset.tips) return;
+  body.dataset.tips = "1";
+  let pinned = null;
+  const show = (el, x, y) => showTip(m.blameTips[Number(el.dataset.bt)] || "", x, y);
+  body.addEventListener("pointermove", (e) => {
+    if (pinned || body.dataset.blamed !== "on") return;
+    const el = e.target.closest("[data-bt]");
+    if (el) show(el, e.clientX, e.clientY); else hideTip();
+  });
+  body.addEventListener("pointerleave", () => { if (!pinned) hideTip(); });
+  body.addEventListener("click", (e) => {
+    if (body.dataset.blamed !== "on" || e.target.closest("a, button")) return;
+    const el = e.target.closest("[data-bt]");
+    if (!el || pinned === el) { pinned = null; hideTip(); return; }
+    pinned = el;
+    show(el, e.clientX, e.clientY);
+  });
 }
 
 async function onInspectorAction(e) {
-  const sw = e.target.closest("[data-color]");
-  if (sw) {
-    const key = sw.closest("[data-colorkey]")?.dataset.colorkey;
-    if (key) return pickColour(key, sw.dataset.color);
-  }
+  if (e.target.closest("[data-colour]")) return colourDialog();
   if (e.target.closest("[data-blame]") && m.record && m.space) {
     return showBlame(m.record, $("#inspector", m.root));
   }

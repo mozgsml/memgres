@@ -20,7 +20,10 @@ from typing import Iterable, List, Optional, Tuple
 
 from .diffing import _HUNK
 
-_ATTR_KEYS = ("seq", "op", "source", "reason", "created_at",
+# What travels with every attributed line: who, when, which revision, and the
+# provenance the writer stamped on it (`source` is the address the knowledge
+# came from, `valid_at` the date it was last known to hold).
+_ATTR_KEYS = ("seq", "op", "source", "reason", "created_at", "valid_at",
               "author_user_id", "author_token_id", "author_name")
 
 

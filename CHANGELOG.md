@@ -5,6 +5,60 @@ All notable changes to memgres are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features/changes,
 patch = fixes).
 
+## [Unreleased]
+
+### Changed
+- **Blame keeps the text.** "Who wrote this" used to replace a record's body
+  with monospace blocks, one per run of lines — which threw away the headings,
+  lists and tables that made the record readable in the first place, and put a
+  button on top of the text to get there. Now the body stays exactly as it is
+  and is tinted instead, the way an editor marks up a file: each block carries
+  the colour of whoever wrote most of its lines, with a key of everyone who
+  touched the record. Lists are banded per item and tables per row — one changed
+  cell shows up as a differently-coloured row, with that edit's reason on it —
+  because there the source lines up one to one with what is drawn. Hovering a
+  block — or tapping it, on a phone — says who wrote those lines, when, in which
+  revision, and with what `source`, `reason` and `valid_at`. Attribution is per
+  line and a rendered block can cover several, so a block names the dominant
+  author rather than claiming a precision it has not got, and the tooltip lists
+  everyone in range. The button moved down to the other buttons, where it stops
+  covering the first line of the body.
+- **The colour picker is one button, with more to pick from.** Choosing a colour
+  was a row of eight swatches sitting in the middle of every card, which is a lot
+  of interface for a decision people make once. It is now **Color**, beside the
+  copy buttons, opening a palette of twenty. The twelve added colours are
+  pick-only — the automatic colour still hashes to the same eight, so nothing
+  already on screen moved.
+
+  **Colour now belongs to the node you are on, not to its top-level branch.**
+  Painting `x402.rails` used to repaint the whole of `x402`; now it paints that
+  path and everything under it, and the nearest ancestor with a colour of its own
+  is what anything unpainted follows. Keys are full paths, so colours already
+  chosen for a top-level branch keep meaning exactly what they meant.
+
+  What is stored is only ever a colour somebody picked. The way back clears the
+  entry instead of storing a word of its own, and it is named for what it hands
+  you: *parent's colour* on a nested path, *colour from the name* on a top-level
+  branch and on the space, which have nothing above them to inherit. The line
+  above it says where the colour on screen came from, rather than calling an
+  inherited or hashed colour "your choice".
+- **A section with nothing in it is no longer drawn.** "Linked from — None" is
+  three lines spent saying what the link count above already said.
+- **The local view opens on the space when nothing is selected.** It used to
+  refuse with "select a record first"; now it centres on the space node, which
+  is the answer that question always has.
+
+### Fixed
+- **Turning blame off wiped the record.** The blame state was kept as
+  `data-blame` on the body, and the button is found by that same attribute — the
+  body comes first in the document, so restoring the text and then relabelling
+  "the button" overwrote the record with the words "Who wrote this". Clicking
+  anywhere in the marked-up text toggled blame off for the same reason.
+- Picking a colour called a function that does not exist, so the map and the
+  sidebar kept the old colour until the page was reloaded.
+- The panel's blame endpoint no longer ships the body a second time: it answers
+  with line ranges and provenance, and the panel tints the body it already has.
+
 ## [0.15.1] — 2026-09-23
 
 ### Fixed

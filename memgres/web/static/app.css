@@ -186,9 +186,6 @@
   .list button:hover { background: var(--panel-2); }
   .list button span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
   .list button small { grid-column: 2; font: 11px var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: -2px; }
-  .colorline { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: space-between; padding: 10px 12px; border-radius: 10px; background: var(--canvas); }
-  .colorline .txt { font-size: 13px; min-width: 0; flex: 1 1 180px; }
-  .colorline .txt .hexi { display: inline-block; vertical-align: -2px; margin-right: 6px; }
   .note { font-size: 12.5px; color: var(--muted); line-height: 1.55; margin: 0; }
   .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   .btn { border: 0; box-shadow: inset 0 0 0 1px var(--line); background: var(--panel-2); color: var(--bright); border-radius: 9px; padding: 7px 13px; cursor: pointer; font-size: 13px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
@@ -200,11 +197,7 @@
   .btn.danger { color: var(--warn); background: transparent; box-shadow: inset 0 0 0 1px rgba(255,107,107,.4); }
   .btn.adminbtn { background: var(--admin); color: #1d1204; box-shadow: none; font-weight: 500; }
   .btn[disabled] { opacity: .45; cursor: not-allowed; }
-  .swatches { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  .sw { width: 30px; height: 30px; border: 0; padding: 0; background: none; cursor: pointer; border-radius: 8px; display: grid; place-items: center; }
-  .sw[aria-pressed="true"] { box-shadow: 0 0 0 2px var(--bright); }
-  .sw.text { width: auto; padding: 0 12px; box-shadow: inset 0 0 0 1px var(--line); color: var(--muted); font-size: 12.5px; }
-  .sw.text[aria-pressed="true"] { color: var(--bright); box-shadow: 0 0 0 2px var(--bright); }
+  .sw { border: 0; padding: 0; background: none; cursor: pointer; border-radius: 8px; display: grid; place-items: center; }
   .preview { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px; background: var(--canvas); font-size: 13px; }
 
   /* ─── pages ─── */
@@ -510,23 +503,40 @@ a.person:hover { color: var(--focus); box-shadow: inset 0 -1px 0 var(--focus); }
 @media (max-width: 760px) { .rrow { grid-template-columns: minmax(0, 1fr) auto; } .rrow .op { display: none; } }
 .every-link.make { color: var(--focus); text-decoration-color: rgba(79,214,242,.4); }
 .every-link.make:hover { text-decoration-color: var(--focus); }
-/* blame: the body as runs, each banded with its author's colour */
-.bodywrap { position: relative; }
-.bodywrap .blamebtn { position: absolute; top: 0; right: 0; opacity: .75; }
-.bodywrap .blamebtn:hover { opacity: 1; }
-.body.blame { display: grid; gap: 10px; }
-.body.blame .blk { border-left: 3px solid var(--c); padding-left: 10px; }
-.body.blame .who { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
-  font-size: 12px; color: var(--muted); margin-bottom: 2px; }
-.body.blame .who .ln { font-variant-numeric: tabular-nums; }
-.body.blame pre { margin: 0; white-space: pre-wrap; word-break: break-word;
-  font: inherit; }
+/* blame: the same text, banded by whoever wrote each piece of it */
+.blame-key { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 12px;
+  margin-bottom: 9px; font-size: 12px; }
+.blame-key .who { display: inline-flex; align-items: center; gap: 5px; color: var(--c); }
+.blame-key .who small { color: var(--muted); font: 11px var(--mono); }
+.blame-key a { text-decoration: none; }
+.blame-key .note { flex-basis: 100%; font-size: 11.5px; }
+.body.blame [data-bt]:not(tr) { border-left: 3px solid var(--c, var(--line));
+  padding: 2px 0 2px 9px; border-radius: 0 6px 6px 0;
+  background: color-mix(in srgb, var(--c, transparent) 8%, transparent); }
+.body.blame [data-bt]:hover { background: color-mix(in srgb, var(--c, transparent) 18%, transparent); }
+/* a table row is banded on its first cell: under border-collapse a border on
+   the row itself is the browser's to ignore */
+.body.blame tr[data-bt] { background: color-mix(in srgb, var(--c, transparent) 8%, transparent); }
+.body.blame tr[data-bt] > :first-child { border-left: 3px solid var(--c, var(--line)); }
+.body.blame > [data-bt] { margin: 3px 0 3px -12px; }
+.body.blame > [data-bt] > :first-child { margin-top: 0; }
+.body.blame > [data-bt] > :last-child { margin-bottom: 0; }
+.body.blame ul, .body.blame ol { padding-left: 2em; }
+.body.blame li[data-bt] { margin: 3px 0; }
+.tip .bt + .bt { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.tip .bt small:first-of-type { color: var(--text); }
 
-/* choosing a colour for a space or a branch */
-.colorline .swatches { display: flex; gap: 6px; flex-wrap: wrap; }
-.colorline .sw { width: 20px; height: 20px; padding: 0; border-radius: 6px;
-  border: 2px solid transparent; background: var(--c); cursor: pointer;
-  line-height: 1; font-size: 11px; color: var(--bg); }
-.colorline .sw.auto { background: transparent; border-color: var(--c); color: var(--c); }
-.colorline .sw:hover { border-color: var(--text); }
-.colorline .sw[aria-pressed="true"] { border-color: var(--text); box-shadow: 0 0 0 2px var(--canvas); }
+/* choosing a colour for a space or a branch: a palette behind one button */
+.pal-dialog { max-width: 380px; }
+.pal-now { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text); }
+.palgrid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 8px; }
+.palgrid .sw { width: 100%; aspect-ratio: 1; border-radius: 8px; background: var(--c);
+  border: 2px solid transparent; }
+.palgrid .sw:hover { border-color: var(--text); }
+.palgrid .sw[aria-pressed="true"] { border-color: var(--bright); box-shadow: 0 0 0 2px var(--canvas), 0 0 0 4px var(--bright); }
+.pal-opts { display: grid; gap: 6px; }
+.pal-opt { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  border: 0; box-shadow: inset 0 0 0 1px var(--line); background: transparent;
+  color: var(--text); border-radius: 9px; padding: 8px 10px; cursor: pointer; font-size: 13px; }
+.pal-opt:hover { box-shadow: inset 0 0 0 1px #3a4470; }
+.pal-opt[aria-pressed="true"] { box-shadow: inset 0 0 0 2px var(--bright); color: var(--bright); }

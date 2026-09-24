@@ -259,7 +259,7 @@ def set_colour(conn, user_id: str, key: str, colour: Optional[str],
     what it now holds.
 
     The key is opaque here on purpose — it is a namespace id, optionally with a
-    branch after a colon — because validating that a branch still exists would
+    path after a colon — because validating that the path still exists would
     make a preference depend on memory that may be renamed or deleted. A key
     that stops meaning anything simply stops being read; the cap is what keeps
     the column from growing without bound.
@@ -268,8 +268,8 @@ def set_colour(conn, user_id: str, key: str, colour: Optional[str],
 
     if colour is not None and colour not in allowed:
         raise ValueError(f"unknown colour {colour!r}")
-    if len(key) > 200:
-        raise ValueError("that key is too long to be a space or a branch")
+    if len(key) > 400:      # a namespace uuid, a colon, and a memory path
+        raise ValueError("that key is too long to be a space or a path")
     with conn.cursor() as cur:
         cur.execute("SELECT ui_colors FROM app_user WHERE id = %s FOR UPDATE",
                     (user_id,))
